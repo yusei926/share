@@ -1,0 +1,5 @@
+lerobot[groot]==0.6.0
+huggingface-hub==1.22.0
+numpy==2.2.6
+torch==2.10.0
+torchvision==0.25.0

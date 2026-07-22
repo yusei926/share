@@ -1,0 +1,58 @@
+{
+  "source_repo_id": "BitRobot/G1_WBT_Dex1_Building-Children-Table",
+  "raw_repo_id": "BitRobot/2026-humanoid-ikea-assembly-challenge",
+  "target_repo_template": "Team-RAMEN/IROS2026_RAMEN_suzuki_{subtask}_1",
+  "fps": 30.0,
+  "min_duration_sec": 0.5,
+  "subtasks": [
+    {
+      "name": "move_to_work_pose",
+      "task": "move to work pose",
+      "labels": ["move to table", "move table base"]
+    },
+    {
+      "name": "pick_leg",
+      "task": "pick table leg",
+      "labels": ["pick table leg"]
+    },
+    {
+      "name": "coarse_insert",
+      "task": "coarse align table leg to table base",
+      "split_source_label": "insert table leg to table base",
+      "split_start_fraction": 0.0,
+      "split_end_fraction": 0.65
+    },
+    {
+      "name": "final_insert_contact",
+      "task": "insert table leg with contact",
+      "split_source_label": "insert table leg to table base",
+      "split_start_fraction": 0.65,
+      "split_end_fraction": 1.0
+    },
+    {
+      "name": "tighten",
+      "task": "rotate leg to tighten",
+      "labels": ["rotate leg to tighten"]
+    },
+    {
+      "name": "rotate_table_base",
+      "task": "rotate table base",
+      "labels": ["rotate table base"]
+    },
+    {
+      "name": "recover_or_regrasp",
+      "task": "recover or regrasp",
+      "labels": [
+        "pick table leg from floor",
+        "place table leg to table",
+        "pick table from floor",
+        "place table to table"
+      ]
+    },
+    {
+      "name": "flip_table",
+      "task": "flip table",
+      "labels": ["flip table"]
+    }
+  ]
+}

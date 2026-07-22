@@ -1,0 +1,58 @@
+# Flip-table policy evaluation in the organizer RoboFinals IKEA simulator.
+#
+# The host runner bind-mounts a task overlay that changes AssembleTableTask into
+# a flip-table evaluation reset/success task.
+
+policy_name: "LeRobotGrootN17Policy"
+checkpoint: "/workspace/flip_table_policy_checkpoint"
+seed: 42
+
+instruction: "Flip the already assembled table over."
+
+observation_config:
+  custom_mapping:
+    observation.images.head_left: first_person_camera
+    observation.images.left_wrist: left_hand_camera
+    observation.images.right_wrist: right_hand_camera
+    observation.state: joint_pos
+
+record_camera:
+  - first_person_camera
+  # Operator-only stereo eye. It is deliberately absent from custom_mapping.
+  - head_right_camera
+  - left_hand_camera
+  - right_hand_camera
+  - global_camera
+# The real demonstrations contain up to 867 actions at 30 Hz (28.9 s). At the
+# 50 Hz simulator control rate, 1,800 steps provide 36 s for the full motion
+# and final settling; the previous 500-step limit could only execute 10 s.
+time_out_limit: 1800
+test_num: 10
+record_video: true
+
+height: 480
+width: 640
+
+env_cfg:
+  task: AssembleTableTask
+  robot: G1-Gripper-Controller-DecoupledWBC
+  layout: /workspace/IROS_IKEA_V13_20260702/Scene02.usd
+  scene_backend: local
+  task_backend: local
+  device: cuda:0
+  num_envs: 1
+  usd_simplify: false
+  enable_cameras: true
+  video: true
+  # CUDA physics requires Fabric so articulated transforms reach the renderer.
+  disable_fabric: false
+  robot_scale: 1.0
+  seed: 42
+  sources: null
+  object_projects: null
+  for_rl: false
+  variant: Visual
+  concatenate_terms: false
+  distributed: false
+  first_person_view: true
+  enable_full_local_scene: true

@@ -1,0 +1,25 @@
+{
+  "schema_version": "team_ramen_stereo_table_corner_annotations/v1",
+  "policy_use": "forbidden: offline camera/table calibration only",
+  "corner_order": [
+    "tabletop_long_minus_width_minus",
+    "tabletop_long_plus_width_minus",
+    "tabletop_long_plus_width_plus",
+    "tabletop_long_minus_width_plus"
+  ],
+  "instructions": [
+    "Use only frames where all four physical tabletop rim corners are visually identifiable in both head images.",
+    "Click the same physical CAD corner in left/right images; do not use interior ribs, leg roots, shadows, or the black workbench edge.",
+    "Leave an occluded frame out instead of guessing. At least three independently reviewable frames are required before fitting a shared scene parameter."
+  ],
+  "annotations": [
+    {
+      "episode_index": 250,
+      "frame_index": 0,
+      "head_left_xy_px": [],
+      "head_right_xy_px": [],
+      "reviewer": "",
+      "review_status": "pending"
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+diff --git a/src/teleimager/image_server.py b/src/teleimager/image_server.py
+index 8cd455f..a33cb24 100644
+--- a/src/teleimager/image_server.py
++++ b/src/teleimager/image_server.py
+@@ -557,6 +557,28 @@ class CameraFinder:
+     """
+     def __init__(self, realsense_enable=False, verbose=False):
+         self.verbose = verbose
++        # The collection config identifies the OpenCV node and both D405s
++        # explicitly. On Jetson, broad UVC probing can block while those
++        # cameras are already present.
++        if os.getenv("TELEIMAGER_SKIP_UVC_DISCOVERY") == "1":
++            self.uvc_devices = []
++            self.uid_map = {}
++            self.video_paths = self._list_video_paths()
++            if realsense_enable:
++                self.rs_serial_numbers = self._list_realsense_serial_numbers()
++            else:
++                self.rs_serial_numbers = []
++            self.rs_video_paths = []
++            self.rs_rgb_video_paths = []
++            self.uvc_rgb_video_paths = []
++            self.uvc_rgb_video_ids = []
++            self.uvc_rgb_physical_paths = []
++            self.uvc_rgb_uids = []
++            self.uvc_rgb_dev_info = []
++            self.uvc_rgb_serial_numbers = []
++            self.uvc_rgb_cameras = {}
++            logger_mp.info("[CameraFinder] skipping broad UVC discovery")
++            return
+         # uvc
+         reload_uvc_driver()
+         self.uvc_devices = uvc.device_list()
+@@ -1449,4 +1471,4 @@ def main():
+     os.killpg(os.getpgrp(), 9)
+
+if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()

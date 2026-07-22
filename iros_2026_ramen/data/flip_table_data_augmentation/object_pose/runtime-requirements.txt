@@ -1,0 +1,16 @@
+transformers==5.13.0 \
+    --hash=sha256:8adbc1d20bd5463cd6876b2eb7cb31971e1065788e7dc6bc12bab597a7c504b7
+kornia==0.8.3 \
+    --hash=sha256:0b15f5d359aeafd7ff54ea631ed1943a3eb295c4a6dae3f745ddeada25e33289
+kornia-rs==0.1.14 \
+    --hash=sha256:396f84661fcf260885c3f9db717caf6904eafd44857dca17be09a835bd7da8d9
+ruamel.yaml==0.19.1 \
+    --hash=sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93
+transformations==2026.1.18 \
+    --hash=sha256:dc2e52cb0c0f4b838c7b6da964fb18f43058abfe767c6c3f6a465b9fc0b3dd12
+iopath==0.1.10 \
+    --hash=sha256:3311c16a4d9137223e20f141655759933e1eda24f8bff166af834af3c645ef01
+pybind11==3.0.4 \
+    --hash=sha256:961720ee652da51d531b7b2451a6bd2bc042b0106e6d9baa48ecb7d58034ce63
+timm==1.0.27 \
+    --hash=sha256:5ff07c9ddf53cbada88eab1c93ff175c64cab683b5a2fddf863bcee985926f89

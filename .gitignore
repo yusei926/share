@@ -1,0 +1,11 @@
+# Generated artifacts and local environments must not enter this snapshot.
+outputs/
+**/outputs/
+*.log
+*.pt
+*.ckpt
+*.hdf5
+*.parquet
+__pycache__/
+.pytest_cache/
+.pixi/

@@ -1,0 +1,16 @@
+_base_:
+  - rl_base
+
+task: AssembleTableTask
+robot: G1-Gripper-Controller-DecoupledWBC
+rl: FlipTableResidualVisualRL
+layout: /workspace/IROS_IKEA_V13_20260702/Scene02_flip_table_assembled.usd
+scene_backend: local
+task_backend: local
+num_envs: 32
+enable_cameras: true
+enable_full_local_scene: true
+usd_simplify: false
+first_person_view: true
+seed: 42
+video: false

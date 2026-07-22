@@ -1,0 +1,85 @@
+{
+  "schema_version": "team_ramen_flip_table_teleop/v1",
+  "runtime": {
+    "xr_repo": "unitreerobotics/xr_teleoperate",
+    "xr_revision": "4c0afdb81f2c19709f053c9c9890a98aca687b44",
+    "televuer_revision": "948f65f6852410610483345e69715a0c673a99eb",
+    "robofinals_image": "paperc/robofinals:RoboFinals-IKEA-V1",
+    "robofinals_digest": "sha256:6f62a73c48a0b1f97e15e9cc76a9fee8a052c0b3b9dcd324d25c1ed01020e9f1"
+  },
+  "rates": {
+    "physics_hz": 100,
+    "servo_hz": 50,
+    "command_hz": 30,
+    "camera_hz": 30,
+    "record_hz": 30
+  },
+  "command_contract": {
+    "arm_joint_names": [
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint"
+    ],
+    "hand_target": "dex1_opening_fraction_left_right",
+    "policy_cameras": [
+      "observation.images.cam_0",
+      "observation.images.cam_2",
+      "observation.images.cam_3"
+    ],
+    "operator_cameras": [
+      "head_left",
+      "head_right"
+    ]
+  },
+  "safety": {
+    "arm_position_lower_rad": [-3.0592, -1.5582, -2.588, -1.0172, -1.942222054, -1.584429558, -1.584429558, -3.0592, -2.2215, -2.588, -1.0172, -1.942222054, -1.584429558, -1.584429558],
+    "arm_position_upper_rad": [2.6404, 2.2215, 2.588, 2.0644, 1.942222054, 1.584429558, 1.584429558, 2.6404, 1.5582, 2.588, 2.0644, 1.942222054, 1.584429558, 1.584429558],
+    "arm_velocity_rad_s": 2.5,
+    "arm_acceleration_rad_s2": 8.0,
+    "hand_velocity_fraction_s": 3.0,
+    "hand_acceleration_fraction_s2": 15.0,
+    "command_hold_timeout_s": 0.20,
+    "command_stop_timeout_s": 0.75
+  },
+  "camera_randomization": {
+    "mount_translation_m": 0.003,
+    "mount_rotation_rad": 0.017453292519943295,
+    "focal_fraction": 0.02,
+    "principal_point_px": 3.0,
+    "distortion_fraction": 0.10,
+    "exposure_ev": 0.35
+  },
+  "collection": {
+    "output_root": "outputs/flip_table_teleop",
+    "dataset_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_augmented_2",
+    "private": true,
+    "target_successful_sim_demos": 30,
+    "mimic_pilot_trials": 100,
+    "mimic_pilot_success_min": 50,
+    "mimic_successful_trajectories_min": 2000,
+    "appearance_variants_per_trajectory_min": 2,
+    "video_shard_size_mb": 500,
+    "dr_profiles": [
+      {"name": "mild", "level": 0.25, "successful_demos": 10},
+      {"name": "medium", "level": 0.60, "successful_demos": 10},
+      {"name": "full", "level": 1.0, "successful_demos": 10}
+    ]
+  },
+  "workstation": {
+    "tailscale_host": "ramen-workstation",
+    "ssh_user": "ubuntu",
+    "remote_repo": "/home/ubuntu/GitHub/iros_2026_ramen",
+    "sim_port": 59610
+  }
+}
