@@ -436,6 +436,7 @@ def runner_argv(
 
 def adapter_dry_run(spec: ModelSpec) -> dict[str, object]:
     """Exercise dimensions and mappings without importing physical transports."""
+    modules_before = set(sys.modules)
     adapter = adapter_for(spec)
     cameras = {role: f"synthetic-{role}".encode() for role in spec.camera_roles}
     observation = CanonicalObservation(
@@ -449,7 +450,7 @@ def adapter_dry_run(spec: ModelSpec) -> dict[str, object]:
     action = adapter.canonical_action(native, observation)
     forbidden = sorted(
         name
-        for name in sys.modules
+        for name in set(sys.modules) - modules_before
         if name.startswith(("unitree_sdk2py", "cyclonedds"))
     )
     if forbidden:

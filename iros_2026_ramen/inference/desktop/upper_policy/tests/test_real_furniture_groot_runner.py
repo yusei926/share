@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import cv2
 import numpy as np
 import pytest
+
+cv2 = pytest.importorskip("cv2")
+pytest.importorskip("lerobot")
 
 import model.subtask_policy_training.deployment.real_furniture_groot_n17_worker as worker_module
 from inference.desktop.upper_policy.furniture_groot_contract import (

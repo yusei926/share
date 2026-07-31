@@ -6,7 +6,13 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-# Lower Policy (inference) tests (Issue #39)。SDK-free、default env で動く。
+# Desktop pipeline 全体の unit test (default env)。cv2/ultralytics/SDK は lazy import
+# なので default env で collection・実行でき、cyclonedds / YOLO weight 依存の test だけ
+# default env では skip される (それらは runtime env で走らせる)。#97 で desktop 配下
+# 全体が default env 完走可能になった。
+test-desktop = "pytest inference/desktop/ -v"
+# Lower Policy (inference) tests (Issue #39)。SDK-free、default env で動く
+# (test-desktop の部分集合、細粒度で lower_policy だけ回したいとき用)。
 test-lower-policy = "pytest inference/desktop/lower_policy/tests/ -v"
 
 [dependencies]
@@ -42,6 +48,13 @@ torch = "==2.12.1"
 torchvision = "==0.27.1"
 ultralytics = "==8.4.80"
 unitree-sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
+
+# runtime env で desktop 全体 test。default env の test-desktop で skip される
+# cyclonedds 依存 test も (cyclonedds install 済のため) 実行される。YOLO weight 依存
+# (test_yolo_obb) は weight を配置した時のみ走る (#96 M7)。二段構成の runtime 側。
+# 呼び出し: pixi run -e runtime test-desktop-runtime
+[feature.runtime.tasks]
+test-desktop-runtime = "pytest inference/desktop/ -v"
 
 # Model discovery, Hub download, contract audit, and adapter-only dry-runs.
 # Deliberately excludes Unitree SDK/CycloneDDS so these commands cannot

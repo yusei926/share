@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import cv2
+
+cv2 = pytest.importorskip("cv2")
 
 from inference.desktop.upper_policy.groot_pick_leg_contract import (
     CAMERA_KEYS,
