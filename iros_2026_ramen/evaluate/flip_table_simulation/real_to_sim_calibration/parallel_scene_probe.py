@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import shlex
 import sys
 from typing import Any
 
@@ -75,6 +74,27 @@ def read_candidates(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"candidate {index} has non-numeric camera values") from exc
         if not np.isfinite([*camera_offset_values, *camera_rpy_values]).all():
             raise ValueError(f"candidate {index} camera values must be finite")
+        robot_root = item.get("robot_root_pos_local_m")
+        robot_yaw = item.get("robot_root_yaw_rad")
+        if (robot_root is None) != (robot_yaw is None):
+            raise ValueError(
+                f"candidate {index} must provide robot_root_pos_local_m and robot_root_yaw_rad together"
+            )
+        if robot_root is None:
+            robot_root_values = None
+            robot_yaw_value = None
+        else:
+            if not isinstance(robot_root, list) or len(robot_root) != 3:
+                raise ValueError(
+                    f"candidate {index}.robot_root_pos_local_m must be [x,y,z]"
+                )
+            try:
+                robot_root_values = [float(value) for value in robot_root]
+                robot_yaw_value = float(robot_yaw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"candidate {index} has non-numeric robot values") from exc
+            if not np.isfinite([*robot_root_values, robot_yaw_value]).all():
+                raise ValueError(f"candidate {index} robot values must be finite")
         candidates.append(
             {
                 "label": str(item.get("label", f"candidate_{index:03d}")),
@@ -82,6 +102,11 @@ def read_candidates(path: Path) -> list[dict[str, Any]]:
                 "yaw_rad": yaw_value,
                 "head_stereo_offset_local_m": camera_offset_values,
                 "head_stereo_rotation_rpy_deg": camera_rpy_values,
+                # Preserve the source-derived fixed robot pose verbatim.  The
+                # task applies it once at reset; dropping it here silently
+                # changes the source camera/table geometry being calibrated.
+                "robot_root_pos_local_m": robot_root_values,
+                "robot_root_yaw_rad": robot_yaw_value,
             }
         )
     return candidates
@@ -103,12 +128,22 @@ def write_probe_environment(
         "FLIP_TABLE_SAVE_RECORDED_CAMERA_GEOMETRY": "true",
         "FLIP_TABLE_CAMERA_FRAME_INDICES": str(frame_index),
         "FLIP_TABLE_CAMERA_FRAME_BATCH_EXPORT": "true",
-        # Per-step scene diagnostics are intentionally single-environment
-        # telemetry for an action replay. A parallel static probe has no
-        # contact/trajectory fit to perform, so do not invoke that AVP-facing
-        # callback for each candidate.
-        "FLIP_TABLE_SAVE_CALIBRATION_SCENE_TRACE": "false",
+        # A rendered candidate is not evidence that its reset transform was
+        # actually applied.  Persist the offline scene trace so the CAD/FK
+        # conformance verifier can compare the realized camera, robot, table,
+        # and workbench transforms before visual scores are interpreted.  The
+        # trace remains diagnostic-only and is never supplied to a policy.
+        "FLIP_TABLE_SAVE_CALIBRATION_SCENE_TRACE": "true",
+        # A calibration candidate must not inherit authored camera xforms or
+        # task caches from an earlier persistent-worker job. Recreate the
+        # Gym/task environment while keeping the expensive Isaac app alive.
+        "FLIP_TABLE_PERSISTENT_RECREATE_ENV": "true",
         "FLIP_TABLE_CALIBRATION_NUM_ENVS": str(len(candidates)),
+        # The explicit source reset may retain a real overhang. Require the
+        # tabletop center to remain safely supported and retain 70% projected
+        # contact area; randomized resets and success stay conservative.
+        "FLIP_TABLE_CALIBRATION_SUPPORT_CENTER_MARGIN_M": "0.05",
+        "FLIP_TABLE_CALIBRATION_MIN_WORKBENCH_SUPPORT_FRACTION": "0.70",
         "FLIP_TABLE_CALIBRATION_TABLE_POSES_JSON": json.dumps(candidates, separators=(",", ":")),
     }
     atomic_write_json(
@@ -123,7 +158,11 @@ def write_probe_environment(
         },
     )
     lines = ["# Generated offline calibration environment. Source before run_eval.sh."]
-    lines += [f"export {name}={shlex.quote(value)}" for name, value in environment.items()]
+    # Python repr is accepted both by POSIX shell `source` and by
+    # persistent_eval_client._read_generated_environment. shlex.quote emits
+    # bare tokens such as `true`, which are valid shell but not a Python
+    # string literal and therefore made generated probe jobs unsubmitable.
+    lines += [f"export {name}={value!r}" for name, value in environment.items()]
     atomic_write_text(output_dir / "parallel_probe.env", "\n".join(lines) + "\n")
     return environment
 
@@ -140,7 +179,14 @@ def score_probe(real_image: Path, frame_dir: Path, manifest_path: Path) -> dict[
     real_corners = np.asarray(real["corners_px"], dtype=np.float64)
     scored: list[dict[str, Any]] = []
     for index, candidate in enumerate(candidates):
-        image = frame_dir / f"env_{index:03d}" / "head_left_rgb.png"
+        # The policy writes a flat frame directory for one active environment
+        # and env_NNN subdirectories only for a true batch export. A persistent
+        # worker intentionally fixes num_envs=1, so support both layouts while
+        # preserving the explicit manifest candidate ordering for batched runs.
+        flat_image = frame_dir / "head_left_rgb.png"
+        image = flat_image if len(candidates) == 1 and flat_image.is_file() else (
+            frame_dir / f"env_{index:03d}" / "head_left_rgb.png"
+        )
         entry: dict[str, Any] = {"environment_index": index, "candidate": candidate, "image": str(image)}
         try:
             simulated = _estimate(

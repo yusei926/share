@@ -1043,4 +1043,6 @@ def stage_success_bonus(env) -> torch.Tensor:
 
 def demo_residual_l2(env) -> torch.Tensor:
     action = as_torch(env.action_manager.action)
-    return torch.mean(action[:, :17] ** 2, dim=1)
+    if action.ndim != 2 or action.shape[1] != 16:
+        raise RuntimeError(f"policy action must be [B,16], got {tuple(action.shape)}")
+    return torch.mean(action[:, :14] ** 2, dim=1)

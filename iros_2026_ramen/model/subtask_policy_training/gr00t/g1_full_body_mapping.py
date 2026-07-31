@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 from typing import Any
+
+try:
+    from .dex1_hand_synergy import dex1_to_hand
+except ImportError:  # Loaded directly by data-materialization utilities.
+    package_root = Path(__file__).resolve().parents[1]
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+    from gr00t.dex1_hand_synergy import dex1_to_hand
 
 
 REAL_G1_RELATIVE_EEF_STATE_DIM = 49
 REAL_G1_RELATIVE_EEF_ACTION_DIM = 53
+GROOT_N17_PACKED_STATE_DIM = 132
+GROOT_N17_PACKED_ACTION_DIM = 132
+GROOT_N17_VALID_ACTION_DIM = 46
 REAL_G1_RELATIVE_EEF_EMBODIMENT_TAG = "real_g1_relative_eef_relative_joints"
 REAL_G1_RELATIVE_EEF_EMBODIMENT_ID = 25
 GROOT_N17_NATIVE_ACTION_HORIZON = 40
@@ -190,7 +203,8 @@ UPPER_BODY_SOURCE_INDEX_MAP = (
     + [SOURCE_ROBOT_Q_DIM, SOURCE_ROBOT_Q_DIM + 1]
 )
 UPPER_BODY_STATE_DIM = len(UPPER_BODY_SOURCE_INDEX_MAP)
-UPPER_BODY_ACTION_DIM = UPPER_BODY_STATE_DIM
+UPPER_BODY_ACTION_SOURCE_INDEX_MAP = UPPER_BODY_SOURCE_INDEX_MAP[3:]
+UPPER_BODY_ACTION_DIM = len(UPPER_BODY_ACTION_SOURCE_INDEX_MAP)
 
 
 def map_source_row_to_real_g1_relative_eef(
@@ -209,16 +223,56 @@ def map_source_row_to_real_g1_relative_eef(
     the chunk's current observation. Pre-converting each row here would anchor
     future chunk elements to the wrong state.
     """
-    _require_dim("ee_state", ee_state, SOURCE_EEF_DIM)
     _require_dim("ee_action", ee_action, SOURCE_EEF_DIM)
-    _require_dim("robot_q_current", robot_q_current, SOURCE_ROBOT_Q_DIM)
     _require_dim("robot_q_desired", robot_q_desired, SOURCE_ROBOT_Q_DIM)
-    _require_dim("hand_state", hand_state, 2)
     _require_dim("hand_cmd", hand_cmd, 2)
 
-    state = [0.0] * REAL_G1_RELATIVE_EEF_STATE_DIM
+    state = map_source_state_to_real_g1_relative_eef(
+        ee_state=ee_state,
+        robot_q_current=robot_q_current,
+        hand_state=hand_state,
+    )
     action = [0.0] * REAL_G1_RELATIVE_EEF_ACTION_DIM
 
+    for side, source_start in (("left", 0), ("right", SOURCE_EEF_POSE_DIM)):
+        source_slice = slice(source_start, source_start + SOURCE_EEF_POSE_DIM)
+        _copy_into(
+            action,
+            REAL_G1_RELATIVE_EEF_ACTION_SLICES[f"{side}_wrist_eef_9d"],
+            source_euler_xyz_pose_to_xyz_rot6d(ee_action[source_slice]),
+        )
+
+    desired_joints = robot_q_desired[SOURCE_ROOT_POSE_DIM:]
+    for group in ("left_arm", "right_arm", "waist"):
+        source_slice = slice(*SOURCE_JOINT_SLICES[group])
+        _copy_into(
+            action,
+            REAL_G1_RELATIVE_EEF_ACTION_SLICES[group],
+            desired_joints[source_slice],
+        )
+
+    for index, side in enumerate(("left", "right")):
+        _copy_into(
+            action,
+            REAL_G1_RELATIVE_EEF_ACTION_SLICES[f"{side}_hand"],
+            dex1_to_hand(hand_cmd[index], side=side, kind="action"),
+        )
+
+    return state, action
+
+
+def map_source_state_to_real_g1_relative_eef(
+    *,
+    ee_state: list[Any],
+    robot_q_current: list[Any],
+    hand_state: list[Any],
+) -> list[float]:
+    """Map one observed G1 state into the pinned 49-D N1.7 slot order."""
+    _require_dim("ee_state", ee_state, SOURCE_EEF_DIM)
+    _require_dim("robot_q_current", robot_q_current, SOURCE_ROBOT_Q_DIM)
+    _require_dim("hand_state", hand_state, 2)
+
+    state = [0.0] * REAL_G1_RELATIVE_EEF_STATE_DIM
     for side, source_start in (("left", 0), ("right", SOURCE_EEF_POSE_DIM)):
         source_slice = slice(source_start, source_start + SOURCE_EEF_POSE_DIM)
         _copy_into(
@@ -226,14 +280,8 @@ def map_source_row_to_real_g1_relative_eef(
             REAL_G1_RELATIVE_EEF_STATE_SLICES[f"{side}_wrist_eef_9d"],
             source_euler_xyz_pose_to_xyz_rot6d(ee_state[source_slice]),
         )
-        _copy_into(
-            action,
-            REAL_G1_RELATIVE_EEF_ACTION_SLICES[f"{side}_wrist_eef_9d"],
-            source_euler_xyz_pose_to_xyz_rot6d(ee_action[source_slice]),
-        )
 
     current_joints = robot_q_current[SOURCE_ROOT_POSE_DIM:]
-    desired_joints = robot_q_desired[SOURCE_ROOT_POSE_DIM:]
     for group in ("left_arm", "right_arm", "waist"):
         source_slice = slice(*SOURCE_JOINT_SLICES[group])
         _copy_into(
@@ -241,20 +289,14 @@ def map_source_row_to_real_g1_relative_eef(
             REAL_G1_RELATIVE_EEF_STATE_SLICES[group],
             current_joints[source_slice],
         )
-        _copy_into(
-            action,
-            REAL_G1_RELATIVE_EEF_ACTION_SLICES[group],
-            desired_joints[source_slice],
-        )
 
-    # Dex1-1 exposes one open/close coordinate per hand. Keep it in the first
-    # element of the official seven-value hand group and make the unavailable
-    # coordinates explicit zero padding.
     for index, side in enumerate(("left", "right")):
-        _copy_into(state, REAL_G1_RELATIVE_EEF_STATE_SLICES[f"{side}_hand"], hand_state[index : index + 1])
-        _copy_into(action, REAL_G1_RELATIVE_EEF_ACTION_SLICES[f"{side}_hand"], hand_cmd[index : index + 1])
-
-    return state, action
+        _copy_into(
+            state,
+            REAL_G1_RELATIVE_EEF_STATE_SLICES[f"{side}_hand"],
+            dex1_to_hand(hand_state[index], side=side, kind="state"),
+        )
+    return state
 
 
 def source_euler_xyz_pose_to_xyz_rot6d(pose: list[Any]) -> list[float]:
@@ -306,7 +348,7 @@ def build_real_g1_relative_eef_modality_json(video_keys: list[str]) -> dict[str,
             "training_eef_format": "xyz_rot6d_absolute_rows; processor converts chunks with inv(T_current)@T_target",
             "action_configs": REAL_G1_RELATIVE_EEF_ACTION_CONFIGS,
             "selected_video_keys": selected_video_keys,
-            "dex1_hand_mapping": "open_close_in_first_of_seven_values; remaining six values are zero padding",
+            "dex1_hand_mapping": "fixed official G1 seven-joint synergy with least-squares inverse",
         },
     }
 
@@ -379,7 +421,9 @@ def map_robot_q_row_to_upper_body(row: dict[str, Any]) -> dict[str, Any]:
 
     mapped = dict(row)
     mapped["observation.state"] = [float(state[index]) for index in UPPER_BODY_SOURCE_INDEX_MAP]
-    mapped["action"] = [float(action[index]) for index in UPPER_BODY_SOURCE_INDEX_MAP]
+    # The waist remains observable, but Regular/WBC owns it.  Never materialize
+    # a learned waist target from legacy demonstrations.
+    mapped["action"] = [float(action[index]) for index in UPPER_BODY_ACTION_SOURCE_INDEX_MAP]
     return mapped
 
 
@@ -412,7 +456,7 @@ UPPER_BODY_STATE_NAMES = UPPER_BODY_JOINT_NAMES + [
     "left_gripper_q",
     "right_gripper_q",
 ]
-UPPER_BODY_ACTION_NAMES = [f"{name}_target" for name in UPPER_BODY_JOINT_NAMES] + [
+UPPER_BODY_ACTION_NAMES = [f"{name}_target" for name in UPPER_BODY_JOINT_NAMES[3:]] + [
     "left_gripper_q_cmd",
     "right_gripper_q_cmd",
 ]
@@ -428,14 +472,14 @@ EEF_9D_COMPONENT_NAMES = [
     "rot6d_row1_y",
     "rot6d_row1_z",
 ]
-DEX1_PADDED_HAND_COMPONENT_NAMES = [
-    "dex1_open_close",
-    "unavailable_1",
-    "unavailable_2",
-    "unavailable_3",
-    "unavailable_4",
-    "unavailable_5",
-    "unavailable_6",
+DEX1_SYNERGY_HAND_COMPONENT_NAMES = [
+    "index_0",
+    "index_1",
+    "middle_0",
+    "middle_1",
+    "thumb_0",
+    "thumb_1",
+    "thumb_2",
 ]
 
 
@@ -446,7 +490,7 @@ def _real_g1_group_names(*, action: bool) -> list[str]:
         if group.endswith("eef_9d"):
             components = EEF_9D_COMPONENT_NAMES
         elif group in {"left_hand", "right_hand"}:
-            components = DEX1_PADDED_HAND_COMPONENT_NAMES
+            components = DEX1_SYNERGY_HAND_COMPONENT_NAMES
         elif group == "left_arm":
             components = G1_FULL_BODY_JOINT_NAMES[slice(*G1_FULL_BODY_STATE_SLICES["left_arm"])]
         elif group == "right_arm":

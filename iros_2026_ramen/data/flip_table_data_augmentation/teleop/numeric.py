@@ -75,7 +75,17 @@ class G1EefForwardKinematics:
         path = Path(urdf_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
-        wrapper = pin.RobotWrapper.BuildFromURDF(str(path), package_dirs=[str(path.parent)])
+        package_root = next(
+            (parent for parent in path.parents if (parent / "package.xml").is_file()),
+            None,
+        )
+        package_dirs = [
+            str(package_root.parent if package_root is not None else path.parent)
+        ]
+        wrapper = pin.RobotWrapper.BuildFromURDF(
+            str(path),
+            package_dirs=package_dirs,
+        )
         self.pin = pin
         self.model = wrapper.model
         self.data = wrapper.data
@@ -191,6 +201,20 @@ def convert_raw_episode(
         raise ValueError("raw manifest contains privileged policy features")
     frame_count = int(manifest["frame_count"])
     frames = _load_frames(trace_path, frame_count)
+    camera_valid = [
+        bool(frame.get("camera_bundle_valid", True)) for frame in frames
+    ]
+    declared_valid_indices = manifest.get("diagnostics", {}).get(
+        "training_valid_frame_indices"
+    )
+    if declared_valid_indices is not None:
+        expected_valid_indices = [
+            index for index, valid in enumerate(camera_valid) if valid
+        ]
+        if declared_valid_indices != expected_valid_indices:
+            raise ValueError(
+                "training_valid_frame_indices differs from frame validity"
+            )
     fk = G1EefForwardKinematics(urdf_path)
     converted = [numeric_features(frame, fk=fk) for frame in frames]
 
@@ -205,6 +229,7 @@ def convert_raw_episode(
         (
             pa.field("timestamp", pa.float32()),
             pa.field("frame_index", pa.int64()),
+            pa.field("camera_valid", pa.bool_()),
         )
     )
     arrays.extend(
@@ -214,6 +239,7 @@ def convert_raw_episode(
                 type=pa.float32(),
             ),
             pa.array(range(frame_count), type=pa.int64()),
+            pa.array(camera_valid, type=pa.bool_()),
         )
     )
     table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
@@ -232,6 +258,8 @@ def convert_raw_episode(
         "episode_id": manifest["episode_id"],
         "frame_count": frame_count,
         "fps": manifest["fps"],
+        "camera_valid_count": sum(camera_valid),
+        "camera_invalid_count": frame_count - sum(camera_valid),
         "raw_manifest_sha256": sha256_file(manifest_path),
         "raw_trace_sha256": sha256_file(trace_path),
         "urdf_sha256": sha256_file(fk.urdf_path),

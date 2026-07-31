@@ -95,8 +95,8 @@ args_cli.enable_cameras = True
 
 def _parse_constant_residual(raw: str) -> list[float]:
     values = [float(value.strip()) for value in raw.split(",") if value.strip()]
-    if len(values) != 19:
-        raise ValueError("--constant-residual must contain exactly 19 comma-separated values")
+    if len(values) != 16:
+        raise ValueError("--constant-residual must contain exactly 16 comma-separated values")
     if not all(math.isfinite(value) and -1.0 <= value <= 1.0 for value in values):
         raise ValueError("--constant-residual values must be finite and in [-1, 1]")
     return values
@@ -404,11 +404,11 @@ def main() -> None:
             _parse_constant_residual(args_cli.constant_residual),
             dtype=torch.float32,
             device=args_cli.device,
-        ).reshape(1, 19)
+        ).reshape(1, 16)
         if args_cli.residual_mode in {"constant", "policy_plus_constant"}
         else None
     )
-    expected_observation_dim = flow.config.model_dim + 3 * 19
+    expected_observation_dim = flow.config.model_dim + 19 + 2 * 16
     if agent is not None and agent.config.observation_dim != expected_observation_dim:
         raise ValueError(
             "RLPD observation dimension does not match Flow checkpoint: "
@@ -475,7 +475,7 @@ def main() -> None:
         "deployable_prefix_controller_steps": deployable_prefix_controller_steps,
         "reset_settle_steps": args_cli.reset_settle_steps,
         "policy_inputs": POLICY_INPUTS,
-        "policy_output": "19D upper-body absolute joint target",
+        "policy_output": "16D arm/hand absolute joint target",
         "actor_critic_privileged_inputs": [],
         "privileged_use": "success, safety and trace diagnostics only",
         "lower_body_policy_control": False,
@@ -508,7 +508,7 @@ def main() -> None:
             )
             clock = PolicyControlClock(args_cli.policy_hz, args_cli.sim_control_hz)
             target_safety.reset()
-            previous_residual = torch.zeros((1, 19), device=env.device)
+            previous_residual = torch.zeros((1, 16), device=env.device)
             episode_safe = True
             ever_curriculum_stage_success = False
             ever_task_success = False

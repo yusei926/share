@@ -30,7 +30,10 @@
       "task": "recover or regrasp"
     },
     "flip_table": {
-      "task": "flip table"
+      "task": "flip table",
+      "dataset_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2",
+      "dataset_revision": "0dc47877dfb2efbea796a059c81290c649bc773c",
+      "groot_policy_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2"
     }
   },
   "cameras": [
@@ -101,12 +104,9 @@
   },
   "action": {
     "key": "action",
-    "dimension": 19,
+    "dimension": 16,
     "semantics": "upper_body_absolute_target",
     "names": [
-      "waist_yaw_joint_target",
-      "waist_roll_joint_target",
-      "waist_pitch_joint_target",
       "left_shoulder_pitch_joint_target",
       "left_shoulder_roll_joint_target",
       "left_shoulder_yaw_joint_target",
@@ -143,7 +143,8 @@
   "validation": {
     "seed": 42,
     "validation_fraction": 0.1,
-    "test_fraction": 0.1
+    "test_fraction": 0.1,
+    "source_split_column": "curation_split"
   },
   "policy_defaults": {
     "act": {
@@ -185,8 +186,18 @@
       "base_model_path": "nvidia/GR00T-N1.7-3B",
       "base_model_revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495",
       "embodiment_tag": "real_g1_relative_eef_relative_joints",
-      "chunk_size": 16,
-      "n_action_steps": 16,
+      "policy_impl": "furniture_groot",
+      "chunk_size": 40,
+      "n_action_steps": 10,
+      "valid_action_dim": 46,
+      "progress_enabled": true,
+      "progress_loss_weight": 0.05,
+      "progress_monotonicity_weight": 0.01,
+      "progress_hidden_dim": 512,
+      "progress_sidecar": "outputs/progress_sidecars/flip_table_v2/progress.jsonl",
+      "visual_rotation_sidecar": "outputs/progress_sidecars/flip_table_v2/visual_rotation.jsonl",
+      "visual_rotation_weight_repo": "Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy",
+      "visual_rotation_weight_file": "runs/m_lowaug_v3/weights/best.pt",
       "use_relative_actions": true,
       "relative_exclude_joints": [
         "hand",
@@ -197,7 +208,8 @@
       "require_native_relative_eef_processor": true,
       "processor_overlay_root": "outputs/groot_base_overlays/real_g1_relative_eef_3cam",
       "use_bf16": true,
-      "image_transforms_enable": true,
+      "image_transforms_enable": false,
+      "consistent_gpu_augmentation": true,
       "batch_size": 64,
       "steps": 20000,
       "save_freq": 5000,

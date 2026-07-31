@@ -6,8 +6,8 @@ set -euo pipefail
   exit 2
 }
 
-XR_REVISION="4c0afdb81f2c19709f053c9c9890a98aca687b44"
-TELEVUER_REVISION="948f65f6852410610483345e69715a0c673a99eb"
+XR_REVISION="7dc9aa1a6edbf4a9f4f887d8ab6fc449ea5135f6"
+TELEVUER_REVISION="766de45e74373ae0ea66321d942ce538385655a5"
 XR_SOURCE="${XR_TELEOP_SOURCE:-$HOME/GitHub/unitree/xr_teleoperate}"
 XR_ROOT="${XR_TELEOP_ROOT:-$HOME/.cache/iros_2026_ramen/xr_teleoperate-$XR_REVISION}"
 if [[ -n "${XR_TELEOP_CONDA:-}" ]]; then
@@ -61,6 +61,13 @@ if [[ -n "$(git -C "$XR_ROOT" status --porcelain --untracked-files=no)" ]]; then
   exit 1
 fi
 
+if ! "$CONDA_EXE" run -n "$XR_ENV" python -c \
+  'from importlib.metadata import version; assert version("mcap") == "1.3.0"' \
+  >/dev/null 2>&1; then
+  "$CONDA_EXE" run --no-capture-output -n "$XR_ENV" python -m pip install \
+    --disable-pip-version-check "mcap==1.3.0"
+fi
+
 PYTHONPATH="$REPO_ROOT:$XR_ROOT:$XR_ROOT/teleop/televuer/src:$XR_ROOT/teleop/teleimager/src" \
   "$CONDA_EXE" run --no-capture-output -n "$XR_ENV" python - <<'PY'
 from data.flip_table_data_augmentation.teleop.upstream_compat import install_logging_mp_compat
@@ -68,10 +75,29 @@ from data.flip_table_data_augmentation.teleop.upstream_compat import install_log
 install_logging_mp_compat()
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from televuer import TeleVuerWrapper
-from teleimager.image_client import ImageClient
+from teleimager.image_client import ImageClient, TeleImage
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
+from data.flip_table_data_augmentation.teleop.real.teleimager import receive_teleimage
+from data.flip_table_data_augmentation.teleop.real.lossless_camera import (
+    CameraFrameEnvelope,
+)
 
-print("pinned-xr-runtime-imports-ok")
+import inspect
+import numpy as np
+
+assert "request_bgr" in inspect.signature(ImageClient).parameters
+sample = np.zeros((2, 3, 3), dtype=np.uint8)
+adapted = receive_teleimage(lambda: TeleImage(30.0, b"jpeg", sample))
+assert adapted.bgr is sample and adapted.jpg == b"jpeg" and adapted.fps == 30.0
+assert CameraFrameEnvelope(
+    role="head_stereo",
+    usb_serial="runtime-check",
+    source_sequence=1,
+    orin_capture_monotonic_ns=1,
+    jpeg=b"jpeg",
+).jpeg_sha256
+
+print("pinned-xr-runtime-imports-and-teleimage-contract-ok")
 PY
 
 cat <<EOF

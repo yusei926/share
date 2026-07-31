@@ -1,0 +1,46 @@
+[workspace]
+name = "curation_tool"
+version = "0.1.0"
+description = "IROS 2026 G1_WBT per-segment quality curation tool (Issue #79)"
+authors = ["Team RAMEN"]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "==3.12.13"
+pytest = "==9.1.1"
+
+# parquet / dataframe (labels_io + loader)
+pyarrow = "==25.0.0"
+pandas = "==2.3.3"  # lerobot 0.6.0 の pandas<3.0 pin に合わせて 2.x を採用
+
+# HF sync + HF dataset load
+huggingface_hub = "==1.23.0"
+
+# UI backend (FastAPI)
+fastapi = "==0.139.0"
+
+# LeRobot v3 dataset load 一式 (torch / torchvision / opencv-python-headless / numpy は
+# lerobot の transitive dep として自動で入る、torch は >=2.7,<2.12 で resolve)。
+# lerobot[dataset] extras 相当を明示: datasets + torchcodec + jsonlines + av
+lerobot = "==0.6.0"
+datasets = "==5.0.0"
+torchcodec = "==0.11.1"  # lerobot 0.6.0 の <0.12,>=0.3 に fit する latest
+jsonlines = "==4.0.0"
+av = "==15.1.0"  # lerobot 0.6.0 の av<16,>=15 に fit する latest
+ffmpeg = "==8.1.2"
+
+[pypi-dependencies]
+# ASGI server。[standard] extras で uvloop / httptools / python-dotenv / websockets 等が入る
+uvicorn = { version = "==0.51.0", extras = ["standard"] }
+
+[tasks.serve]
+# UI 起動 (Phase B 実装後)
+cmd = "python -m ui.app --port 8765"
+
+[tasks.sync-hf]
+# HF 手動 sync CLI (Phase B 実装後)
+cmd = "python -m ui.hf_sync"
+
+[tasks.test]
+cmd = "pytest tests/ -v"

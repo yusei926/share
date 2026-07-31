@@ -128,8 +128,11 @@ def _set_success_contract_environment(success: dict) -> None:
         "FLIP_TABLE_SUCCESS_MAX_ANGULAR_SPEED_RAD_S": success["settled_angular_speed_rad_s_max"],
         "FLIP_TABLE_SUCCESS_WORKBENCH_EDGE_MARGIN_M": success["workbench_edge_margin_m_min"],
         "FLIP_TABLE_SUCCESS_HOLD_STEPS": success["hold_steps_min"],
-        "FLIP_TABLE_LOCK_LOWER_BODY": "true",
-        "FLIP_TABLE_LOCK_ROBOT_ROOT": "true",
+        "FLIP_TABLE_SIM_BODY_MODE": "balanced_wbc",
+        "FLIP_TABLE_LOCK_LOWER_BODY": "false",
+        "FLIP_TABLE_LOCK_ROBOT_ROOT": "false",
+        "FLIP_TABLE_FIX_ROOT_LINK": "false",
+        "FLIP_TABLE_REQUIRE_WAIST_LOCK": "false",
         "FLIP_TABLE_RL_STAGE": "full",
     }
     for name, value in values.items():
@@ -176,9 +179,11 @@ def _set_physical_randomization_environment(config) -> None:
         "FLIP_TABLE_PREPARE_ASSEMBLED_SCENE": "true",
         "FLIP_TABLE_RANDOMIZE_UPPER_BODY_POSE": "true",
         "FLIP_TABLE_RANDOMIZE_CONTACT_MATERIALS": "true",
-        "FLIP_TABLE_LOCK_LOWER_BODY": "true",
-        "FLIP_TABLE_LOCK_ROBOT_ROOT": "true",
-        "FLIP_TABLE_FIX_ROOT_LINK": "true",
+        "FLIP_TABLE_SIM_BODY_MODE": "balanced_wbc",
+        "FLIP_TABLE_LOCK_LOWER_BODY": "false",
+        "FLIP_TABLE_LOCK_ROBOT_ROOT": "false",
+        "FLIP_TABLE_FIX_ROOT_LINK": "false",
+        "FLIP_TABLE_REQUIRE_WAIST_LOCK": "false",
         "FLIP_TABLE_RL_RANDOMIZE_MASS": "false",
         "FLIP_TABLE_EVAL_RANDOMIZE_MASS": "false",
         # Appearance is sampled only during accepted-trajectory replay.

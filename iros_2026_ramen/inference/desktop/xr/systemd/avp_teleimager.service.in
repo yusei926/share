@@ -1,0 +1,21 @@
+[Unit]
+Description=IROS RAMEN camera-only AVP TeleImager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@REPOSITORY_ROOT@
+EnvironmentFile=-/etc/default/iros-ramen-avp-teleimager
+Environment=IROS_AVP_RECORDING_ROOT=/home/unitree/teleimager/lossless_recordings
+Environment=IROS_AVP_RECORDER_PORT=60010
+ExecStart=@REPOSITORY_ROOT@/inference/desktop/xr/launch_orin_avp_image_server.sh --run
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

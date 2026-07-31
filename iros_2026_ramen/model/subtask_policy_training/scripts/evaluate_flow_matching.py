@@ -111,9 +111,9 @@ def main() -> None:
             "head-left RGB",
             "left D405 RGB",
             "right D405 RGB",
-            "19D upper-body joint state",
+            "19D waist/arm/hand observed state",
         ],
-        "policy_output": "19D upper-body absolute joint target chunk",
+        "policy_output": "16D arm/hand absolute joint target chunk",
         "privileged_inputs": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

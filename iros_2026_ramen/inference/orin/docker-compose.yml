@@ -1,0 +1,18 @@
+services:
+  ramen_inference:
+    build: .
+    image: ramen-inference:humble
+    network_mode: host
+    ipc: host
+    privileged: true
+    environment:
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - HEAD_CAMERA_DEVICE=${HEAD_CAMERA_DEVICE:-/dev/v4l/by-id/usb-USB2.0_Camera_RGB_USB2.0_Camera_RGB_01.00.00-video-index0}
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /dev/v4l:/dev/v4l
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    working_dir: /workspace
+    command: bash

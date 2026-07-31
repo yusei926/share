@@ -156,10 +156,20 @@ def _validate_policy_action(action: torch.Tensor, action_dim: int) -> torch.Tens
 
 def _processed_controller_target(raw_env) -> torch.Tensor:
     manager = raw_env.action_manager
-    body = torch.cat(
-        [manager.get_term(name)._processed_actions for name in ("waist_action", "left_arm_action", "right_arm_action")],
-        dim=1,
-    )
+    try:
+        body = manager.get_term("base_action").target_robot_joints_mujoco
+    except KeyError:
+        # Retained only for fixed_diagnostic replay of historical policies.
+        legacy = torch.cat(
+            [
+                manager.get_term(name)._processed_actions
+                for name in ("waist_action", "left_arm_action", "right_arm_action")
+            ],
+            dim=1,
+        )
+        body = legacy[:, 3:17]
+    if body.shape[1] != 14:
+        raise RuntimeError(f"controller arm target must be [B,14], got {tuple(body.shape)}")
     hand_commands = []
     for name in ("left_hand_action", "right_hand_action"):
         joints = manager.get_term(name)._processed_actions
@@ -311,7 +321,7 @@ def main() -> None:
         "camera_resolution": [640, 480],
         "policy_mode": "visual" if "Visual" in args_cli.rl else "state",
         "policy_inputs": VISUAL_POLICY_INPUTS if "Visual" in args_cli.rl else STATE_POLICY_INPUTS,
-        "policy_output": "19D upper-body residual converted to real-compatible joint targets",
+        "policy_output": "16D arm-and-hand residual converted to real-compatible joint targets",
         "action_source": "constant_scripted_teacher" if constant_action is not None else "checkpoint_mean",
         "constant_residual_action": (
             constant_action[0].detach().cpu().tolist() if constant_action is not None else None

@@ -29,6 +29,7 @@ UPPER_BODY_JOINT_NAMES = (
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 )
+ARM_JOINT_NAMES = UPPER_BODY_JOINT_NAMES[3:]
 
 LOWER_BODY_JOINT_NAMES = (
     "left_hip_pitch_joint",
@@ -50,51 +51,24 @@ DEX1_CLOSE_POS = -0.02
 DEMO_HAND_CLOSED = 0.0
 DEMO_HAND_OPEN = 4.5
 
-# Residuals are deliberately smaller than the full URDF range. The real
-# demonstration supplies the nominal motion and PPO learns contact corrections.
-RESIDUAL_SCALE_RAD = {
-    "waist_yaw_joint": 0.25,
-    "waist_roll_joint": 0.15,
-    "waist_pitch_joint": 0.18,
-    ".*_shoulder_pitch_joint": 0.40,
-    ".*_shoulder_roll_joint": 0.35,
-    ".*_shoulder_yaw_joint": 0.35,
-    ".*_elbow_joint": 0.40,
-    ".*_wrist_roll_joint": 0.45,
-    ".*_wrist_pitch_joint": 0.40,
-    ".*_wrist_yaw_joint": 0.45,
-}
-
-JOINT_POSITION_LIMITS_RAD = {
-    "waist_yaw_joint": (-2.618, 2.618),
-    "waist_roll_joint": (-0.520, 0.520),
-    "waist_pitch_joint": (-0.520, 0.520),
-    ".*_shoulder_pitch_joint": (-3.089, 2.670),
-    "left_shoulder_roll_joint": (-1.588, 2.251),
-    "right_shoulder_roll_joint": (-2.251, 1.588),
-    ".*_shoulder_yaw_joint": (-2.618, 2.618),
-    ".*_elbow_joint": (-1.047, 2.094),
-    ".*_wrist_roll_joint": (-1.972, 1.972),
-    ".*_wrist_pitch_joint": (-1.614, 1.614),
-    ".*_wrist_yaw_joint": (-1.614, 1.614),
-}
-
-ACTION_DIM = 19
+ACTION_DIM = 16
 DEFAULT_STAGE = "reach"
 
 
 def load_demo_actions(path: str | Path) -> torch.Tensor:
-    """Load and validate a 19-D real-robot upper-body target trajectory."""
+    """Load 16-D targets; deterministically drop waist from legacy 19-D data."""
 
     source = Path(path)
     payload = json.loads(source.read_text(encoding="utf-8"))
     if isinstance(payload, dict):
         payload = payload.get("actions")
     actions = torch.as_tensor(payload, dtype=torch.float32)
-    if actions.ndim != 2 or actions.shape[1] != 19 or actions.shape[0] < 2:
-        raise ValueError(f"demo actions must have shape [N>=2, 19], got {tuple(actions.shape)}")
+    if actions.ndim != 2 or actions.shape[1] not in {16, 19} or actions.shape[0] < 2:
+        raise ValueError(f"demo actions must be [N>=2,16] or legacy [N>=2,19], got {tuple(actions.shape)}")
     if not torch.isfinite(actions).all():
         raise ValueError("demo actions contain NaN or Inf")
+    if actions.shape[1] == 19:
+        actions = torch.cat((actions[:, 3:17], actions[:, 17:19]), dim=1)
     return actions
 
 
@@ -164,7 +138,7 @@ def load_labeled_residual_action_trajectory(
             raise ValueError(f"residual trajectory segment {index} must be an object")
         target = torch.as_tensor(segment.get("action"), dtype=torch.float32)
         if target.shape != (ACTION_DIM,) or not torch.isfinite(target).all():
-            raise ValueError(f"residual trajectory segment {index} must contain 19 finite values")
+            raise ValueError(f"residual trajectory segment {index} must contain 16 finite values")
         if torch.any(target.abs() > 1.0):
             raise ValueError(f"residual trajectory segment {index} exceeds [-1, 1]")
         steps = int(segment.get("steps", 0))
@@ -210,7 +184,7 @@ def load_residual_action_trajectory(
     target_control_hz: float | None = None,
     require_source_control_hz: bool = False,
 ) -> torch.Tensor:
-    """Expand and optionally time-resample a deployable 19-D trajectory."""
+    """Expand and optionally time-resample a deployable 16-D trajectory."""
 
     schedule, _labels, _metadata = load_labeled_residual_action_trajectory(
         path,
@@ -277,7 +251,7 @@ def action_prior_schedule(env) -> torch.Tensor:
         values = [float(value.strip()) for value in constant_raw.split(",") if value.strip()]
         if len(values) != ACTION_DIM:
             raise ValueError(
-                "FLIP_TABLE_RL_TEACHER_RESIDUAL_ACTION must contain 19 comma-separated values"
+                "FLIP_TABLE_RL_TEACHER_RESIDUAL_ACTION must contain 16 comma-separated values"
             )
         cached = torch.tensor(values, dtype=torch.float32, device=env.device).unsqueeze(0)
         if not torch.isfinite(cached).all():
@@ -335,7 +309,7 @@ def dex1_joint_velocity_to_command(values: torch.Tensor) -> torch.Tensor:
 
 def demo_actions_in_controller_domain(actions: torch.Tensor) -> torch.Tensor:
     result = actions.clone()
-    result[..., 17:19] = demo_hand_to_dex1_command(result[..., 17:19])
+    result[..., 14:16] = demo_hand_to_dex1_command(result[..., 14:16])
     return result
 
 
@@ -372,14 +346,14 @@ def nearest_demo_targets(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select a monotonic, state-conditioned target from a real demonstration.
 
-    Only the 17 real upper-body joint values are used. This same operation can
+    Only the 14 real arm joint values are used. This same operation can
     run in simulation and on G1, so it does not introduce privileged state.
     """
 
-    if current_joint_pos.ndim != 2 or current_joint_pos.shape[1] != 17:
-        raise ValueError(f"current_joint_pos must be [B, 17], got {tuple(current_joint_pos.shape)}")
-    if demo_actions.ndim != 2 or demo_actions.shape[1] != 19:
-        raise ValueError(f"demo_actions must be [T, 19], got {tuple(demo_actions.shape)}")
+    if current_joint_pos.ndim != 2 or current_joint_pos.shape[1] != 14:
+        raise ValueError(f"current_joint_pos must be [B,14], got {tuple(current_joint_pos.shape)}")
+    if demo_actions.ndim != 2 or demo_actions.shape[1] != 16:
+        raise ValueError(f"demo_actions must be [T,16], got {tuple(demo_actions.shape)}")
 
     batch = current_joint_pos.shape[0]
     horizon = demo_actions.shape[0]
@@ -398,7 +372,7 @@ def nearest_demo_targets(
 
     offsets = torch.arange(-search_back, search_forward + 1, device=current_joint_pos.device)
     candidates = (progress[:, None] + offsets[None, :]).clamp(lower, upper)
-    candidate_states = demo[candidates, :17]
+    candidate_states = demo[candidates, :14]
     distances = torch.mean((candidate_states - current_joint_pos[:, None, :]) ** 2, dim=-1)
     nearest = candidates.gather(1, distances.argmin(dim=1, keepdim=True)).squeeze(1)
     monotonic = torch.maximum(progress, nearest)

@@ -8,17 +8,19 @@ from pathlib import Path
 from typing import Sequence
 
 import torch
-from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
-from isaaclab.envs.mdp.actions.joint_actions import JointPositionAction
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.utils import configclass
 from robofinals.core.mdp.actions.joint_position_map_action import (
     JointPositionMapAction,
     JointPositionMapActionCfg,
 )
+from robofinals.core.mdp.actions.team_ramen_balanced_wbc_action import (
+    ARM_JOINT_NAMES,
+    TeamRamenBalancedWBCAction,
+    TeamRamenBalancedWBCActionCfg,
+)
 
 from .common import (
-    UPPER_BODY_JOINT_NAMES,
     action_prior_at_steps,
     action_prior_schedule,
     demo_hand_to_dex1_command,
@@ -98,14 +100,10 @@ def _policy_residual_range_multiplier() -> float:
 
 
 def _enforce_sim_lower_body_lock(env) -> None:
-    """Apply the task's fixed-lower-body contract before each RL control tick."""
+    """Reject legacy locking: WBC exclusively owns waist, legs and root."""
 
-    arena_cfg = getattr(env.cfg, "isaaclab_arena_env", None)
-    task = getattr(arena_cfg, "task", None)
-    lock = getattr(task, "_apply_lower_body_lock", None)
-    if lock is None:
-        raise RuntimeError("flip-table task does not expose the lower-body lock")
-    lock(env)
+    if os.environ.get("FLIP_TABLE_SIM_BODY_MODE", "balanced_wbc") != "balanced_wbc":
+        raise RuntimeError("Residual RLPD requires FLIP_TABLE_SIM_BODY_MODE=balanced_wbc")
 
 
 def _rlpd_absolute_target(env, *, num_envs: int) -> torch.Tensor:
@@ -113,15 +111,15 @@ def _rlpd_absolute_target(env, *, num_envs: int) -> torch.Tensor:
     if value is None:
         raise RuntimeError("RLPD runner must set env._flip_table_rlpd_absolute_target before env.step")
     target = torch.as_tensor(value, device=env.device, dtype=torch.float32)
-    if target.shape != (num_envs, 19):
-        raise ValueError(f"RLPD absolute target must be [{num_envs},19], got {tuple(target.shape)}")
+    if target.shape != (num_envs, 16):
+        raise ValueError(f"RLPD absolute target must be [{num_envs},16], got {tuple(target.shape)}")
     if not torch.isfinite(target).all():
         raise ValueError("RLPD absolute target contains NaN or Inf")
     return target
 
 
 def _external_absolute_target_enabled(env) -> bool:
-    """Return whether an offline controller currently owns the 19-D target.
+    """Return whether an offline controller currently owns the 16-D target.
 
     Normal Flow/RLPD execution keeps the default ``True``.  A scripted teacher
     can temporarily replay its recorded residual prefix with this disabled,
@@ -183,7 +181,7 @@ class _ResidualDelayBuffer:
             )
         if owner:
             env._flip_table_rlpd_last_commanded_target = torch.zeros(
-                (self.num_envs, 19),
+                (self.num_envs, 16),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -216,8 +214,8 @@ class _ResidualDelayBuffer:
                 self._delay_env._flip_table_rlpd_flow_ready[ids] = False
 
 
-class DemoResidualJointPositionAction(_ResidualDelayBuffer, JointPositionAction):
-    """Add bounded PPO residuals to a monotonic real-demonstration prior."""
+class DemoResidualJointPositionAction(_ResidualDelayBuffer, TeamRamenBalancedWBCAction):
+    """Compose 14-D arm targets, then delegate full-body control to WBC."""
 
     cfg: "DemoResidualJointPositionActionCfg"
 
@@ -233,14 +231,28 @@ class DemoResidualJointPositionAction(_ResidualDelayBuffer, JointPositionAction)
         self._env = env
         self._phase_settings = _phase_settings(env, self._demo_actions.shape[0])
         self._all_joint_ids, resolved_names = self._asset.find_joints(
-            list(UPPER_BODY_JOINT_NAMES), preserve_order=True
+            list(ARM_JOINT_NAMES), preserve_order=True
         )
-        if tuple(resolved_names) != UPPER_BODY_JOINT_NAMES:
-            raise RuntimeError(f"unexpected upper-body joint order: {resolved_names}")
-        demo_lookup = {name: index for index, name in enumerate(UPPER_BODY_JOINT_NAMES)}
-        self._demo_columns = torch.tensor(
-            [demo_lookup[name] for name in self._joint_names], device=self.device, dtype=torch.long
+        if tuple(resolved_names) != ARM_JOINT_NAMES:
+            raise RuntimeError(f"unexpected arm joint order: {resolved_names}")
+        self._demo_columns = torch.arange(
+            14, device=self.device, dtype=torch.long
         )
+        self._residual_scale = torch.tensor(
+            (0.40, 0.35, 0.35, 0.40, 0.45, 0.40, 0.45) * 2,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+        self._lower = torch.tensor(
+            (-3.089, -1.588, -2.618, -1.047, -1.972, -1.614, -1.614,
+             -3.089, -2.251, -2.618, -1.047, -1.972, -1.614, -1.614),
+            dtype=torch.float32, device=self.device,
+        ).unsqueeze(0)
+        self._upper = torch.tensor(
+            (2.670, 2.251, 2.618, 2.094, 1.972, 1.614, 1.614,
+             2.670, 1.588, 2.618, 2.094, 1.972, 1.614, 1.614),
+            dtype=torch.float32, device=self.device,
+        ).unsqueeze(0)
         self._policy_residual_range_multiplier = _policy_residual_range_multiplier()
         teacher, self._policy_correction_scale = _teacher_residual(env)
         self._teacher_residual = teacher[:, self._demo_columns]
@@ -254,11 +266,10 @@ class DemoResidualJointPositionAction(_ResidualDelayBuffer, JointPositionAction)
         self._use_flow_base = os.environ.get("FLIP_TABLE_RLPD_USE_FLOW_BASE", "false").strip().lower() in {
             "1", "true", "yes", "on"
         }
-        self._initialize_delay_buffer(env, self.action_dim, owner=cfg.sample_shared_delay)
+        self._initialize_delay_buffer(env, self.action_dim, owner=True)
 
     def process_actions(self, actions: torch.Tensor) -> None:
-        if self._delay_owner:
-            _enforce_sim_lower_body_lock(self._env)
+        _enforce_sim_lower_body_lock(self._env)
         self._raw_actions[:] = self._apply_action_delay(actions.clamp(-1.0, 1.0))
         current = self._asset.data.joint_pos[:, self._all_joint_ids]
         targets, self._progress = phase_demo_targets(
@@ -290,7 +301,7 @@ class DemoResidualJointPositionAction(_ResidualDelayBuffer, JointPositionAction)
             * self._policy_residual_range_multiplier
             * self._raw_actions
         ).clamp(-residual_limit, residual_limit)
-        self._processed_actions = prior + effective_residual * self._scale
+        self._processed_actions = prior + effective_residual * self._residual_scale
         if _absolute_target_path_active(
             self._env, use_flow_base=self._use_flow_base
         ) and _external_absolute_target_enabled(self._env):
@@ -303,15 +314,13 @@ class DemoResidualJointPositionAction(_ResidualDelayBuffer, JointPositionAction)
                 external_target,
                 self._processed_actions,
             )
-        if self.cfg.clip is not None:
-            self._processed_actions = torch.clamp(
-                self._processed_actions,
-                min=self._clip[:, :, 0],
-                max=self._clip[:, :, 1],
-            )
+        self._processed_actions = torch.maximum(
+            torch.minimum(self._processed_actions, self._upper), self._lower
+        )
         self._env._flip_table_rlpd_last_commanded_target[:, self._demo_columns] = (
             self._processed_actions.detach()
         )
+        TeamRamenBalancedWBCAction.process_actions(self, self._processed_actions)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
@@ -320,13 +329,12 @@ class DemoResidualJointPositionAction(_ResidualDelayBuffer, JointPositionAction)
 
 
 @configclass
-class DemoResidualJointPositionActionCfg(JointPositionActionCfg):
+class DemoResidualJointPositionActionCfg(TeamRamenBalancedWBCActionCfg):
     class_type: type[ActionTerm] = DemoResidualJointPositionAction
-    joint_names: list[str] = MISSING
+    joint_names: list[str] = [".*"]
     demo_lookahead: int = 3
     demo_search_back: int = 2
     demo_search_forward: int = 45
-    sample_shared_delay: bool = False
 
 
 class DemoResidualDex1Action(_ResidualDelayBuffer, JointPositionMapAction):
@@ -348,10 +356,10 @@ class DemoResidualDex1Action(_ResidualDelayBuffer, JointPositionMapAction):
         self._env = env
         self._phase_settings = _phase_settings(env, self._demo_actions.shape[0])
         self._all_joint_ids, resolved_names = self._asset.find_joints(
-            list(UPPER_BODY_JOINT_NAMES), preserve_order=True
+            list(ARM_JOINT_NAMES), preserve_order=True
         )
-        if tuple(resolved_names) != UPPER_BODY_JOINT_NAMES:
-            raise RuntimeError(f"unexpected upper-body joint order: {resolved_names}")
+        if tuple(resolved_names) != ARM_JOINT_NAMES:
+            raise RuntimeError(f"unexpected arm joint order: {resolved_names}")
         self._policy_residual_range_multiplier = _policy_residual_range_multiplier()
         teacher, self._policy_correction_scale = _teacher_residual(env)
         self._teacher_residual = teacher[:, self.cfg.demo_column : self.cfg.demo_column + 1]

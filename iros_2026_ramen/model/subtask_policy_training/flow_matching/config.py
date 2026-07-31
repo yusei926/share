@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-SCHEMA_VERSION = "team_ramen_flow_matching_v2"
+SCHEMA_VERSION = "team_ramen_flow_matching_v3"
 POLICY_CAMERAS = (
     "observation.images.head_left",
     "observation.images.left_wrist",
@@ -17,7 +17,7 @@ POLICY_CAMERAS = (
 @dataclass(frozen=True)
 class FlowMatchingConfig:
     state_dim: int = 19
-    action_dim: int = 19
+    action_dim: int = 16
     action_horizon: int = 24
     n_action_steps: int = 6
     fps: int = 30
@@ -38,8 +38,10 @@ class FlowMatchingConfig:
     deterministic_noise_seed: int = 17
 
     def __post_init__(self) -> None:
-        if self.state_dim != 19 or self.action_dim != 19:
-            raise ValueError("the G1 upper-body policy contract requires 19-D state and action")
+        if self.state_dim != 19 or self.action_dim != 16:
+            raise ValueError(
+                "the G1 policy contract requires 19-D observed state and 16-D arm/hand action"
+            )
         if self.fps != 30:
             raise ValueError("the real demonstration contract requires 30 fps")
         if self.action_horizon < 2:

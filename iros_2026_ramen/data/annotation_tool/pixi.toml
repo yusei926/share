@@ -1,0 +1,58 @@
+[workspace]
+name = "annotation_tool"
+version = "0.1.0"
+description = "IROS 2026 Upper Policy 用 Label Studio + YOLO-OBB annotation pipeline (Epic #43, Issue #44)"
+authors = ["Team RAMEN"]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "==3.10.20"
+numpy = "==2.2.6"
+pillow = "==12.2.0"
+python-dotenv = "==1.2.2"
+huggingface_hub = "==1.20.1"
+redis-server = "==8.8.0"
+pytest = "==9.1.1"
+
+[pypi-dependencies]
+# label-studio 系は /install 経由で pinned で追加 (supply-chain scan 済)
+# LeRobot v3.0 parquet 読み込み用 (label-studio が pyarrow<23 を要求するため 22.x に pin)
+pyarrow = "==22.0.0"
+label-studio = "==1.23.0"
+label-studio-sdk = "==2.0.18"
+
+[tasks.redis]
+# LS の RQ (background job queue) 用。--daemonize yes で back に回して即戻る、
+# pidfile を書いて `pixi run redis-stop` で確実に停止できるようにする。
+cmd = "redis-server --daemonize yes --pidfile $PWD/workspace/redis.pid --logfile $PWD/logs/redis.log --dir $PWD/workspace"
+
+[tasks.redis-stop]
+cmd = "test -f $PWD/workspace/redis.pid && kill $(cat $PWD/workspace/redis.pid) && rm -f $PWD/workspace/redis.pid || true"
+
+[tasks.serve]
+# 認証情報はローカル環境変数のみから受け取り、repository に固定値を残さない。
+# DOCUMENT_ROOT は $PWD 基準で cmd 内展開 (Linux 前提)
+# RQ 用 redis-server を前段で起動 (`depends-on = ["redis"]`)、無いと 6379 待ちで stuck する
+depends-on = ["redis"]
+cmd = "test -n \"${LABEL_STUDIO_USERNAME:-}\" && test -n \"${LABEL_STUDIO_PASSWORD:-}\" && test -n \"${LABEL_STUDIO_USER_TOKEN:-}\" || { echo 'Set LABEL_STUDIO_USERNAME, LABEL_STUDIO_PASSWORD, and LABEL_STUDIO_USER_TOKEN.' >&2; exit 2; }; LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=\"$PWD/workspace\" label-studio start --port 8080 --data-dir workspace/ls_data --username \"$LABEL_STUDIO_USERNAME\" --password \"$LABEL_STUDIO_PASSWORD\" --user-token \"$LABEL_STUDIO_USER_TOKEN\" --enable-legacy-api-token --no-browser"
+env = { LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED = "true", LABEL_STUDIO_DISABLE_SIGNALS = "true", COLLECT_ANALYTICS = "false", DISABLE_SIGNUP_WITHOUT_LINK = "true" }
+
+[tasks.bootstrap]
+# LS 起動後にプロジェクト作成 + Local storage 登録 + tasks import までを一発でやる
+cmd = "python scripts/bootstrap_project.py"
+
+[tasks.dump-frames]
+# LeRobot v3.0 head RGB → PNG 抽出 (trial 用サンプリング)
+cmd = "python scripts/dump_head_frames.py"
+
+[tasks.ls-to-yolo]
+# LS export JSON → YOLO OBB txt 変換
+cmd = "python scripts/ls_export_to_yolo_obb.py"
+
+[tasks.push-annotations]
+# LS project の annotations → YOLO OBB 変換 → HF push (ep 指定)
+cmd = "python scripts/push_annotations.py"
+
+[tasks.test]
+cmd = "pytest tests/ -v"

@@ -1,0 +1,43 @@
+[workspace]
+authors = ["Team RAMEN"]
+channels = ["conda-forge"]
+name = "iros-yolo-training"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+# YOLO-OBB 学習用 sub-workspace (Issue #45/46)。root workspace の runtime feature が
+# 持つ Unitree SDK path dep とは無関係に install できる (= 学習担当者は third_party
+# 不要)。tasks は cwd で repo root に降りて既存の module import を維持。
+
+[tasks]
+# YOLO-OBB dataset build (Issue #45)。HF pull → skill stratified split → ultralytics layout
+build-yolo-dataset = { cmd = "python -m data.yolo_obb.scripts.build_dataset", cwd = "../.." }
+
+# YOLO-OBB train (Issue #46)。config yaml で run 設定を切替
+# 使用例: cd model/yolo_obb && pixi run train-yolo --config model/yolo_obb/configs/s_baseline.yaml
+train-yolo = { cmd = "python -m model.yolo_obb.scripts.train", cwd = "../.." }
+
+# YOLO-OBB predict (Issue #46)。学習済 best.pt で未見 ep frame に inference + 描画
+# 使用例: cd model/yolo_obb && pixi run predict-yolo --run-name s_baseline --frames-ep 63 --n 30
+predict-yolo = { cmd = "python -m model.yolo_obb.scripts.predict", cwd = "../.." }
+
+# yolo_obb tests (data/yolo_obb + model/yolo_obb)
+test = { cmd = "pytest data/yolo_obb/tests/ model/yolo_obb/tests/ -v", cwd = "../.." }
+
+[dependencies]
+python = "==3.12.13"
+pyarrow = "==24.0.0"
+numpy = "==2.5.0"
+huggingface_hub = "==1.20.1"
+tqdm = "==4.68.3"
+pytest = "==9.1.1"
+python-dotenv = "==1.2.2"
+pyyaml = "==6.0.3"
+pillow = "==12.2.0"
+wandb = "==0.28.0"
+
+[pypi-dependencies]
+torch = "==2.12.1"
+torchvision = "==0.27.1"
+opencv-python = "==4.13.0.92"
+ultralytics = "==8.4.80"

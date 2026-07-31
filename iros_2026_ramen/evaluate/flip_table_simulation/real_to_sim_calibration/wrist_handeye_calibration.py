@@ -240,7 +240,13 @@ def _candidate_record(
     wrist_root = eef[SIDES.index(side)].reshape(4, 4) @ tool_from_eef
     # ``tool_from_eef`` is the inverse of the configured wrist-to-tool frame.
     nominal = _nominal_wrist_from_camera(frame, side, wrist_root)
-    camera_candidates = _camera_from_table_candidates(mask, intrinsic, distortion)
+    try:
+        camera_candidates = _camera_from_table_candidates(mask, intrinsic, distortion)
+    except ValueError:
+        # A selected segmentation mask can still have an occluded rim or no
+        # usable quadrilateral in one wrist view.  It is one rejected source
+        # observation, not a reason to discard all other static evidence.
+        return None
     wrist_candidates = tuple(
         np.linalg.inv(wrist_root) @ root_from_table @ np.linalg.inv(camera_from_table)
         for camera_from_table in camera_candidates

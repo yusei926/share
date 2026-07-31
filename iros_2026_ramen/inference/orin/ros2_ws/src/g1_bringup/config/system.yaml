@@ -1,0 +1,50 @@
+g1_mock_hw_bridge:
+  ros__parameters:
+    publish_rate_hz: 25.0
+    # 実 HBVCAM を usb_cam で publish するので mock 側の zero 画像 publish は off。
+    # joint_states / robot_state / hand_state 等は継続 (mock_hardware:=true 時のため)。
+    publish_images: false
+    image_topics_json: >-
+      {
+        "observation.images.cam_0": "/g1/cameras/cam_0/image_raw",
+        "observation.images.cam_1": "/g1/cameras/cam_1/image_raw",
+        "observation.images.cam_2": "/g1/cameras/cam_2/image_raw",
+        "observation.images.cam_3": "/g1/cameras/cam_3/image_raw"
+      }
+    image_height: 480
+    image_width: 640
+    image_publish_rate_hz: 5.0
+    log_commands: true
+    motion_enabled_default: true
+    joint_target_topic: /g1/joint_target
+    hand_command_topic: /g1/hand/command
+    hand_dim: 2
+    hand_names: [left_hand, right_hand]
+    ee_state_dim: 12
+    joint_names: [
+      g1_joint_00, g1_joint_01, g1_joint_02, g1_joint_03, g1_joint_04, g1_joint_05,
+      g1_joint_06, g1_joint_07, g1_joint_08, g1_joint_09, g1_joint_10, g1_joint_11,
+      g1_joint_12, g1_joint_13, g1_joint_14, g1_joint_15, g1_joint_16, g1_joint_17,
+      g1_joint_18, g1_joint_19, g1_joint_20, g1_joint_21, g1_joint_22, g1_joint_23,
+      g1_joint_24, g1_joint_25, g1_joint_26, g1_joint_27, g1_joint_28, g1_joint_29,
+      g1_joint_30, g1_joint_31, g1_joint_32, g1_joint_33, g1_joint_34, g1_joint_35
+    ]
+
+g1_real_hw_bridge:
+  ros__parameters:
+    # unitree_sdk2py 経由で rt/lowstate を subscribe → /joint_states + /g1/robot_state に publish。
+    # motor 命令 (rt/lowcmd) は一切発行しない → Damp state 安全性を bridge レベルで保証。
+    domain_id: 0
+    # G1 とOrinを繋ぐNIC名。現在のOrin実機ではeth0 (192.168.123.164/24)。
+    # 別機体・別NICへ移す際は必ず `ip a` で確認して変更すること。
+    interface: eth0
+    # SDK は ~500Hz で lowstate を吐くので、rclpy 側は 50Hz に throttle
+    # (RViz / debug 用途では 50Hz で十分、必要なら上げる)。
+    publish_rate_hz: 50.0
+    # 最初の lowstate を SDK から受け取るまで /joint_states を publish しない。
+    # false にすると zero position が最初に流れて RViz が一瞬 T-pose を表示する。
+    require_first_state_before_publish: true
+    # joint_names の source of truth は real_hw_bridge_node.py の
+    # joint_mapping.G1_JOINT_NAMES (29 個、G1JointIndex 0..28 順)。
+    # 特別な事情 (URDF 側 rename 追従、debug 用 subset 等) が無い限り yaml で
+    # override しない (drift 防止)。override したい場合はここに joint_names: [...] を追記。

@@ -28,6 +28,41 @@ ARM_JOINT_NAMES = (
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 )
+# Unitree xr_teleoperate main, assets/g1/g1_body29_hand14.urdf.  Configuration
+# may be more conservative, but it must never expand beyond these hardware
+# limits.  teleop_v1 intentionally keeps 0.03 rad of margin on every side.
+OFFICIAL_G1_29_ARM_LOWER_RAD = (
+    -3.0892,
+    -1.5882,
+    -2.618,
+    -1.0472,
+    -1.972222054,
+    -1.614429558,
+    -1.614429558,
+    -3.0892,
+    -2.2515,
+    -2.618,
+    -1.0472,
+    -1.972222054,
+    -1.614429558,
+    -1.614429558,
+)
+OFFICIAL_G1_29_ARM_UPPER_RAD = (
+    2.6704,
+    2.2515,
+    2.618,
+    2.0944,
+    1.972222054,
+    1.614429558,
+    1.614429558,
+    2.6704,
+    1.5882,
+    2.618,
+    2.0944,
+    1.972222054,
+    1.614429558,
+    1.614429558,
+)
 POLICY_CAMERA_KEYS = (
     "observation.images.cam_0",
     "observation.images.cam_2",
@@ -91,6 +126,7 @@ class Rates:
     servo_hz: int
     command_hz: int
     camera_hz: int
+    camera_poll_hz: int
     record_hz: int
 
 
@@ -196,10 +232,17 @@ def load_teleop_config(path: str | Path = DEFAULT_TELEOP_CONFIG_PATH) -> TeleopC
     rates_raw = _mapping(root["rates"], "rates")
     _exact(rates_raw, "rates", set(Rates.__dataclass_fields__))
     rates = Rates(**{key: int(_positive(value, f"rates.{key}")) for key, value in rates_raw.items()})
-    if rates.physics_hz != 100 or rates.servo_hz != 50:
-        raise ValueError("interactive sim physics/servo rates must remain 100/50 Hz")
-    if len({rates.command_hz, rates.camera_hz, rates.record_hz}) != 1 or rates.record_hz != 30:
-        raise ValueError("AVP commands, cameras, and recording must share the 30 Hz clock")
+    if rates.physics_hz != 200 or rates.servo_hz != 50:
+        raise ValueError("balanced-WBC sim physics/servo rates must remain 200/50 Hz")
+    if rates.camera_hz != 30 or rates.record_hz != 30:
+        raise ValueError("physical cameras and the canonical dataset must remain 30 Hz")
+    if rates.command_hz != 30:
+        raise ValueError("the canonical real/sim policy command clock must remain 30 Hz")
+    if rates.camera_poll_hz < 2 * rates.camera_hz:
+        raise ValueError(
+            "camera_poll_hz must oversample the latest-only camera transport "
+            "by at least two times"
+        )
 
     command_raw = _mapping(root["command_contract"], "command_contract")
     _exact(command_raw, "command_contract", {"arm_joint_names", "hand_target", "policy_cameras", "operator_cameras"})
@@ -221,6 +264,19 @@ def load_teleop_config(path: str | Path = DEFAULT_TELEOP_CONFIG_PATH) -> TeleopC
     upper = _range(safety_raw["arm_position_upper_rad"], "safety.arm_position_upper_rad", 14)
     if any(lo >= hi for lo, hi in zip(lower, upper, strict=True)):
         raise ValueError("arm position limits must have positive intervals")
+    if any(
+        lo < official_lo or hi > official_hi
+        for lo, hi, official_lo, official_hi in zip(
+            lower,
+            upper,
+            OFFICIAL_G1_29_ARM_LOWER_RAD,
+            OFFICIAL_G1_29_ARM_UPPER_RAD,
+            strict=True,
+        )
+    ):
+        raise ValueError(
+            "arm position limits exceed the official G1_29 URDF hardware range"
+        )
     safety = SafetyLimits(
         arm_position_lower_rad=lower,
         arm_position_upper_rad=upper,

@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://team-ramen.invalid/schemas/iros_ramen_deployment_v1.json",
+  "title": "Team RAMEN physical G1 deployment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "model_id",
+    "family",
+    "task",
+    "camera_roles",
+    "observation_horizon",
+    "model_state_dim",
+    "model_action_dim",
+    "model_action_horizon",
+    "execution_steps",
+    "state_semantics",
+    "action_semantics",
+    "canonical_output",
+    "lower_body_owner",
+    "artifact"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "team_ramen_g1_deployment/v1"
+    },
+    "model_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "family": {
+      "enum": [
+        "groot_absolute_joint_v1",
+        "groot_relative_eef_v1",
+        "diffusion_chunk_relative_v1"
+      ]
+    },
+    "task": {
+      "type": "string",
+      "minLength": 1
+    },
+    "camera_roles": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "head_left",
+          "head_right",
+          "left_wrist",
+          "right_wrist"
+        ]
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "observation_horizon": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "model_state_dim": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "model_action_dim": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "model_action_horizon": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "execution_steps": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "state_semantics": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action_semantics": {
+      "type": "string",
+      "minLength": 1
+    },
+    "canonical_output": {
+      "const": "arm14_absolute_rad+dex1_opening_fraction2"
+    },
+    "lower_body_owner": {
+      "const": "unitree_regular_mode"
+    },
+    "expected_model_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_subdir",
+        "required_files",
+        "allow_patterns",
+        "file_sha256"
+      ],
+      "properties": {
+        "checkpoint_subdir": {
+          "type": "string"
+        },
+        "required_files": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "allow_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "file_sha256": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

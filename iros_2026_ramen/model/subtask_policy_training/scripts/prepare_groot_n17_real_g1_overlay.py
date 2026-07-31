@@ -18,6 +18,14 @@ from huggingface_hub import snapshot_download
 MAPPING_PATH = Path(__file__).resolve().parents[1] / "gr00t" / "g1_full_body_mapping.py"
 MARKER_NAME = "team_ramen_groot_overlay.json"
 POLICY_VIDEO_KEYS = ["head_left", "left_wrist", "right_wrist"]
+PINNED_MODEL_PATH = "nvidia/GR00T-N1.7-3B"
+PINNED_REVISION = "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+PINNED_FILE_SHA256 = {
+    "config.json": "54c0367060cd310d0b3343fe72a589860a8b6e8173810164a4ffd6253f52e689",
+    "processor_config.json": "85c1b4690ae090559e79a45193e598b65d6146eedf14750884da65e6d31032be",
+    "statistics.json": "c97b1b07a82a8a8858771d56d278732d97dd8eae506032c146c77eb53828afc9",
+    "embodiment_id.json": "abc4a749389837416a102d9455a8c089336f2e417afb18565703b9944974bc35",
+}
 
 
 def load_mapping_module() -> Any:
@@ -93,20 +101,42 @@ def prepare_overlay(
     statistics = read_json(statistics_path)
     embodiment_ids = read_json(embodiment_path)
     validate_real_g1_contract(model_config, processor_config, statistics, embodiment_ids)
-    source_processor_sha256 = sha256_file(processor_path)
+    source_hashes = {
+        path.name: sha256_file(path)
+        for path in (model_config_path, processor_path, statistics_path, embodiment_path)
+    }
+    if model_path == PINNED_MODEL_PATH:
+        if revision != PINNED_REVISION:
+            raise ValueError(
+                f"{PINNED_MODEL_PATH} must be pinned to {PINNED_REVISION}, got {revision}"
+            )
+        if source_hashes != PINNED_FILE_SHA256:
+            raise ValueError(
+                "pinned GR00T N1.7 contract file hashes differ from the reviewed revision"
+            )
     marker = {
-        "schema_version": "team_ramen_groot_n17_overlay_v1",
+        "schema_version": "team_ramen_groot_n17_overlay_v2",
         "source_model_path": model_path,
         "requested_revision": revision,
         "resolved_source_root": source_root.as_posix(),
-        "source_processor_sha256": source_processor_sha256,
+        "source_file_sha256": source_hashes,
         "embodiment_tag": _mapping.REAL_G1_RELATIVE_EEF_EMBODIMENT_TAG,
         "embodiment_id": _mapping.REAL_G1_RELATIVE_EEF_EMBODIMENT_ID,
-        "video_delta_indices": [0],
+        "video_delta_indices": [-20, 0],
         "video_modality_keys": POLICY_VIDEO_KEYS,
         "state_dim": _mapping.REAL_G1_RELATIVE_EEF_STATE_DIM,
         "action_dim": _mapping.REAL_G1_RELATIVE_EEF_ACTION_DIM,
+        "packed_state_dim": _mapping.GROOT_N17_PACKED_STATE_DIM,
+        "packed_action_dim": _mapping.GROOT_N17_PACKED_ACTION_DIM,
+        "valid_action_dim": _mapping.GROOT_N17_VALID_ACTION_DIM,
+        "action_horizon": _mapping.GROOT_N17_NATIVE_ACTION_HORIZON,
         "action_configs": _mapping.REAL_G1_RELATIVE_EEF_ACTION_CONFIGS,
+        "intentional_pretraining_differences": {
+            "video_modality_keys": {
+                "official": ["ego_view"],
+                "fine_tuning": POLICY_VIDEO_KEYS,
+            }
+        },
     }
 
     marker_path = output_root / MARKER_NAME
@@ -131,7 +161,7 @@ def prepare_overlay(
             _mapping.REAL_G1_RELATIVE_EEF_EMBODIMENT_TAG
         ]
         modality["video"] = {
-            "delta_indices": [0],
+            "delta_indices": [-20, 0],
             "modality_keys": POLICY_VIDEO_KEYS,
         }
         write_json(temporary / "processor_config.json", overlay_config)

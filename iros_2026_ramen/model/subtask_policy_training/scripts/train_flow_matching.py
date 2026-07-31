@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the three-camera 19-D flow-matching behavior-cloning policy."""
+"""Train the three-camera 19-D-state/16-D-action flow-matching policy."""
 
 from __future__ import annotations
 
@@ -188,8 +188,8 @@ def validate(
                 step_count = int(valid.sum())
                 raw_error_sum += float((raw_error * valid).sum())
                 normalized_error_sum += float((normalized_error * valid).sum())
-                body_error_sum += float((raw_error[..., :17] * valid).sum())
-                hand_error_sum += float((raw_error[..., 17:] * valid).sum())
+                body_error_sum += float((raw_error[..., :14] * valid).sum())
+                hand_error_sum += float((raw_error[..., 14:16] * valid).sum())
                 valid_steps += step_count
                 action_samples += action_count
     finally:
@@ -205,7 +205,7 @@ def validate(
         "action_mae": raw_error_sum / (valid_steps * model.config.action_dim),
         "action_normalized_mae": normalized_error_sum
         / (valid_steps * model.config.action_dim),
-        "body_action_mae_rad": body_error_sum / (valid_steps * 17),
+        "body_action_mae_rad": body_error_sum / (valid_steps * 14),
         "dex1_action_mae": hand_error_sum / (valid_steps * 2),
         "action_samples": float(action_samples),
     }
@@ -369,9 +369,9 @@ def main() -> None:
             "head-left RGB 640x480",
             "left D405 RGB 640x480",
             "right D405 RGB 640x480",
-            "19D upper-body joint state",
+            "19D waist/arm/hand observed state",
         ],
-        "policy_output": "19D upper-body absolute joint targets",
+        "policy_output": "16D arm/hand absolute joint targets",
         "sim_privileged_policy_inputs": [],
     }
     (args.output_dir / "training_manifest.json").write_text(

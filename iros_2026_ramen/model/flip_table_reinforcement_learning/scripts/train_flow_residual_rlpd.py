@@ -42,7 +42,7 @@ parser.add_argument("--initial-temperature", type=float, default=1.0e-3)
 parser.add_argument(
     "--prior-residual",
     default="",
-    help="Successful 19D comma-separated residual used for prior replay and actor initialization.",
+    help="Successful 16D arm/hand residual used for prior replay and actor initialization.",
 )
 parser.add_argument("--policy-hz", type=float, default=30.0)
 parser.add_argument("--sim-control-hz", type=float, default=50.0)
@@ -77,10 +77,10 @@ args_cli.enable_cameras = True
 
 def parse_prior_residual(raw: str) -> list[float]:
     if not raw.strip():
-        return [0.0] * 19
+        return [0.0] * 16
     values = [float(value.strip()) for value in raw.split(",") if value.strip()]
-    if len(values) != 19:
-        raise ValueError("--prior-residual must contain exactly 19 comma-separated values")
+    if len(values) != 16:
+        raise ValueError("--prior-residual must contain exactly 16 comma-separated values")
     if not all(math.isfinite(value) and -1.0 < value < 1.0 for value in values):
         raise ValueError("--prior-residual values must be finite and strictly inside (-1, 1)")
     return values
@@ -344,7 +344,7 @@ def save_combined_checkpoint(
                 "schema_version": "team_ramen_flow_residual_rlpd_v1",
                 "transitions": transitions,
                 "policy_inputs": POLICY_INPUTS,
-                "policy_output": "19D upper-body absolute joint targets",
+                "policy_output": "16D arm/hand absolute joint targets",
                 "privileged_inputs": [],
                 "sim_privileged_use": "reward, success, curriculum and diagnostics only",
                 "training_prior_residual": (
@@ -439,7 +439,7 @@ def restore_training_resume(
     if payload.get("schema_version") != "team_ramen_flow_residual_rlpd_training_v1":
         raise ValueError("unsupported Flow Residual RLPD training checkpoint schema")
     restored_prior = torch.tensor(
-        payload.get("prior_residual", [0.0] * 19),
+        payload.get("prior_residual", [0.0] * 16),
         dtype=expected_prior_residual.dtype,
         device=expected_prior_residual.device,
     ).reshape(-1)
@@ -519,7 +519,7 @@ def main() -> None:
     flow = FlowMatchingPolicy.from_pretrained(flow_checkpoint, device=env.device)
     flow.requires_grad_(False)
     flow_motion_gain = float(os.environ.get("FLIP_TABLE_RLPD_FLOW_MOTION_GAIN", "1.0"))
-    observation_dim = flow.config.model_dim + 3 * 19
+    observation_dim = flow.config.model_dim + 19 + 2 * 16
     stage = os.environ.get("FLIP_TABLE_RL_STAGE", "reach").strip().lower()
     stochastic_action_mask = stochastic_action_mask_for_stage(stage)
     scheduler = FlowTargetScheduler(
@@ -531,7 +531,7 @@ def main() -> None:
         stochastic_action_mask,
         dtype=torch.float32,
         device=env.device,
-    ).reshape(1, 19)
+    ).reshape(1, 16)
     agent = RLPDAgent(
         RLPDConfig(
             observation_dim=observation_dim,
@@ -575,14 +575,14 @@ def main() -> None:
         parse_prior_residual(args_cli.prior_residual),
         dtype=torch.float32,
         device=env.device,
-    ).reshape(1, 19)
+    ).reshape(1, 16)
     prior_residual_reference = prior_residual.clone()
     if args_cli.resume is None and args_cli.prior_residual.strip():
         agent.initialize_actor_residual(prior_residual[0])
     prior = ReplayBuffer(args_cli.prior_replay_capacity, observation_dim)
     online = ReplayBuffer(args_cli.online_replay_capacity, observation_dim)
     rng = np.random.default_rng(args_cli.seed)
-    previous_residual = torch.zeros((env.num_envs, 19), device=env.device)
+    previous_residual = torch.zeros((env.num_envs, 16), device=env.device)
     clock = PolicyControlClock(args_cli.policy_hz, args_cli.sim_control_hz)
     target_safety = target_safety_from_environment(policy_hz=args_cli.policy_hz)
     randomization_level = max(
@@ -670,7 +670,7 @@ def main() -> None:
         "env_spacing_m": float(env.cfg.scene.env_spacing),
         "observation_dim": observation_dim,
         "policy_inputs": POLICY_INPUTS,
-        "policy_output": "19D upper-body absolute joint target",
+        "policy_output": "16D arm/hand absolute joint target",
         "actor_critic_privileged_inputs": [],
         "sim_privileged_use": "reward, success, curriculum and diagnostics only",
         "lower_body_policy_control": False,
@@ -707,7 +707,7 @@ def main() -> None:
             "enabled": runtime_policy_start_step(env) > 0,
             "runtime_controller_steps": runtime_policy_start_step(env),
             "source": os.environ.get("FLIP_TABLE_RL_ACTION_PRIOR_TRAJECTORY"),
-            "handoff": "Flow targets re-anchored to the last commanded 19D target",
+            "handoff": "Flow targets re-anchored to the last commanded 16D target",
             "privileged_inputs": [],
         },
         "training_prefix_state_reuse": {

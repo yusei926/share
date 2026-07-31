@@ -290,10 +290,10 @@ class RLPDAgent(nn.Module):
             "policy_inputs": [
                 "frozen Flow Matching observation context",
                 "normalized 19D upper-body state",
-                "normalized 19D Flow Matching base target",
-                "previous 19D residual",
+                "normalized 16D Flow Matching arm/hand base target",
+                "previous 16D residual",
             ],
-            "policy_output": "19D bounded residual over the Flow Matching joint target",
+            "policy_output": "16D bounded residual over the Flow Matching arm/hand target",
             "privileged_inputs": [],
             "update_steps": self.update_steps,
         }

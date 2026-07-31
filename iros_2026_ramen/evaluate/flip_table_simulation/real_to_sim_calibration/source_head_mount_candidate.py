@@ -171,6 +171,64 @@ def candidate_from_artifacts(
     }
 
 
+def compose_task_stereo_correction(
+    candidate: dict[str, Any], incremental_correction: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply an incremental head-rig correction to a reset candidate.
+
+    ``candidate_from_artifacts`` compares the *realized* simulator cameras
+    with the source camera.  Its translation and rotation therefore describe
+    an increment around the candidate that produced the trace; they are not
+    an absolute task configuration.  Replacing the existing task values would
+    make a second calibration pass silently discard the first pass.
+
+    ``assemble_table_task`` interprets its RPY values as intrinsic ``XYZ``.
+    Preserve that convention and left-compose the newly observed correction:
+    ``R_next = R_increment @ R_current``.  The rig-centre offset is an
+    additive local translation in the same task convention.
+    """
+
+    def _vector(value: Any, key: str) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float64)
+        if array.shape != (3,) or not np.isfinite(array).all():
+            raise ValueError(f"{key} must be a finite length-3 vector")
+        return array
+
+    current_offset = _vector(
+        candidate.get("head_stereo_offset_local_m", (0.0, 0.0, 0.0)),
+        "candidate head_stereo_offset_local_m",
+    )
+    current_rpy_deg = _vector(
+        candidate.get("head_stereo_rotation_rpy_deg", (0.0, 0.0, 0.0)),
+        "candidate head_stereo_rotation_rpy_deg",
+    )
+    incremental_offset = _vector(
+        incremental_correction.get("head_stereo_offset_local_m"),
+        "incremental head_stereo_offset_local_m",
+    )
+    incremental_rpy_deg = _vector(
+        incremental_correction.get("head_stereo_rotation_rpy_deg"),
+        "incremental head_stereo_rotation_rpy_deg",
+    )
+    current_rotation = Rotation.from_euler("XYZ", current_rpy_deg, degrees=True)
+    incremental_rotation = Rotation.from_euler("XYZ", incremental_rpy_deg, degrees=True)
+    composed_rpy_deg = (incremental_rotation * current_rotation).as_euler(
+        "XYZ", degrees=True
+    )
+
+    result = dict(candidate)
+    result["head_stereo_offset_local_m"] = [
+        float(value) for value in current_offset + incremental_offset
+    ]
+    result["head_stereo_rotation_rpy_deg"] = [float(value) for value in composed_rpy_deg]
+    result["head_stereo_correction_composition"] = {
+        "translation": "candidate_offset_plus_incremental_offset",
+        "rotation": "R_incremental @ R_candidate",
+        "rpy_convention": "intrinsic_XYZ_degrees",
+    }
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-alignment", type=Path, required=True)
@@ -194,13 +252,7 @@ def main() -> None:
         _trace_diagnostic(args.sim_trace.expanduser().resolve(), args.sim_step),
         source_frame=args.source_frame,
     )
-    candidate = dict(candidates[0])
-    candidate.update(
-        {
-            "head_stereo_offset_local_m": correction["head_stereo_offset_local_m"],
-            "head_stereo_rotation_rpy_deg": correction["head_stereo_rotation_rpy_deg"],
-        }
-    )
+    candidate = compose_task_stereo_correction(dict(candidates[0]), correction)
     report = {
         "schema_version": SCHEMA_VERSION,
         "policy_use": "forbidden: offline reset calibration only",
@@ -209,7 +261,13 @@ def main() -> None:
         "sim_trace": str(args.sim_trace.expanduser().resolve()),
         "source_frame": args.source_frame,
         "sim_step": args.sim_step,
+        # ``correction`` is the inter-tool contract consumed by
+        # ``source_head_mount_consensus``.  Keep the explicit incremental
+        # name as well because this value is relative to the rendered
+        # candidate, rather than an absolute task camera configuration.
         "correction": correction,
+        "incremental_correction": correction,
+        "composition": candidate["head_stereo_correction_composition"],
         "candidates": [candidate],
     }
     atomic_write_json(args.output.expanduser().resolve(), report)

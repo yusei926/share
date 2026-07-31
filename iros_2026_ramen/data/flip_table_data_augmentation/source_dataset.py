@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Any
 
@@ -130,6 +131,20 @@ class SourceDatasetIndex:
         return len(self._rows)
 
 
+def _ffmpeg_executable() -> str:
+    configured = os.environ.get("FFMPEG_BINARY")
+    executable = configured or shutil.which("ffmpeg")
+    if executable is not None:
+        return executable
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise RuntimeError(
+            "ffmpeg is unavailable; set FFMPEG_BINARY or install imageio-ffmpeg"
+        ) from exc
+    return str(imageio_ffmpeg.get_ffmpeg_exe())
+
+
 def select_review_frames(frame_count: int, count: int = 9) -> tuple[int, ...]:
     """Choose deterministic endpoint-inclusive frames for camera audits."""
 
@@ -150,7 +165,7 @@ def extract_video_frame(video_path: Path, timestamp: float, output_path: Path) -
     temporary.unlink(missing_ok=True)
     result = subprocess.run(
         (
-            "ffmpeg",
+            _ffmpeg_executable(),
             "-hide_banner",
             "-loglevel",
             "error",

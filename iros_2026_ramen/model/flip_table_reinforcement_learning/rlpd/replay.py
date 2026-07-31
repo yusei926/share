@@ -33,7 +33,7 @@ class ReplayBatch:
 
 
 class ReplayBuffer:
-    def __init__(self, capacity: int, observation_dim: int, action_dim: int = 19) -> None:
+    def __init__(self, capacity: int, observation_dim: int, action_dim: int = 16) -> None:
         if capacity <= 0 or observation_dim <= 0 or action_dim <= 0:
             raise ValueError("replay dimensions and capacity must be positive")
         self.capacity = int(capacity)

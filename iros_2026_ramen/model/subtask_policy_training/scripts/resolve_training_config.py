@@ -18,6 +18,10 @@ STANDARD_POLICY_CAMERAS = ("head_left", "left_wrist", "right_wrist")
 DEFAULT_IMAGE_SHAPE_HWC = (480, 640, 3)
 SUPPORTED_POLICY_TYPES = ("act", "diffusion", "flow_matching", "groot")
 GROOT_RELATIVE_EXCLUDE_JOINTS = ("hand", "waist", "base_height", "navigate")
+GROOT_PINNED_MODEL_PATH = "nvidia/GR00T-N1.7-3B"
+GROOT_PINNED_REVISION = "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+GROOT_POLICY_IMPL = "furniture_groot"
+DELTA_ACTION_REPRESENTATION = "arm_delta_gripper_absolute"
 
 
 def load_mapping_module() -> Any:
@@ -85,6 +89,31 @@ def env_int(name: str, default: int, *, minimum: int | None = None) -> str:
     return str(value)
 
 
+def env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> str:
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {os.environ[name]!r}") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}, got {value}")
+    return f"{value:.17g}"
+
+
+def heldout_episode_indices() -> str:
+    raw = os.environ.get("HELDOUT_TEST_EPISODES", "").strip()
+    if not raw:
+        return ""
+    try:
+        values = [int(value.strip()) for value in raw.split(",") if value.strip()]
+    except ValueError as exc:
+        raise ValueError("HELDOUT_TEST_EPISODES must be comma-separated integers") from exc
+    if not values or any(value < 0 for value in values) or len(values) != len(set(values)):
+        raise ValueError("HELDOUT_TEST_EPISODES must be unique non-negative integers")
+    return ",".join(str(value) for value in sorted(values))
+
+
 def env_json_list(name: str, default: list[str]) -> str:
     if name not in os.environ:
         values = default
@@ -149,10 +178,27 @@ def policy_dims(config: dict[str, Any], policy_type: str, scope: str) -> tuple[i
     return _mapping.SOURCE_STATE_DIM, _mapping.SOURCE_ACTION_DIM
 
 
-def action_semantics(config: dict[str, Any], policy_type: str, scope: str) -> str:
+def action_representation(config: dict[str, Any], policy_type: str, scope: str) -> str:
+    value = str(
+        os.environ.get(
+            "ACTION_REPRESENTATION", config.get("training", {}).get("action_representation", "absolute_target")
+        )
+    ).strip()
+    if value not in {"absolute_target", DELTA_ACTION_REPRESENTATION}:
+        raise ValueError(f"unsupported ACTION_REPRESENTATION={value!r}")
+    if value == DELTA_ACTION_REPRESENTATION and (policy_type == "groot" or scope != "upper_body"):
+        raise ValueError("arm_delta_gripper_absolute requires an upper-body ACT, diffusion, or flow policy")
+    return value
+
+
+def action_semantics(
+    config: dict[str, Any], policy_type: str, scope: str, representation: str
+) -> str:
     if policy_type == "groot":
         return GROOT_G1_ACTION_SEMANTICS
     if scope == "upper_body":
+        if representation == DELTA_ACTION_REPRESENTATION:
+            return "upper_body_arm_delta_gripper_absolute"
         return "upper_body_absolute_target"
     return str(config["action"]["semantics"])
 
@@ -161,7 +207,7 @@ def policy_view_layout(policy_type: str, scope: str) -> str:
     if policy_type == "groot":
         return "real_g1_relative_eef_relative_joints"
     if scope == "upper_body":
-        return "robot_q_upper_body_19d"
+        return "robot_q_state19_action16"
     return "robot_q_current_robot_q_desired_38d"
 
 
@@ -204,6 +250,7 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
     if subtask not in config["subtasks"]:
         choices = ", ".join(sorted(config["subtasks"]))
         raise ValueError(f"unknown SUBTASK={subtask!r}; choices: {choices}")
+    subtask_config = config["subtasks"][subtask]
 
     policy_type = str(os.environ.get("POLICY_TYPE", training.get("policy_type", "act"))).strip().lower()
     if policy_type not in SUPPORTED_POLICY_TYPES:
@@ -212,19 +259,53 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
         )
     dataset_repo_id = os.environ.get(
         "DATASET_REPO_ID",
-        format_template(config["dataset_repo_template"], subtask=subtask, policy_type=policy_type),
+        str(
+            subtask_config.get(
+                "dataset_repo_id",
+                format_template(
+                    config["dataset_repo_template"],
+                    subtask=subtask,
+                    policy_type=policy_type,
+                ),
+            )
+        ),
     )
     dataset_revision = os.environ.get(
         "DATASET_REVISION",
-        str(config.get("source_dataset", {}).get("revision", "")),
+        str(
+            subtask_config.get(
+                "dataset_revision",
+                config.get("source_dataset", {}).get("revision", ""),
+            )
+        ),
     ).strip()
     groot_dataset_repo_id = os.environ.get(
         "GROOT_DATASET_REPO_ID",
-        format_template(config["groot_dataset_repo_template"], subtask=subtask, policy_type=policy_type),
+        str(
+            subtask_config.get(
+                "groot_dataset_repo_id",
+                dataset_repo_id
+                if policy_type == "groot"
+                else format_template(
+                    config["groot_dataset_repo_template"],
+                    subtask=subtask,
+                    policy_type=policy_type,
+                ),
+            )
+        ),
     )
     policy_repo_id = os.environ.get(
         "POLICY_REPO_ID",
-        format_template(config["policy_repo_template"], subtask=subtask, policy_type=policy_type),
+        str(
+            subtask_config.get(
+                "groot_policy_repo_id" if policy_type == "groot" else "policy_repo_id",
+                format_template(
+                    config["policy_repo_template"],
+                    subtask=subtask,
+                    policy_type=policy_type,
+                ),
+            )
+        ),
     )
     output_dir = os.environ.get(
         "OUTPUT_DIR",
@@ -256,6 +337,7 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
     camera_names = policy_camera_names(config)
     image_shape_hwc(config)
     scope = control_scope(config, policy_type)
+    representation = action_representation(config, policy_type, scope)
     state_dim, action_dim = policy_dims(config, policy_type, scope)
     training_view_root = os.environ.get(
         "TRAINING_VIEW_ROOT",
@@ -300,7 +382,15 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
         "ROBOT_TYPE": str(config["robot_type"]),
         "STATE_DIM": str(state_dim),
         "ACTION_DIM": str(action_dim),
-        "ACTION_SEMANTICS": action_semantics(config, policy_type, scope),
+        "ACTION_REPRESENTATION": representation,
+        "ACTION_SEMANTICS": action_semantics(config, policy_type, scope, representation),
+        "TRAINING_VALIDATION_FRACTION": env_float(
+            "TRAINING_VALIDATION_FRACTION",
+            float(config.get("validation", {}).get("validation_fraction", 0.1)),
+            minimum=0.0,
+            maximum=0.99,
+        ),
+        "HELDOUT_TEST_EPISODES": heldout_episode_indices(),
         "CAMERAS": ",".join(camera_names),
         "SOURCE_CAMERA_MAP": json.dumps(training_video_map(config), separators=(",", ":")),
         "POLICY_VIEW_LAYOUT": policy_view_layout(policy_type, scope),
@@ -329,12 +419,12 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
             "TRAIN_SAVE_FREQ", int(policy_defaults.get("save_freq", 50000)), minimum=1
         ),
         "TRAIN_EVAL_STEPS": env_int(
-            "TRAIN_EVAL_STEPS", int(policy_defaults.get("eval_steps", 10000)), minimum=1
+            "TRAIN_EVAL_STEPS", int(policy_defaults.get("eval_steps", 10000)), minimum=0
         ),
         "TRAIN_MAX_EVAL_SAMPLES": env_int(
             "TRAIN_MAX_EVAL_SAMPLES",
             int(policy_defaults.get("max_eval_samples", 512)),
-            minimum=1,
+            minimum=0,
         ),
         "TRAIN_LOG_FREQ": env_int(
             "TRAIN_LOG_FREQ", int(policy_defaults.get("log_freq", 100)), minimum=1
@@ -429,20 +519,83 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
                 "GROOT_RELATIVE_EXCLUDE_JOINTS must be exactly "
                 f"{GROOT_RELATIVE_EXCLUDE_JOINTS}; changing it breaks the REAL_G1 action contract"
             )
+        base_model_path = env_string(
+            "GROOT_BASE_MODEL_PATH",
+            str(defaults.get("base_model_path", GROOT_PINNED_MODEL_PATH)),
+        )
+        base_model_revision = env_string(
+            "GROOT_BASE_MODEL_REVISION",
+            str(defaults.get("base_model_revision", GROOT_PINNED_REVISION)),
+        )
+        if base_model_path != GROOT_PINNED_MODEL_PATH or base_model_revision != GROOT_PINNED_REVISION:
+            raise ValueError(
+                "GR00T N1.7 training must use the reviewed pinned checkpoint "
+                f"{GROOT_PINNED_MODEL_PATH}@{GROOT_PINNED_REVISION}"
+            )
+        policy_impl = env_string(
+            "GROOT_POLICY_IMPL",
+            str(defaults.get("policy_impl", GROOT_POLICY_IMPL)),
+        )
+        if policy_impl != GROOT_POLICY_IMPL:
+            raise ValueError(f"GROOT_POLICY_IMPL must be {GROOT_POLICY_IMPL!r}")
+        chunk_size = env_int(
+            "GROOT_CHUNK_SIZE",
+            int(defaults.get("chunk_size", _mapping.GROOT_N17_NATIVE_ACTION_HORIZON)),
+            minimum=1,
+        )
+        if int(chunk_size) != _mapping.GROOT_N17_NATIVE_ACTION_HORIZON:
+            raise ValueError("GROOT_CHUNK_SIZE must retain the pinned N1.7 horizon of 40")
+        valid_action_dim = env_int(
+            "GROOT_VALID_ACTION_DIM",
+            int(defaults.get("valid_action_dim", _mapping.GROOT_N17_VALID_ACTION_DIM)),
+            minimum=1,
+        )
+        if int(valid_action_dim) != _mapping.GROOT_N17_VALID_ACTION_DIM:
+            raise ValueError("GROOT_VALID_ACTION_DIM must be exactly 46")
         values.update(
             {
-                "GROOT_BASE_MODEL_PATH": env_string(
-                    "GROOT_BASE_MODEL_PATH", str(defaults.get("base_model_path", "nvidia/GR00T-N1.7-3B"))
-                ),
-                "GROOT_BASE_MODEL_REVISION": env_string(
-                    "GROOT_BASE_MODEL_REVISION", str(defaults.get("base_model_revision", "main"))
-                ),
+                "GROOT_BASE_MODEL_PATH": base_model_path,
+                "GROOT_BASE_MODEL_REVISION": base_model_revision,
+                "GROOT_POLICY_IMPL": policy_impl,
                 "GROOT_EMBODIMENT_TAG": embodiment_tag,
-                "GROOT_CHUNK_SIZE": env_int(
-                    "GROOT_CHUNK_SIZE", int(defaults.get("chunk_size", 16)), minimum=1
-                ),
+                "GROOT_CHUNK_SIZE": chunk_size,
                 "GROOT_N_ACTION_STEPS": env_int(
-                    "GROOT_N_ACTION_STEPS", int(defaults.get("n_action_steps", 16)), minimum=1
+                    "GROOT_N_ACTION_STEPS", int(defaults.get("n_action_steps", 10)), minimum=1
+                ),
+                "GROOT_VALID_ACTION_DIM": valid_action_dim,
+                "GROOT_PROGRESS_ENABLED": env_bool(
+                    "GROOT_PROGRESS_ENABLED", bool(defaults.get("progress_enabled", True))
+                ),
+                "GROOT_PROGRESS_LOSS_WEIGHT": env_float(
+                    "GROOT_PROGRESS_LOSS_WEIGHT",
+                    float(defaults.get("progress_loss_weight", 0.05)),
+                    minimum=0.0,
+                ),
+                "GROOT_PROGRESS_MONOTONICITY_WEIGHT": env_float(
+                    "GROOT_PROGRESS_MONOTONICITY_WEIGHT",
+                    float(defaults.get("progress_monotonicity_weight", 0.01)),
+                    minimum=0.0,
+                ),
+                "GROOT_PROGRESS_HIDDEN_DIM": env_int(
+                    "GROOT_PROGRESS_HIDDEN_DIM",
+                    int(defaults.get("progress_hidden_dim", 512)),
+                    minimum=1,
+                ),
+                "GROOT_PROGRESS_SIDECAR": env_string(
+                    "GROOT_PROGRESS_SIDECAR",
+                    str(defaults.get("progress_sidecar", "")),
+                ),
+                "GROOT_VISUAL_ROTATION_SIDECAR": env_string(
+                    "GROOT_VISUAL_ROTATION_SIDECAR",
+                    str(defaults.get("visual_rotation_sidecar", "")),
+                ),
+                "GROOT_VISUAL_ROTATION_WEIGHT_REPO": env_string(
+                    "GROOT_VISUAL_ROTATION_WEIGHT_REPO",
+                    str(defaults.get("visual_rotation_weight_repo", "")),
+                ),
+                "GROOT_VISUAL_ROTATION_WEIGHT_FILE": env_string(
+                    "GROOT_VISUAL_ROTATION_WEIGHT_FILE",
+                    str(defaults.get("visual_rotation_weight_file", "")),
                 ),
                 "GROOT_USE_RELATIVE_ACTIONS": use_relative_actions,
                 "GROOT_RELATIVE_EXCLUDE_JOINTS": relative_exclude_joints,
@@ -457,8 +610,29 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
                     ),
                 ),
                 "GROOT_USE_BF16": env_bool("GROOT_USE_BF16", bool(defaults.get("use_bf16", True))),
+                "GROOT_TUNE_LLM": env_bool("GROOT_TUNE_LLM", False),
+                "GROOT_TUNE_VISUAL": env_bool("GROOT_TUNE_VISUAL", False),
+                "GROOT_TUNE_PROJECTOR": env_bool("GROOT_TUNE_PROJECTOR", True),
+                "GROOT_TUNE_DIFFUSION_MODEL": env_bool(
+                    "GROOT_TUNE_DIFFUSION_MODEL", True
+                ),
+                "GROOT_TUNE_VLLN": env_bool("GROOT_TUNE_VLLN", True),
+                "GROOT_TUNE_TOP_LLM_LAYERS": env_int(
+                    "GROOT_TUNE_TOP_LLM_LAYERS", 0, minimum=0
+                ),
+                "GROOT_OPTIMIZER_LR": env_float("GROOT_OPTIMIZER_LR", 1.0e-4, minimum=0.0),
+                "GROOT_OPTIMIZER_WEIGHT_DECAY": env_float(
+                    "GROOT_OPTIMIZER_WEIGHT_DECAY", 1.0e-5, minimum=0.0
+                ),
+                "GROOT_WARMUP_RATIO": env_float(
+                    "GROOT_WARMUP_RATIO", 0.05, minimum=0.0, maximum=1.0
+                ),
                 "GROOT_IMAGE_TRANSFORMS_ENABLE": env_bool(
                     "GROOT_IMAGE_TRANSFORMS_ENABLE", bool(defaults.get("image_transforms_enable", True))
+                ),
+                "GROOT_CONSISTENT_GPU_AUGMENTATION": env_bool(
+                    "GROOT_CONSISTENT_GPU_AUGMENTATION",
+                    bool(defaults.get("consistent_gpu_augmentation", True)),
                 ),
                 "GROOT_BATCH_SIZE": env_int(
                     "GROOT_BATCH_SIZE", int(defaults.get("batch_size", 64)), minimum=1
@@ -485,8 +659,42 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
                 ),
             }
         )
+        warmup_ratio = float(values["GROOT_WARMUP_RATIO"])
+        warmup_steps = int(round(int(values["GROOT_STEPS"]) * warmup_ratio))
+        if warmup_ratio > 0.0:
+            warmup_steps = max(1, warmup_steps)
+        values["GROOT_WARMUP_STEPS"] = str(warmup_steps)
         if int(values["GROOT_N_ACTION_STEPS"]) > int(values["GROOT_CHUNK_SIZE"]):
             raise ValueError("GROOT_N_ACTION_STEPS cannot exceed GROOT_CHUNK_SIZE")
+        required_progress_assets = {
+            "GROOT_PROGRESS_SIDECAR": values["GROOT_PROGRESS_SIDECAR"],
+            "GROOT_VISUAL_ROTATION_SIDECAR": values["GROOT_VISUAL_ROTATION_SIDECAR"],
+            "GROOT_VISUAL_ROTATION_WEIGHT_REPO": values[
+                "GROOT_VISUAL_ROTATION_WEIGHT_REPO"
+            ],
+            "GROOT_VISUAL_ROTATION_WEIGHT_FILE": values[
+                "GROOT_VISUAL_ROTATION_WEIGHT_FILE"
+            ],
+        }
+        if any(not value for value in required_progress_assets.values()):
+            raise ValueError(
+                "GR00T baseline/aux matched training requires progress, visual-rotation, "
+                f"and detector provenance: {required_progress_assets}"
+            )
+        expected_tuning = {
+            "GROOT_TUNE_LLM": "false",
+            "GROOT_TUNE_VISUAL": "false",
+            "GROOT_TUNE_PROJECTOR": "true",
+            "GROOT_TUNE_DIFFUSION_MODEL": "true",
+            "GROOT_TUNE_VLLN": "true",
+            "GROOT_TUNE_TOP_LLM_LAYERS": "0",
+        }
+        actual_tuning = {key: values[key] for key in expected_tuning}
+        if actual_tuning != expected_tuning:
+            raise ValueError(
+                "GR00T tuning scope must freeze vision/LLM and train the official "
+                f"projector/action head: expected {expected_tuning}, got {actual_tuning}"
+            )
     return values
 
 

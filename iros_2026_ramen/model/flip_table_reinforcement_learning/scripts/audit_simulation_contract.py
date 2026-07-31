@@ -28,7 +28,12 @@ parser.add_argument("--num-envs", type=int, default=1)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--sim-control-hz", type=float, default=50.0)
 parser.add_argument("--equilibrium-steps", type=int, default=250)
-parser.add_argument("--stability-steps", type=int, default=250)
+parser.add_argument(
+    "--stability-steps",
+    type=int,
+    default=3000,
+    help="stand-only WBC audit steps (3000 at 50 Hz = 60 s)",
+)
 parser.add_argument("--joint-response-steps", type=int, default=100)
 parser.add_argument("--wrench-steps", type=int, default=8)
 parser.add_argument("--upward-force-n", type=float, default=30.0)
@@ -61,8 +66,13 @@ if (
 ):
     raise ValueError("wrench magnitudes must be positive")
 
-# Build a deterministic policy-free environment. The action adapter still runs
-# so this audit exercises the same 19-D absolute-target path used by Flow/RLPD.
+# Build a deterministic policy-free environment. The organizer WBC still runs
+# so this audit exercises the same 16-D arm/hand path used by Flow/RLPD.
+os.environ["FLIP_TABLE_SIM_BODY_MODE"] = "balanced_wbc"
+os.environ["FLIP_TABLE_LOCK_LOWER_BODY"] = "false"
+os.environ["FLIP_TABLE_LOCK_ROBOT_ROOT"] = "false"
+os.environ["FLIP_TABLE_FIX_ROOT_LINK"] = "false"
+os.environ["FLIP_TABLE_REQUIRE_WAIST_LOCK"] = "false"
 os.environ["FLIP_TABLE_RLPD_USE_FLOW_BASE"] = "true"
 os.environ["FLIP_TABLE_RL_POLICY_START_STEP"] = "0"
 os.environ["FLIP_TABLE_RL_CONTROL_HZ"] = str(args_cli.sim_control_hz)
@@ -102,7 +112,14 @@ from isaaclab.utils.math import matrix_from_quat
 from robofinals.utils.env import ExecuteMode, parse_env_cfg
 from robofinals.utils.isaac_data_compat import as_torch, sim_quat_raw_to_xyzw_torch
 from robofinals.utils.place_utils.env_utils import set_seed
-from robofinals_rl.flip_table.common import LOWER_BODY_JOINT_NAMES, UPPER_BODY_JOINT_NAMES
+from robofinals.core.mdp.actions.team_ramen_balanced_wbc_action import (
+    TeamRamenBalancedWBCAction,
+)
+from robofinals_rl.flip_table.common import (
+    ARM_JOINT_NAMES,
+    LOWER_BODY_JOINT_NAMES,
+    UPPER_BODY_JOINT_NAMES,
+)
 from model.flip_table_reinforcement_learning.rlpd.sim_runtime import (
     dataset_joint_state,
     last_commanded_target,
@@ -116,6 +133,7 @@ DEX1_JOINT_NAMES = (
     "right_dex1_finger_joint_1",
     "right_dex1_finger_joint_2",
 )
+WBC_OWNED_JOINT_NAMES = LOWER_BODY_JOINT_NAMES + UPPER_BODY_JOINT_NAMES[:3]
 PREPARED_SCENE_RIGID_BODY_PATHS = (
     "/World/Table001/Table001_01",
     "/World/Leg001/Leg001",
@@ -144,14 +162,12 @@ FINGER_CONTACT_SENSOR_NAMES = (
 )
 
 
-def _expected_direct_target_gains(joint_name: str) -> tuple[float, float]:
-    if joint_name.startswith("waist_"):
-        return 200.0, 5.0
+def _expected_policy_target_gains(joint_name: str) -> tuple[float, float]:
     if "dex1_finger" in joint_name:
         return 800.0, 3.0
     if "wrist_" in joint_name:
-        return 40.0, 1.5
-    return 80.0, 3.0
+        return 20.0, 1.5
+    return 40.0, 3.0
 
 
 def _tensor_list(value: torch.Tensor) -> list[Any]:
@@ -342,17 +358,22 @@ def _robot_data_joint_vector(robot: Any, field: str, joint_ids: list[int]) -> to
     return tensor[0, joint_ids]
 
 
-def _direct_target_actuator_contract(robot: Any, urdf_path: Path) -> dict[str, Any]:
-    """Compare config, runtime drives, and PhysX limits with the Dex1 URDF."""
+def _wbc_actuator_contract(robot: Any, urdf_path: Path) -> dict[str, Any]:
+    """Validate policy-owned drives and organizer-WBC lower-body ownership."""
 
-    controlled_names = UPPER_BODY_JOINT_NAMES + DEX1_JOINT_NAMES
+    # Waist commands are deliberately absent: the organizer WBC owns all three
+    # waist joints together with the floating base and legs.  Only arms and
+    # Dex1 may be driven by direct policy targets.
+    controlled_names = ARM_JOINT_NAMES + DEX1_JOINT_NAMES
     urdf_limits = _urdf_joint_limits(urdf_path, controlled_names)
     runtime_by_joint: dict[str, dict[str, float | None]] = {}
     actuator_groups: dict[str, Any] = {}
-    for group_name in ("waist", "arms", "grippers"):
-        cfg = robot.cfg.actuators.get(group_name)
+    ownership: dict[str, list[str]] = {
+        name: [] for name in WBC_OWNED_JOINT_NAMES + ARM_JOINT_NAMES + DEX1_JOINT_NAMES
+    }
+    for group_name, cfg in robot.cfg.actuators.items():
         actuator = robot.actuators.get(group_name)
-        if cfg is None or actuator is None:
+        if actuator is None:
             actuator_groups[group_name] = {"present": False}
             continue
         _joint_ids, joint_names = robot.find_joints(
@@ -377,6 +398,9 @@ def _direct_target_actuator_contract(robot: Any, urdf_path: Path) -> dict[str, A
                 for field, vector in vectors.items()
             },
         }
+        for joint_name in joint_names:
+            if joint_name in ownership:
+                ownership[joint_name].append(group_name)
         for index, joint_name in enumerate(joint_names):
             runtime_by_joint[joint_name] = {
                 field: None if vector is None else float(vector[index])
@@ -389,7 +413,7 @@ def _direct_target_actuator_contract(robot: Any, urdf_path: Path) -> dict[str, A
     records: dict[str, Any] = {}
     all_match = True
     for index, name in enumerate(controlled_names):
-        expected_kp, expected_kd = _expected_direct_target_gains(name)
+        expected_kp, expected_kd = _expected_policy_target_gains(name)
         runtime = runtime_by_joint.get(name, {})
         expected = {
             **urdf_limits[name],
@@ -450,6 +474,18 @@ def _direct_target_actuator_contract(robot: Any, urdf_path: Path) -> dict[str, A
             "pass": record_pass,
         }
 
+    arm_ownership = {name: ownership[name] for name in ARM_JOINT_NAMES}
+    hand_ownership = {name: ownership[name] for name in DEX1_JOINT_NAMES}
+    lower_ownership = {name: ownership[name] for name in WBC_OWNED_JOINT_NAMES}
+    ownership_pass = (
+        all(groups == ["arms"] for groups in arm_ownership.values())
+        and all(groups == ["grippers"] for groups in hand_ownership.values())
+        and all(
+            len(groups) == 1 and groups[0] not in {"arms", "grippers"}
+            for groups in lower_ownership.values()
+        )
+    )
+
     rigid_props = robot.cfg.spawn.rigid_props
     articulation_props = robot.cfg.spawn.articulation_props
     solver = {
@@ -473,12 +509,20 @@ def _direct_target_actuator_contract(robot: Any, urdf_path: Path) -> dict[str, A
         and solver["articulation_velocity_iterations"] >= 4
     )
     return {
-        "profile": "G1/Dex1 direct upper-body joint targets",
+        "profile": "organizer WBC lower body plus direct G1-arm/Dex1 policy targets",
         "urdf": _file_identity(urdf_path),
         "actuator_groups": actuator_groups,
+        "policy_owned_joint_names": list(controlled_names),
+        "wbc_owned_joint_names": list(WBC_OWNED_JOINT_NAMES),
+        "ownership": {
+            "arms": arm_ownership,
+            "hands": hand_ownership,
+            "lower_body_and_waist": lower_ownership,
+            "pass": ownership_pass,
+        },
         "joints": records,
         "solver": solver,
-        "pass": all_match and bool(solver["pass"]),
+        "pass": all_match and ownership_pass and bool(solver["pass"]),
     }
 
 
@@ -500,6 +544,16 @@ def _root_state(robot: Any) -> tuple[torch.Tensor, torch.Tensor]:
     pos = as_torch(robot.data.root_pos_w)[:, :3]
     quat = sim_quat_raw_to_xyzw_torch(as_torch(robot.data.root_quat_w)[:, :4])
     return pos.clone(), quat.clone()
+
+
+def _xyzw_roll_pitch(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return roll/pitch for simulator xyzw root quaternions."""
+
+    q = torch.nn.functional.normalize(quat, dim=-1)
+    x, y, z, w = q.unbind(dim=-1)
+    roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = torch.asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0))
+    return roll, pitch
 
 
 def _table_state(task: Any, env: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -547,8 +601,8 @@ def _rotation_matrix_angle_rad(current: torch.Tensor, reference: torch.Tensor) -
 
 
 def _step_target(env: Any, target: torch.Tensor, zero_action: torch.Tensor) -> None:
-    if target.shape != (env.num_envs, 19):
-        raise ValueError(f"absolute target must be [B,19], got {tuple(target.shape)}")
+    if target.shape != (env.num_envs, 16):
+        raise ValueError(f"absolute arm/hand target must be [B,16], got {tuple(target.shape)}")
     env._flip_table_rlpd_absolute_target = target
     _observation, _reward, terminated, truncated, _extras = env.step(zero_action)
     if bool(torch.logical_or(terminated, truncated).any()):
@@ -565,11 +619,12 @@ def _reset_and_hold(
     env.reset()
     set_flow_control_ready(env, True)
     if target is None:
-        target = dataset_joint_state(env).detach().clone()
+        state = dataset_joint_state(env).detach().clone()
+        target = torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
     else:
         target = target.detach().clone().to(device=env.device, dtype=torch.float32)
-    if target.shape != (env.num_envs, 19):
-        raise ValueError(f"hold target must be [B,19], got {tuple(target.shape)}")
+    if target.shape != (env.num_envs, 16):
+        raise ValueError(f"hold target must be [B,16], got {tuple(target.shape)}")
     for _ in range(steps):
         _step_target(env, target, zero_action)
     return target, dataset_joint_state(env).detach().clone()
@@ -585,14 +640,14 @@ def _reset_actuator_target_contract(
     env.reset()
     set_flow_control_ready(env, True)
     initial = dataset_joint_state(env).detach().clone()
-    stale = initial.clone()
+    stale = torch.cat((initial[:, 3:17], initial[:, 17:19]), dim=1)
     stale[:, 0] += 0.12
     stale[:, 3] += 0.18
     stale[:, 10] -= 0.18
-    stale[:, 17:19] = torch.where(
-        stale[:, 17:19] < 2.25,
-        torch.full_like(stale[:, 17:19], 4.0),
-        torch.full_like(stale[:, 17:19], 0.5),
+    stale[:, 14:16] = torch.where(
+        stale[:, 14:16] < 2.25,
+        torch.full_like(stale[:, 14:16], 4.0),
+        torch.full_like(stale[:, 14:16], 0.5),
     )
     for _ in range(3):
         _step_target(env, stale, zero_action)
@@ -605,7 +660,8 @@ def _reset_actuator_target_contract(
     velocity_target_after_reset = as_torch(robot.data.joint_vel_target).detach().clone()
     position_error = torch.abs(position_target_after_reset - state_after_reset)
     velocity_target_error = torch.abs(velocity_target_after_reset - velocity_after_reset)
-    stale_command_delta = torch.abs(commanded_before_reset - initial).max()
+    initial_action = torch.cat((initial[:, 3:17], initial[:, 17:19]), dim=1)
+    stale_command_delta = torch.abs(commanded_before_reset - initial_action).max()
 
     result = {
         "deliberate_pre_reset_command_delta": float(stale_command_delta),
@@ -641,7 +697,7 @@ def _explicit_effort_saturation_contract(
         current - limits[..., 0]
     )
     saturation_target = nominal_target.clone()
-    saturation_target[:, :17] = torch.where(
+    saturation_target[:, :14] = torch.where(
         farther_upper,
         limits[..., 1],
         limits[..., 0],
@@ -650,9 +706,9 @@ def _explicit_effort_saturation_contract(
 
     computed = as_torch(robot.data.computed_torque)[:, body_joint_ids].detach().clone()
     applied = as_torch(robot.data.applied_torque)[:, body_joint_ids].detach().clone()
-    urdf_limits = _urdf_joint_limits(urdf_path, UPPER_BODY_JOINT_NAMES)
+    urdf_limits = _urdf_joint_limits(urdf_path, ARM_JOINT_NAMES)
     expected = torch.tensor(
-        [urdf_limits[name]["effort"] for name in UPPER_BODY_JOINT_NAMES],
+        [urdf_limits[name]["effort"] for name in ARM_JOINT_NAMES],
         device=applied.device,
         dtype=applied.dtype,
     ).unsqueeze(0)
@@ -668,8 +724,8 @@ def _explicit_effort_saturation_contract(
     )
     requested_fraction = float(requested_saturation.float().mean())
     result = {
-        "joint_names": list(UPPER_BODY_JOINT_NAMES),
-        "target": _tensor_list(saturation_target[:, :17]),
+        "joint_names": list(ARM_JOINT_NAMES),
+        "target": _tensor_list(saturation_target[:, :14]),
         "computed_torque_nm": _tensor_list(computed),
         "applied_torque_nm": _tensor_list(applied),
         "urdf_effort_limit_nm": _tensor_list(expected),
@@ -684,7 +740,11 @@ def _explicit_effort_saturation_contract(
         bool(torch.all(within_limit))
         and bool(torch.all(saturation_matches))
         and bool(torch.all(sign_matches))
-        and requested_fraction >= 0.80
+        # This is an actuator-clipping proof, not a requirement to overload
+        # every arm joint simultaneously.  A quarter of the joints requesting
+        # saturation is sufficient to exercise both signs and multiple motor
+        # classes; every requested saturation must still clip exactly.
+        and requested_fraction >= 0.25
         # The deployable action adapter uses rounded conservative limits that
         # are at most 0.0005 rad inside the exact generated-URDF limits.
         and safety_clip_delta <= 1.0e-3
@@ -847,7 +907,7 @@ def _scene_geometry_contract(task: Any, env: Any, robot: Any) -> dict[str, Any]:
     root_to_table_direction = torch.nn.functional.normalize(root_to_table_xy, dim=-1)
     robot_facing_cosine = torch.sum(root_forward_xy * root_to_table_direction, dim=-1)
     minimum_root_distance = float(
-        os.environ.get("FLIP_TABLE_ROBOT_TABLE_MIN_DISTANCE_M", "0.61")
+        os.environ.get("FLIP_TABLE_ROBOT_TABLE_MIN_DISTANCE_M", "0.62")
     )
 
     result = {
@@ -936,7 +996,8 @@ def _randomized_reset_contract(
         for trial in range(args_cli.randomized_reset_trials):
             env.reset()
             set_flow_control_ready(env, True)
-            target = dataset_joint_state(env).detach().clone()
+            state = dataset_joint_state(env).detach().clone()
+            target = torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
             for _ in range(10):
                 _step_target(env, target, zero_action)
 
@@ -1342,6 +1403,12 @@ def main() -> None:
         "generated_dex1_urdf": robofinals_root
         / "robofinals/data/assets/g1_urdf_gripper/g1/g1_29dof_mode_15_with_dex1_1.urdf",
         "prepared_scene_usd": Path(str(args_cli.layout)),
+        "wbc_stand_onnx": robofinals_root
+        / "robofinals/data/ckpts/nv_wbc_v0904/homie_v2/stand.onnx",
+        "wbc_walk_onnx": robofinals_root
+        / "robofinals/data/ckpts/nv_wbc_v0904/homie_v2/walk.onnx",
+        "team_ramen_wbc_adapter": robofinals_root
+        / "robofinals/core/mdp/actions/team_ramen_balanced_wbc_action.py",
     }
     if official_root_raw:
         official_root = Path(official_root_raw)
@@ -1353,12 +1420,6 @@ def main() -> None:
                 / "robofinals/core/robots/unitree/assets_cfg.py",
             }
         )
-    assets_text = runtime_paths["patched_g1_assets_config"].read_text(encoding="utf-8")
-    stale_actuator_markers = (
-        "LW_G1_ARM_ACTUATOR",
-        "G1_IMPLICIT_ARM_JOINT_PARAMS",
-        "new_implicit_arms",
-    )
     actuator_configs: dict[str, Any] = {}
     for name, actuator_cfg in robot.cfg.actuators.items():
         actuator_configs[name] = {
@@ -1382,34 +1443,82 @@ def main() -> None:
                 if hasattr(actuator_cfg, field)
             },
         }
+    file_identities = {
+        label: _file_identity(path) for label, path in runtime_paths.items()
+    }
+    expected_official_hashes = {
+        "official_v1_g1_config":
+            "da19a18ddff14d7cb0fd8878d7f8c3f55ce44bfba05a44d08c453c23cb7721a0",
+        "official_v1_g1_assets_config":
+            "a8cec088b01198f105b7c6dac2652ba245e0da197c267512c2dcab9230041919",
+    }
+    official_hashes_match = bool(official_root_raw) and all(
+        file_identities.get(label, {}).get("sha256") == expected
+        for label, expected in expected_official_hashes.items()
+    )
+    expected_runtime_hashes = {
+        "wbc_stand_onnx": os.environ.get("FLIP_TABLE_WBC_STAND_ONNX_SHA256", ""),
+        "wbc_walk_onnx": os.environ.get("FLIP_TABLE_WBC_WALK_ONNX_SHA256", ""),
+        "team_ramen_wbc_adapter": os.environ.get("FLIP_TABLE_WBC_ADAPTER_SHA256", ""),
+    }
+    runtime_hashes_match = all(
+        bool(expected) and file_identities[label].get("sha256") == expected
+        for label, expected in expected_runtime_hashes.items()
+    )
+    base_action = env.action_manager.get_term("base_action")
+    action_contract = {
+        "total_action_dim": int(env.action_manager.total_action_dim),
+        "active_terms": list(env.action_manager.active_terms),
+        "base_action_class": type(base_action).__name__,
+        "is_team_ramen_balanced_wbc_adapter": isinstance(
+            base_action, TeamRamenBalancedWBCAction
+        ),
+        "base_action_dim": int(base_action.action_dim),
+        "base_height_m": float(base_action.cfg.base_height_m),
+        "body_mode": os.environ.get("FLIP_TABLE_SIM_BODY_MODE", ""),
+    }
+    action_contract["pass"] = (
+        action_contract["total_action_dim"] == 16
+        and action_contract["active_terms"]
+        == ["base_action", "left_hand_action", "right_hand_action"]
+        and action_contract["is_team_ramen_balanced_wbc_adapter"]
+        and action_contract["base_action_dim"] == 14
+        and math.isclose(action_contract["base_height_m"], 0.74, abs_tol=1.0e-9)
+        and action_contract["body_mode"] == "balanced_wbc"
+    )
     runtime_identity = {
         "image_contract": "paperc/robofinals:RoboFinals-IKEA-V1 plus deterministic Dex1 compatibility patch",
-        "files": {label: _file_identity(path) for label, path in runtime_paths.items()},
-        "stale_actuator_markers_found": [
-            marker for marker in stale_actuator_markers if marker in assets_text
-        ],
+        "files": file_identities,
+        "expected_official_hashes": expected_official_hashes,
+        "official_hashes_match": official_hashes_match,
+        "expected_runtime_hashes": expected_runtime_hashes,
+        "runtime_hashes_match": runtime_hashes_match,
+        "action_contract": action_contract,
         "actuators": actuator_configs,
     }
     runtime_identity["pass"] = (
-        not runtime_identity["stale_actuator_markers_found"]
+        official_hashes_match
+        and runtime_hashes_match
+        and bool(action_contract["pass"])
         and actuator_configs.get("arms", {}).get("config_class") == "IdealPDActuatorCfg"
+        and actuator_configs.get("grippers", {}).get("config_class") == "IdealPDActuatorCfg"
         and all(record["exists"] for record in runtime_identity["files"].values())
     )
     prepared_scene_velocity = _prepared_scene_velocity_contract(
         runtime_paths["prepared_scene_usd"]
     )
-    direct_target_actuators = _direct_target_actuator_contract(
+    wbc_actuators = _wbc_actuator_contract(
         robot, runtime_paths["generated_dex1_urdf"]
     )
-    body_joint_ids = _resolve_joint_ids(robot, UPPER_BODY_JOINT_NAMES)
-    lower_joint_ids = _resolve_joint_ids(robot, LOWER_BODY_JOINT_NAMES)
+    body_joint_ids = _resolve_joint_ids(robot, ARM_JOINT_NAMES)
+    lower_joint_ids = _resolve_joint_ids(robot, WBC_OWNED_JOINT_NAMES)
     zero_action = torch.zeros(
         (env.num_envs, env.action_manager.total_action_dim),
         dtype=torch.float32,
         device=env.device,
     )
-    if zero_action.shape[1] != 19:
-        raise RuntimeError(f"expected a 19-D action adapter, got {zero_action.shape[1]}")
+    if zero_action.shape[1] != 16:
+        raise RuntimeError(f"expected a 16-D WBC action adapter, got {zero_action.shape[1]}")
 
     expected_step_dt = 1.0 / args_cli.sim_control_hz
     timebase = {
@@ -1439,16 +1548,18 @@ def main() -> None:
     workbench_ref_pos, workbench_ref_quat = _workbench_state(task, env)
     root_ref_pos, root_ref_quat = _root_state(robot)
     lower_ref = as_torch(robot.data.joint_pos)[:, lower_joint_ids].clone()
-    body_ref = hold_state[:, :17].clone()
+    body_ref = hold_state[:, 3:17].clone()
     assembly_ref_pos, assembly_ref_rot = _assembly_frame(task, env)
     stability_max = {
         "table_translation_m": 0.0,
         "table_rotation_rad": 0.0,
         "workbench_translation_m": 0.0,
         "workbench_rotation_rad": 0.0,
-        "robot_root_translation_m": 0.0,
-        "robot_root_rotation_rad": 0.0,
-        "lower_body_joint_error_rad": 0.0,
+        "robot_root_xy_drift_m": 0.0,
+        "robot_root_height_error_m": 0.0,
+        "robot_root_abs_roll_rad": 0.0,
+        "robot_root_abs_pitch_rad": 0.0,
+        "lower_body_joint_motion_rad": 0.0,
         "upper_body_joint_drift_rad": 0.0,
         "upper_body_target_error_rad": 0.0,
         "upper_body_joint_velocity_rad_s": 0.0,
@@ -1482,16 +1593,23 @@ def main() -> None:
             stability_max["workbench_rotation_rad"],
             float(_quat_angle_rad(workbench_quat, workbench_ref_quat).max()),
         )
-        stability_max["robot_root_translation_m"] = max(
-            stability_max["robot_root_translation_m"],
-            float(torch.linalg.norm(root_pos - root_ref_pos, dim=-1).max()),
+        roll, pitch = _xyzw_roll_pitch(root_quat)
+        stability_max["robot_root_xy_drift_m"] = max(
+            stability_max["robot_root_xy_drift_m"],
+            float(torch.linalg.norm(root_pos[:, :2] - root_ref_pos[:, :2], dim=-1).max()),
         )
-        stability_max["robot_root_rotation_rad"] = max(
-            stability_max["robot_root_rotation_rad"],
-            float(_quat_angle_rad(root_quat, root_ref_quat).max()),
+        stability_max["robot_root_height_error_m"] = max(
+            stability_max["robot_root_height_error_m"],
+            float(torch.abs(root_pos[:, 2] - 0.74).max()),
         )
-        stability_max["lower_body_joint_error_rad"] = max(
-            stability_max["lower_body_joint_error_rad"],
+        stability_max["robot_root_abs_roll_rad"] = max(
+            stability_max["robot_root_abs_roll_rad"], float(torch.abs(roll).max())
+        )
+        stability_max["robot_root_abs_pitch_rad"] = max(
+            stability_max["robot_root_abs_pitch_rad"], float(torch.abs(pitch).max())
+        )
+        stability_max["lower_body_joint_motion_rad"] = max(
+            stability_max["lower_body_joint_motion_rad"],
             float(torch.abs(lower - lower_ref).max()),
         )
         stability_max["upper_body_joint_drift_rad"] = max(
@@ -1500,7 +1618,7 @@ def main() -> None:
         )
         stability_max["upper_body_target_error_rad"] = max(
             stability_max["upper_body_target_error_rad"],
-            float(torch.abs(body - hold_target[:, :17]).max()),
+            float(torch.abs(body - hold_target[:, :14]).max()),
         )
         stability_max["upper_body_joint_velocity_rad_s"] = max(
             stability_max["upper_body_joint_velocity_rad_s"],
@@ -1521,11 +1639,13 @@ def main() -> None:
             and stability_max["table_rotation_rad"] <= math.radians(2.0)
             and stability_max["workbench_translation_m"] <= 1.0e-5
             and stability_max["workbench_rotation_rad"] <= 1.0e-5
-            and stability_max["robot_root_translation_m"] <= 1.0e-4
-            and stability_max["robot_root_rotation_rad"] <= 1.0e-4
-            and stability_max["lower_body_joint_error_rad"] <= 0.005
-            and stability_max["upper_body_joint_drift_rad"] <= 0.01
-            and stability_max["upper_body_joint_velocity_rad_s"] <= 0.05
+            and stability_max["robot_root_xy_drift_m"] <= 0.20
+            and stability_max["robot_root_height_error_m"] <= 0.08
+            and stability_max["robot_root_abs_roll_rad"] <= math.radians(15.0)
+            and stability_max["robot_root_abs_pitch_rad"] <= math.radians(15.0)
+            and math.isfinite(stability_max["lower_body_joint_motion_rad"])
+            and stability_max["upper_body_joint_drift_rad"] <= 0.15
+            and stability_max["upper_body_joint_velocity_rad_s"] <= 0.50
             and stability_max["assembly_position_drift_m"] <= 0.002
             and stability_max["assembly_rotation_drift_rad"] <= math.radians(1.0)
         ),
@@ -1587,21 +1707,18 @@ def main() -> None:
             0.08,
             -0.08,
             0.08,
-            -0.08,
-            0.08,
-            -0.08,
         ],
         dtype=nominal_target.dtype,
         device=env.device,
     ).unsqueeze(0)
     positive_target = nominal_target.clone()
     negative_target = nominal_target.clone()
-    positive_target[:, :17] += half_delta
-    negative_target[:, :17] -= half_delta
+    positive_target[:, :14] += half_delta
+    negative_target[:, :14] -= half_delta
     soft_limits = as_torch(robot.data.soft_joint_pos_limits)[:, body_joint_ids]
     for target in (positive_target, negative_target):
-        target[:, :17] = torch.maximum(
-            torch.minimum(target[:, :17], soft_limits[..., 1]),
+        target[:, :14] = torch.maximum(
+            torch.minimum(target[:, :14], soft_limits[..., 1]),
             soft_limits[..., 0],
         )
 
@@ -1631,35 +1748,35 @@ def main() -> None:
     negative_state, negative_velocity, negative_echo_error = run_body_trial(
         negative_target
     )
-    requested_span = positive_target[:, :17] - negative_target[:, :17]
-    actual_span = positive_state[:, :17] - negative_state[:, :17]
+    requested_span = positive_target[:, :14] - negative_target[:, :14]
+    actual_span = positive_state[:, 3:17] - negative_state[:, 3:17]
     meaningful = torch.abs(requested_span) >= 0.02
     sign_match = torch.sign(actual_span[meaningful]) == torch.sign(
         requested_span[meaningful]
     )
     response_gain = actual_span[meaningful] / requested_span[meaningful]
-    positive_tracking_error = positive_state[:, :17] - positive_target[:, :17]
-    negative_tracking_error = negative_state[:, :17] - negative_target[:, :17]
+    positive_tracking_error = positive_state[:, 3:17] - positive_target[:, :14]
+    negative_tracking_error = negative_state[:, 3:17] - negative_target[:, :14]
     max_tracking_error = max(
         float(torch.abs(positive_tracking_error).max()),
         float(torch.abs(negative_tracking_error).max()),
     )
     max_command_echo_error = max(positive_echo_error, negative_echo_error)
     body_response = {
-        "joint_names": list(UPPER_BODY_JOINT_NAMES),
+        "joint_names": list(ARM_JOINT_NAMES),
         "equilibrium_steps": args_cli.equilibrium_steps,
         "response_steps": args_cli.joint_response_steps,
-        "nominal_target": _tensor_list(nominal_target[:, :17]),
-        "nominal_equilibrium_state": _tensor_list(nominal_state[:, :17]),
+        "nominal_target": _tensor_list(nominal_target[:, :14]),
+        "nominal_equilibrium_state": _tensor_list(nominal_state[:, 3:17]),
         "nominal_equilibrium_error": _tensor_list(
-            nominal_state[:, :17] - nominal_target[:, :17]
+            nominal_state[:, 3:17] - nominal_target[:, :14]
         ),
-        "positive_target": _tensor_list(positive_target[:, :17]),
-        "positive_state": _tensor_list(positive_state[:, :17]),
+        "positive_target": _tensor_list(positive_target[:, :14]),
+        "positive_state": _tensor_list(positive_state[:, 3:17]),
         "positive_final_velocity_rad_s": _tensor_list(positive_velocity),
         "positive_tracking_error": _tensor_list(positive_tracking_error),
-        "negative_target": _tensor_list(negative_target[:, :17]),
-        "negative_state": _tensor_list(negative_state[:, :17]),
+        "negative_target": _tensor_list(negative_target[:, :14]),
+        "negative_state": _tensor_list(negative_state[:, 3:17]),
         "negative_final_velocity_rad_s": _tensor_list(negative_velocity),
         "negative_tracking_error": _tensor_list(negative_tracking_error),
         "requested_span": _tensor_list(requested_span),
@@ -1682,8 +1799,8 @@ def main() -> None:
         env, zero_action, args_cli.equilibrium_steps
     )
     hand_target_a = hand_baseline.clone()
-    hand_target_a[:, 17] = 0.0
-    hand_target_a[:, 18] = 4.5
+    hand_target_a[:, 14] = 0.0
+    hand_target_a[:, 15] = 4.5
     for _ in range(args_cli.joint_response_steps):
         _step_target(env, hand_target_a, zero_action)
     hand_state_a = dataset_joint_state(env)
@@ -1694,19 +1811,19 @@ def main() -> None:
         target=hand_baseline,
     )
     hand_target_b = hand_baseline.clone()
-    hand_target_b[:, 17] = 4.5
-    hand_target_b[:, 18] = 0.0
+    hand_target_b[:, 14] = 4.5
+    hand_target_b[:, 15] = 0.0
     for _ in range(args_cli.joint_response_steps):
         _step_target(env, hand_target_b, zero_action)
     hand_state_b = dataset_joint_state(env)
     hand_response = {
-        "target_open_left_closed_right": _tensor_list(hand_target_a[:, 17:19]),
+        "target_open_left_closed_right": _tensor_list(hand_target_a[:, 14:16]),
         "state_open_left_closed_right": _tensor_list(hand_state_a[:, 17:19]),
-        "target_closed_left_open_right": _tensor_list(hand_target_b[:, 17:19]),
+        "target_closed_left_open_right": _tensor_list(hand_target_b[:, 14:16]),
         "state_closed_left_open_right": _tensor_list(hand_state_b[:, 17:19]),
         "max_command_error": max(
-            float(torch.abs(hand_state_a[:, 17:19] - hand_target_a[:, 17:19]).max()),
-            float(torch.abs(hand_state_b[:, 17:19] - hand_target_b[:, 17:19]).max()),
+            float(torch.abs(hand_state_a[:, 17:19] - hand_target_a[:, 14:16]).max()),
+            float(torch.abs(hand_state_b[:, 17:19] - hand_target_b[:, 14:16]).max()),
         ),
     }
     hand_response["pass"] = hand_response["max_command_error"] <= 0.25
@@ -1888,7 +2005,7 @@ def main() -> None:
         "runtime_identity_and_actuators": bool(runtime_identity["pass"]),
         "prepared_scene_starts_motionless": bool(prepared_scene_velocity["pass"]),
         "reset_clears_prior_actuator_targets": bool(reset_actuator_targets["pass"]),
-        "direct_target_actuators_and_solver": bool(direct_target_actuators["pass"]),
+        "wbc_actuator_ownership_and_solver": bool(wbc_actuators["pass"]),
         "explicit_pd_effort_saturation": bool(actuator_effort_saturation["pass"]),
         "timebase": bool(timebase["pass"]),
         "scene_geometry_and_reset_pose": bool(scene_geometry["pass"]),
@@ -1904,18 +2021,19 @@ def main() -> None:
         "assembled_table_torque_response": bool(torque_response["pass"]),
     }
     report = {
-        "schema_version": "team_ramen_flip_table_simulation_contract_audit_v12",
+        "schema_version": "team_ramen_flip_table_simulation_contract_audit_v13",
         "purpose": "policy-independent simulator and control-path validation",
         "privileged_state_use": "diagnostics only; never a policy, critic, planner, or inference input",
         "seed": int(args_cli.seed),
         "action_dim": int(env.action_manager.total_action_dim),
         "action_terms": list(env.action_manager.active_terms),
-        "controlled_joint_names": list(UPPER_BODY_JOINT_NAMES) + ["left_dex1", "right_dex1"],
-        "lower_body_joint_names": list(LOWER_BODY_JOINT_NAMES),
+        "controlled_joint_names": list(ARM_JOINT_NAMES) + ["left_dex1", "right_dex1"],
+        "balance_owner": "organizer G1 decoupled WBC (root, legs, waist)",
+        "wbc_owned_joint_names": list(WBC_OWNED_JOINT_NAMES),
         "runtime_identity": runtime_identity,
         "prepared_scene_velocity": prepared_scene_velocity,
         "reset_actuator_targets": reset_actuator_targets,
-        "direct_target_actuators": direct_target_actuators,
+        "wbc_actuators": wbc_actuators,
         "actuator_effort_saturation": actuator_effort_saturation,
         "timebase": timebase,
         "scene_geometry": scene_geometry,

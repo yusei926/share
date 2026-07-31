@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "models": {
+    "pick_legs_act_joint16_augxx_s40k": {
+      "aliases": ["pana_nakatsuka_act_pick_joint16_augxx_s40k_20260730"],
+      "repo_id": "Team-RAMEN/pana_nakatsuka_act_pick_joint16_augxx_s40k_20260730",
+      "revision": "fcf3f0493c64b301f20fb5c803ab18344b62aabf",
+      "family": "act_absolute_joint16_v1",
+      "task": "pick table leg",
+      "camera_roles": ["head_left", "head_right", "left_wrist", "right_wrist"],
+      "observation_horizon": 1,
+      "model_state_dim": 16,
+      "model_action_dim": 16,
+      "model_action_horizon": 30,
+      "execution_steps": 8,
+      "state_semantics": "g1_sdk_arms14+dex1_physical2",
+      "action_semantics": "absolute_arms14_rad+dex1_physical2;clamp_to_serialized_training_support",
+      "runner": "inference.desktop.upper_policy.run_pick_leg_act",
+      "worker": "model/subtask_policy_training/deployment/real_act_joint16_worker.py",
+      "expected_model_sha256": "581bde6e608d196f7018af1acf01ea666a2a07fb472f8c898c5f2c116ed45bce",
+      "artifact": {
+        "checkpoint_subdir": "pretrained_model",
+        "required_files": ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json", "policy_preprocessor_step_3_normalizer_processor.safetensors", "policy_postprocessor_step_0_unnormalizer_processor.safetensors", "train_config.json"],
+        "allow_patterns": ["README.md", "pretrained_model/config.json", "pretrained_model/model.safetensors", "pretrained_model/policy_preprocessor.json", "pretrained_model/policy_postprocessor.json", "pretrained_model/policy_preprocessor_step_3_normalizer_processor.safetensors", "pretrained_model/policy_postprocessor_step_0_unnormalizer_processor.safetensors", "pretrained_model/train_config.json"],
+        "file_sha256": {
+          "model.safetensors": "581bde6e608d196f7018af1acf01ea666a2a07fb472f8c898c5f2c116ed45bce",
+          "policy_preprocessor_step_3_normalizer_processor.safetensors": "960100d5be112a01fd6f1eeedc409bf2a51e9f7912ded26b22089cb32d41352c",
+          "policy_postprocessor_step_0_unnormalizer_processor.safetensors": "960100d5be112a01fd6f1eeedc409bf2a51e9f7912ded26b22089cb32d41352c"
+        }
+      }
+    },
+    "pick_legs_groot_v1": {
+      "aliases": ["groot-n1.7-pick-legs-ver1"],
+      "repo_id": "Team-RAMEN/groot-n1.7-pick-legs-ver1",
+      "revision": "b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a",
+      "family": "groot_absolute_joint_v1",
+      "task": "pick table leg",
+      "camera_roles": ["head_left", "head_right", "left_wrist", "right_wrist"],
+      "observation_horizon": 1,
+      "model_state_dim": 38,
+      "model_action_dim": 38,
+      "model_action_horizon": 16,
+      "execution_steps": 8,
+      "state_semantics": "root_xyz_wxyz7+g1_sdk_body29+dex1_physical2",
+      "action_semantics": "absolute_root7+body29+dex1_physical2;execute_body[15:29]+hands_only",
+      "runner": "inference.desktop.upper_policy.run_pick_leg_groot",
+      "worker": "model/subtask_policy_training/deployment/real_groot_n17_worker.py",
+      "artifact": {
+        "checkpoint_subdir": "checkpoint-40000",
+        "required_files": ["config.json", "processor_config.json", "statistics.json", "embodiment_id.json", "model.safetensors.index.json", "model-00001-of-00003.safetensors", "model-00002-of-00003.safetensors", "model-00003-of-00003.safetensors"],
+        "allow_patterns": ["checkpoint-40000/config.json", "checkpoint-40000/processor_config.json", "checkpoint-40000/statistics.json", "checkpoint-40000/embodiment_id.json", "checkpoint-40000/model.safetensors.index.json", "checkpoint-40000/model-*.safetensors"],
+        "file_sha256": {
+          "model-00001-of-00003.safetensors": "cbcaea5ee88f1e0f1465043920a2647c67e7de17d24adfd1c477742a6168edec",
+          "model-00002-of-00003.safetensors": "3f048ba29dfb44676ee0329e6f15e5778c177c2861fc88d554b7c632548a0a5e",
+          "model-00003-of-00003.safetensors": "684424c3a2550cb799ef035478c5c539c5ceb86d3dbc49d039b4efea49cf4a20"
+        }
+      }
+    },
+    "pick_legs_groot_v2_lora": {
+      "aliases": ["groot-n1.7-pick-legs-ver2-lora"],
+      "repo_id": "Team-RAMEN/groot-n1.7-pick-legs-ver2-lora",
+      "revision": "8f875028fffb1b35ebaf6a95d1575ccec86c12a1",
+      "family": "groot_absolute_joint_v1",
+      "task": "pick table leg",
+      "camera_roles": ["head_left", "head_right", "left_wrist", "right_wrist"],
+      "observation_horizon": 1,
+      "model_state_dim": 38,
+      "model_action_dim": 38,
+      "model_action_horizon": 16,
+      "execution_steps": 8,
+      "state_semantics": "root_xyz_wxyz7+g1_sdk_body29+dex1_physical2",
+      "action_semantics": "absolute_root7+body29+dex1_physical2;execute_body[15:29]+hands_only",
+      "runner": "inference.desktop.upper_policy.run_pick_leg_groot",
+      "worker": "model/subtask_policy_training/deployment/real_groot_n17_worker.py",
+      "artifact": {
+        "checkpoint_subdir": "",
+        "required_files": ["config.json", "processor_config.json", "statistics.json", "embodiment_id.json", "model.safetensors.index.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+        "allow_patterns": ["README.md", "config.json", "processor_config.json", "statistics.json", "embodiment_id.json", "model.safetensors.index.json", "model-*.safetensors"],
+        "file_sha256": {
+          "model-00001-of-00002.safetensors": "bce0d79d501096d051bd779831be59c77acbcd7a2daa97a8ddd2cb37b820af4e",
+          "model-00002-of-00002.safetensors": "6beb5655b55ba3e6377169700931d87e8b8a450e5c293d94721e9cea09aaf030"
+        }
+      }
+    },
+    "coarse_insert_groot_n17_v2": {
+      "aliases": ["IROS2026_RAMEN_takada_groot_n17_coarse_insert_100k_dex1_v2"],
+      "repo_id": "Team-RAMEN/IROS2026_RAMEN_takada_groot_n17_coarse_insert_100k_dex1_v2",
+      "revision": "55bff52e3849323d1e37d03376ea6f4520440236",
+      "family": "groot_relative_eef_v1",
+      "task": "coarse align table leg to table base",
+      "camera_roles": ["head_left", "left_wrist", "right_wrist"],
+      "observation_horizon": 1,
+      "model_state_dim": 49,
+      "model_action_dim": 53,
+      "model_action_horizon": 16,
+      "execution_steps": 8,
+      "state_semantics": "eef_xyz_rot6d18+hand7x2+arms14+waist3",
+      "action_semantics": "decoded_absolute53;execute_arms[32:46]+dex1(left18,right25);discard_eef,waist,base,navigation",
+      "runner": "inference.desktop.upper_policy.run_coarse_insert_groot",
+      "worker": "model/subtask_policy_training/deployment/real_coarse_insert_groot_n17_worker.py",
+      "expected_model_sha256": "f2f4e035657c0a6ca13b8d87dc17f692a83be2f1186fd20bf8cfba5569dfa2f2",
+      "artifact": {
+        "checkpoint_subdir": "",
+        "required_files": ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json", "policy_preprocessor_step_2_groot_n1_7_pack_inputs_v1.safetensors"],
+        "allow_patterns": ["README.md", "config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json", "policy_preprocessor_step_2_groot_n1_7_pack_inputs_v1.safetensors", "train_config.json"],
+        "file_sha256": {
+          "model.safetensors": "f2f4e035657c0a6ca13b8d87dc17f692a83be2f1186fd20bf8cfba5569dfa2f2",
+          "policy_preprocessor_step_2_groot_n1_7_pack_inputs_v1.safetensors": "87118aa905a39ebdecfd7937cecaf99458f47b75a07806106f1825a6a3cc7293"
+        }
+      }
+    },
+    "flip_table_diffusion_chunk_relative_v2": {
+      "aliases": ["IROS2026_RAMEN_suzuki_flip_table_diffusion_chunk_relative_2"],
+      "repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_diffusion_chunk_relative_2",
+      "revision": "5d231c68aca6cf3f37c18f56ebaf083fb3d192e3",
+      "family": "diffusion_chunk_relative_v1",
+      "task": "flip table",
+      "camera_roles": ["head_left", "left_wrist", "right_wrist"],
+      "observation_horizon": 2,
+      "model_state_dim": 19,
+      "model_action_dim": 16,
+      "model_action_horizon": 16,
+      "execution_steps": 8,
+      "state_semantics": "waist3+arms14+dex1_physical2",
+      "action_semantics": "arm14_relative_to_measured_chunk_start+dex1_physical2_absolute;zscore;clip_sample_false",
+      "runner": "inference.desktop.upper_policy.run_flip_table_diffusion",
+      "worker": "model/subtask_policy_training/deployment/real_diffusion_worker.py",
+      "expected_model_sha256": "a054158be8cb9c9ffee4c96ae23d56dd562f64218de89b942b9af8086ed4388e",
+      "artifact": {
+        "checkpoint_subdir": "",
+        "required_files": ["config.json", "model.safetensors", "normalization.json", "train_config.json", "training_manifest.json", "_diffusion_config/config.json"],
+        "allow_patterns": ["README.md", "config.json", "model.safetensors", "normalization.json", "train_config.json", "training_manifest.json", "training_run_record.json", "evaluation_report.json", "policy_preprocessor.json", "policy_postprocessor.json", "_diffusion_config/config.json"],
+        "file_sha256": {
+          "model.safetensors": "a054158be8cb9c9ffee4c96ae23d56dd562f64218de89b942b9af8086ed4388e"
+        }
+      }
+    }
+  }
+}

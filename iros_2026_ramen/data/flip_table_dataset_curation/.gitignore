@@ -1,0 +1,5 @@
+.pixi/
+workspace/*
+!workspace/README.md
+__pycache__/
+.pytest_cache/

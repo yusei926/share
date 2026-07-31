@@ -28,6 +28,8 @@ SOURCE_EEF_ORDER = ("left", "right")
 SOURCE_EEF_POSE_FORMAT = "xyz_euler_xyz_rad"
 SOURCE_EEF_REFERENCE_FRAME = "robot_root"
 UPPER_BODY_SLICE = slice(19, 36)
+ARM_ACTION_SLICE = slice(22, 36)
+BODY_ACTION_SLICE = slice(SOURCE_ROOT_DIM, SOURCE_Q_DIM)
 POLICY_CAMERA_KEYS = (
     "observation.images.cam_0",
     "observation.images.cam_2",
@@ -136,8 +138,8 @@ def finite_matrix(value: Any, width: int, label: str) -> np.ndarray:
     return matrix
 
 
-def source_19d_actions(robot_q_desired: Any, hand_cmd: Any) -> np.ndarray:
-    """Return the only 19-D command that the fixed-base evaluation may replay."""
+def source_16d_actions(robot_q_desired: Any, hand_cmd: Any) -> np.ndarray:
+    """Return the deployable arms14 + hands2 command used by every replay."""
 
     q = finite_matrix(robot_q_desired, SOURCE_Q_DIM, "robot_q_desired")
     hands = finite_matrix(hand_cmd, SOURCE_HAND_DIM, "hand_cmd")
@@ -145,7 +147,24 @@ def source_19d_actions(robot_q_desired: Any, hand_cmd: Any) -> np.ndarray:
         raise ValueError("robot_q_desired and hand_cmd must have equal frame counts")
     if np.any(hands < 0.0) or np.any(hands > 4.5):
         raise ValueError("hand_cmd is outside the recorded [0,4.5] range")
-    return np.concatenate((q[:, UPPER_BODY_SLICE], hands), axis=1)
+    return np.concatenate((q[:, ARM_ACTION_SLICE], hands), axis=1)
+
+
+def source_31d_actions(robot_q_desired: Any, hand_cmd: Any) -> np.ndarray:
+    """Return recorded body29 plus Dex1 commands for a diagnostic replay.
+
+    The deployable policy contract remains :func:`source_16d_actions`.
+    Whole-body replay exists only to identify the simulator controller; it
+    never writes a floating root pose or supplies policy inputs.
+    """
+
+    q = finite_matrix(robot_q_desired, SOURCE_Q_DIM, "robot_q_desired")
+    hands = finite_matrix(hand_cmd, SOURCE_HAND_DIM, "hand_cmd")
+    if len(q) != len(hands):
+        raise ValueError("robot_q_desired and hand_cmd must have equal frame counts")
+    if np.any(hands < 0.0) or np.any(hands > 4.5):
+        raise ValueError("hand_cmd is outside the recorded [0,4.5] range")
+    return np.concatenate((q[:, BODY_ACTION_SLICE], hands), axis=1)
 
 
 def source_19d_observation(robot_q_current: Any, hand_state: Any) -> np.ndarray:
@@ -155,7 +174,7 @@ def source_19d_observation(robot_q_current: Any, hand_state: Any) -> np.ndarray:
     interval: a small amount of encoder overshoot is an observed calibration
     fact, while conversion to a simulator-valid finger position happens at the
     scene boundary.  This is deliberately distinct from
-    :func:`source_19d_actions`, whose hand command is contractually in
+    :func:`source_16d_actions`, whose hand command is contractually in
     ``[0, 4.5]``.
     """
 
@@ -164,6 +183,16 @@ def source_19d_observation(robot_q_current: Any, hand_state: Any) -> np.ndarray:
     if len(q) != len(hands):
         raise ValueError("robot_q_current and hand_state must have equal frame counts")
     return np.concatenate((q[:, UPPER_BODY_SLICE], hands), axis=1)
+
+
+def source_31d_observation(robot_q_current: Any, hand_state: Any) -> np.ndarray:
+    """Return measured body29 and hand encoders for diagnostic replay only."""
+
+    q = finite_matrix(robot_q_current, SOURCE_Q_DIM, "robot_q_current")
+    hands = finite_matrix(hand_state, SOURCE_HAND_DIM, "hand_state")
+    if len(q) != len(hands):
+        raise ValueError("robot_q_current and hand_state must have equal frame counts")
+    return np.concatenate((q[:, BODY_ACTION_SLICE], hands), axis=1)
 
 
 def episode_signals(
@@ -241,19 +270,19 @@ def select_episode_roles(
 
 
 def compute_joint_replay_metrics(
-    target_19d: Any,
+    target_16d: Any,
     actual_19d: Any,
     *,
     source_hz: float = SOURCE_FPS,
     simulator_hz: float = 50.0,
 ) -> JointReplayMetrics:
-    target = finite_matrix(target_19d, 19, "target_19d")
+    target = finite_matrix(target_16d, 16, "target_16d")
     actual = finite_matrix(actual_19d, 19, "actual_19d")
-    if target.shape != actual.shape:
-        raise ValueError("target_19d and actual_19d must have equal shapes")
+    if target.shape[0] != actual.shape[0]:
+        raise ValueError("target_16d and actual_19d must have equal frame counts")
     if source_hz <= 0.0 or simulator_hz <= 0.0:
         raise ValueError("source_hz and simulator_hz must be positive")
-    errors = actual[:, :17] - target[:, :17]
+    errors = actual[:, 3:17] - target[:, :14]
     # The production calibration contract has no lower-body command channel.
     # Keep it unavailable rather than treating an absent signal as a success.
     return JointReplayMetrics(

@@ -31,6 +31,7 @@ def make_info(total_episodes: int, total_frames: int) -> dict:
         "total_frames": total_frames,
         "features": {
             "observation.images.cam_0": video,
+            "observation.images.cam_1": video,
             "observation.images.cam_2": video,
             "observation.images.cam_3": video,
             "observation.state.ee_state": {"dtype": "float32", "shape": [12]},
@@ -86,6 +87,20 @@ def test_episode_metadata_rejects_noncontiguous_ranges() -> None:
     errors, _, _ = module.audit_episode_metadata(make_info(2, 20), episodes)
 
     assert any("dataset ranges" in error for error in errors)
+
+
+def test_episode_metadata_accepts_frame_based_source_provenance() -> None:
+    module = load_module()
+    episodes = make_episodes(2)
+    for index, episode in enumerate(episodes):
+        del episode["source_start_sec"]
+        del episode["source_end_sec"]
+        episode["source_frame_start"] = index * 10
+        episode["source_frame_end"] = (index + 1) * 10
+
+    errors, _, _ = module.audit_episode_metadata(make_info(2, 20), episodes)
+
+    assert errors == []
 
 
 def test_episode_metadata_requires_relative_eef_source_fields() -> None:

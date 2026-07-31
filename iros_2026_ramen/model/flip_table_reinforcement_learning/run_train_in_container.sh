@@ -31,9 +31,9 @@ Supported modes:
   evaluate_rlpd_stage  Evaluate a Flow checkpoint or Flow+RLPD checkpoint.
   train_rlpd           Train the Flow+RLPD comparison baseline.
 
-All successful demonstrations and Mimic integration belong to the next branch.
-This entrypoint intentionally contains no CEM, fixed-trajectory, or privileged
-teacher-search mode.
+Production Sim paths use the organizer balanced WBC with a 16-D arm/hand
+policy action. fixed_diagnostic is reserved for explicit fault isolation.
+This entrypoint contains no runtime teleport or privileged policy input.
 EOF
 }
 
@@ -122,6 +122,11 @@ export FLIP_TABLE_RESTORE_OFFICIAL_V1_ROBOT_FILES=true
 export FLIP_TABLE_RL_DEMO_ACTION_PATH="$DEMO_PATH"
 export FLIP_TABLE_RL_STAGE="$STAGE"
 export FLIP_TABLE_RL_CONTROL_HZ="${FLIP_TABLE_RL_CONTROL_HZ:-50}"
+export FLIP_TABLE_SIM_BODY_MODE=balanced_wbc
+export FLIP_TABLE_LOCK_LOWER_BODY=false
+export FLIP_TABLE_LOCK_ROBOT_ROOT=false
+export FLIP_TABLE_FIX_ROOT_LINK=false
+export FLIP_TABLE_REQUIRE_WAIST_LOCK=false
 export FLIP_TABLE_RL_DEMO_HZ="${FLIP_TABLE_RL_DEMO_HZ:-30}"
 export FLIP_TABLE_RL_PHASE_MODE="${FLIP_TABLE_RL_PHASE_MODE:-clock}"
 export FLIP_TABLE_RL_DEMO_START_INDEX="${FLIP_TABLE_RL_DEMO_START_INDEX:-0}"
@@ -173,6 +178,15 @@ fi
 cp "$SIM_DIR/container_overlay/robofinals_tasks/local_auto_tasks/assemble_table_task.py" "$TASK_TARGET"
 rm -rf "$ROBOFINALS_ROOT/robofinals_rl/flip_table"
 cp -a "$FEATURE_DIR/container_overlay/robofinals_rl/flip_table" "$ROBOFINALS_ROOT/robofinals_rl/flip_table"
+cp "$SIM_DIR/container_overlay/mdp/team_ramen_balanced_wbc_action.py" \
+  "$ROBOFINALS_ROOT/robofinals/core/mdp/actions/team_ramen_balanced_wbc_action.py"
+WBC_CKPT_DIR="$ROBOFINALS_ROOT/robofinals/data/ckpts/nv_wbc_v0904/homie_v2"
+for required_wbc in "$WBC_CKPT_DIR/stand.onnx" "$WBC_CKPT_DIR/walk.onnx"; do
+  [[ -f "$required_wbc" ]] || { echo "ERROR: official WBC asset missing: $required_wbc" >&2; exit 1; }
+done
+export FLIP_TABLE_WBC_STAND_ONNX_SHA256="$(sha256sum "$WBC_CKPT_DIR/stand.onnx" | awk '{print $1}')"
+export FLIP_TABLE_WBC_WALK_ONNX_SHA256="$(sha256sum "$WBC_CKPT_DIR/walk.onnx" | awk '{print $1}')"
+export FLIP_TABLE_WBC_ADAPTER_SHA256="$(sha256sum "$ROBOFINALS_ROOT/robofinals/core/mdp/actions/team_ramen_balanced_wbc_action.py" | awk '{print $1}')"
 
 "$PYTHON_BIN" - "$ROBOFINALS_ROOT/robofinals_rl/__init__.py" <<'PY'
 import sys
@@ -251,16 +265,33 @@ RUN_MANIFEST_PATH="${FLIP_TABLE_RL_RUN_MANIFEST_PATH:-$RUN_DIR.run_manifest.json
 cd "$ROBOFINALS_ROOT"
 case "$MODE" in
   audit_contract)
-    exec "$PYTHON_BIN" "$FEATURE_DIR/scripts/audit_simulation_contract.py" \
+    audit_output="${FLIP_TABLE_SIM_AUDIT_OUTPUT:-$RUN_DIR/simulation_contract_audit.json}"
+    "$PYTHON_BIN" "$FEATURE_DIR/scripts/audit_simulation_contract.py" \
       --task_config flip_table_rl --num-envs 1 --sim-control-hz "$FLIP_TABLE_RL_CONTROL_HZ" \
       --seed "${FLIP_TABLE_SIM_AUDIT_SEED:-42}" \
       --friction-steps "${FLIP_TABLE_SIM_AUDIT_FRICTION_STEPS:-20}" \
       --friction-force-n "${FLIP_TABLE_SIM_AUDIT_FRICTION_FORCE_N:-5.0}" \
-      --output "${FLIP_TABLE_SIM_AUDIT_OUTPUT:-$RUN_DIR/simulation_contract_audit.json}" --headless
+      --output "$audit_output" --headless
+    # Isaac Sim can terminate its Python application with status 0 after an
+    # uncaught exception during shutdown.  The report is therefore the
+    # authoritative completion marker, and a failing gate must fail CI too.
+    "$PYTHON_BIN" - "$audit_output" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.stat().st_size == 0:
+    raise SystemExit(f"simulation contract audit did not produce a report: {path}")
+report = json.loads(path.read_text(encoding="utf-8"))
+if report.get("all_gates_pass") is not True:
+    failed = [name for name, passed in report.get("gates", {}).items() if not passed]
+    raise SystemExit(f"simulation contract audit gates failed: {failed}")
+PY
     ;;
   audit_partial_reset)
     exec "$PYTHON_BIN" "$FEATURE_DIR/scripts/audit_partial_reset_contract.py" \
-      --task_config flip_table_rl --num-envs "$NUM_ENVS" \
+      --task_config flip_table_rl --num_envs "$NUM_ENVS" \
       --settle_steps "${FLIP_TABLE_RL_RESET_SETTLE_STEPS:-4}" \
       --output "$RUN_DIR/partial_reset_contract.json"
     ;;

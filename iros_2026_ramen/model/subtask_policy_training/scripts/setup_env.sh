@@ -4,10 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-uv venv .venv --python 3.12 --allow-existing
-source .venv/bin/activate
+VENV_DIR="${VENV_DIR:-.venv}"
+uv venv "$VENV_DIR" --python 3.12 --allow-existing
+source "$VENV_DIR/bin/activate"
 uv pip install -r requirements.txt
+uv pip install --no-deps --editable lerobot_policy_furniture_groot
 python scripts/patch_lerobot_groot_relative_eef.py
+python scripts/patch_lerobot_furniture_groot_plugin.py
+python scripts/patch_lerobot_gradient_accumulation.py
+python scripts/patch_lerobot_checkpoint_retention.py
 
 python - <<'PY'
 import lerobot

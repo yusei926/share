@@ -17,11 +17,28 @@ SPLIT_PATH = Path("meta/team_ramen_episode_split.json")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resolve leakage-safe LeRobot train/eval episodes.")
     parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--allow-empty-validation", action="store_true")
+    parser.add_argument(
+        "--overfit-train-episodes",
+        help="Comma-separated subset of the declared train split for a gated overfit run.",
+    )
+    parser.add_argument(
+        "--overfit-validation-count",
+        type=int,
+        default=1,
+        help="Number of declared validation episodes retained by an overfit run.",
+    )
     parser.add_argument("--format", choices=("shell", "json"), default="shell")
     return parser.parse_args()
 
 
-def resolve_split(dataset_root: Path) -> dict[str, Any]:
+def resolve_split(
+    dataset_root: Path,
+    *,
+    allow_empty_validation: bool = False,
+    overfit_train_episodes: list[int] | None = None,
+    overfit_validation_count: int = 1,
+) -> dict[str, Any]:
     split_path = dataset_root / SPLIT_PATH
     if not split_path.is_file():
         raise FileNotFoundError(f"training split manifest is missing: {split_path}")
@@ -64,17 +81,40 @@ def resolve_split(dataset_root: Path) -> dict[str, Any]:
             raise ValueError(
                 f"source-recording leakage between {left} and {right}: {sorted(source_overlap)[:10]}"
             )
-    if not episode_sets["train"] or not episode_sets["validation"]:
+    if not episode_sets["train"] or (not allow_empty_validation and not episode_sets["validation"]):
         raise ValueError("training and validation splits must both be non-empty")
 
     train = sorted(episode_sets["train"])
     validation = sorted(episode_sets["validation"])
+    if overfit_train_episodes is not None:
+        if not overfit_train_episodes:
+            raise ValueError("overfit train episode selection must not be empty")
+        if len(overfit_train_episodes) != len(set(overfit_train_episodes)):
+            raise ValueError("overfit train episode selection contains duplicates")
+        unknown = sorted(set(overfit_train_episodes) - episode_sets["train"])
+        if unknown:
+            raise ValueError(
+                "overfit episodes must belong to the declared train split; "
+                f"invalid indices: {unknown}"
+            )
+        if overfit_validation_count <= 0:
+            raise ValueError("overfit validation count must be positive")
+        if overfit_validation_count > len(validation):
+            raise ValueError(
+                "overfit validation count exceeds the declared validation split "
+                f"({overfit_validation_count} > {len(validation)})"
+            )
+        train = sorted(overfit_train_episodes)
+        validation = validation[:overfit_validation_count]
     selected = train + validation
-    eval_split = len(validation) / len(selected)
-    if math.ceil(len(selected) * eval_split) != len(validation):
-        eval_split = (len(validation) - 0.5) / len(selected)
-    if math.ceil(len(selected) * eval_split) != len(validation):
-        raise RuntimeError("could not represent validation split for LeRobot's ceil-based splitter")
+    if validation:
+        eval_split = len(validation) / len(selected)
+        if math.ceil(len(selected) * eval_split) != len(validation):
+            eval_split = (len(validation) - 0.5) / len(selected)
+        if math.ceil(len(selected) * eval_split) != len(validation):
+            raise RuntimeError("could not represent validation split for LeRobot's ceil-based splitter")
+    else:
+        eval_split = 0.0
 
     return {
         "DATASET_EPISODES_JSON": json.dumps(selected, separators=(",", ":")),
@@ -83,12 +123,22 @@ def resolve_split(dataset_root: Path) -> dict[str, Any]:
         "VALIDATION_EPISODE_COUNT": len(validation),
         "TEST_EPISODE_COUNT": len(episode_sets["test"]),
         "SPLIT_SHA256": expected_sha,
+        "OVERFIT_MODE": overfit_train_episodes is not None,
     }
 
 
 def main() -> None:
     args = parse_args()
-    values = resolve_split(args.dataset_root.resolve())
+    values = resolve_split(
+        args.dataset_root.resolve(),
+        allow_empty_validation=args.allow_empty_validation,
+        overfit_train_episodes=(
+            [int(value) for value in args.overfit_train_episodes.split(",")]
+            if args.overfit_train_episodes
+            else None
+        ),
+        overfit_validation_count=args.overfit_validation_count,
+    )
     if args.format == "json":
         print(json.dumps(values, indent=2, sort_keys=True))
         return

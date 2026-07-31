@@ -17,9 +17,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscri
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
 
 
-def read_state(topic: str) -> MotorStates_ | None:
-    subscriber = ChannelSubscriber(topic, MotorStates_)
-    subscriber.Init()
+def read_state(subscriber: ChannelSubscriber) -> MotorStates_ | None:
     return subscriber.Read()
 
 
@@ -36,16 +34,25 @@ def main() -> int:
         "left": "rt/dex1/left/state",
         "right": "rt/dex1/right/state",
     }
+    # CycloneDDS lazily populates the Python IDL type on the first Topic
+    # construction and that population is not thread-safe. Build and init both
+    # subscribers serially; only the potentially blocking Read calls belong in
+    # parallel daemon threads.
+    subscribers = {}
+    for side, topic in topics.items():
+        subscriber = ChannelSubscriber(topic, MotorStates_)
+        subscriber.Init()
+        subscribers[side] = subscriber
     received: queue.Queue[tuple[str, MotorStates_ | None]] = queue.Queue()
 
-    def reader(side: str, topic: str) -> None:
-        received.put((side, read_state(topic)))
+    def reader(side: str, subscriber: ChannelSubscriber) -> None:
+        received.put((side, read_state(subscriber)))
 
     # ChannelSubscriber.Read may block forever before the PC2 service is up.
     # Daemon threads let this diagnostic fail cleanly without a publisher or
     # any command path to the robot.
-    for side, topic in topics.items():
-        threading.Thread(target=reader, args=(side, topic), daemon=True).start()
+    for side, subscriber in subscribers.items():
+        threading.Thread(target=reader, args=(side, subscriber), daemon=True).start()
 
     states: dict[str, MotorStates_ | None] = {}
     deadline = time.monotonic() + args.timeout

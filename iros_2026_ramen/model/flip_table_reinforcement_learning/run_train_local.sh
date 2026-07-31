@@ -52,6 +52,27 @@ if [[ -n "${FLIP_TABLE_RL_DEMO_ACTION_PATH:-}" ]]; then
     -e FLIP_TABLE_RL_DEMO_ACTION_PATH=/workspace/flip_table_inputs/demo_actions.json
   )
 fi
+
+# The repository is the only writable host bind mount.  Translate an output
+# path inside it to the container namespace and reject paths that would be
+# written only into the disposable container layer.
+if [[ -n "${FLIP_TABLE_RL_OUTPUT_DIR:-}" ]]; then
+  if [[ "$FLIP_TABLE_RL_OUTPUT_DIR" = /* ]]; then
+    host_output_dir="$(realpath -m "$FLIP_TABLE_RL_OUTPUT_DIR")"
+  else
+    host_output_dir="$(realpath -m "$ROOT_DIR/$FLIP_TABLE_RL_OUTPUT_DIR")"
+  fi
+  case "$host_output_dir" in
+    "$ROOT_DIR"/*)
+      container_output_dir="/workspace/iros_2026_ramen/${host_output_dir#"$ROOT_DIR"/}"
+      docker_args+=(-e "FLIP_TABLE_RL_OUTPUT_DIR=$container_output_dir")
+      ;;
+    *)
+      echo "ERROR: FLIP_TABLE_RL_OUTPUT_DIR must be inside $ROOT_DIR" >&2
+      exit 1
+      ;;
+  esac
+fi
 for token_variable in HF_TOKEN HUGGINGFACE_HUB_TOKEN; do
   if [[ -n "${!token_variable:-}" ]]; then
     docker_args+=(-e "$token_variable")
@@ -63,8 +84,8 @@ done
 # only the project-scoped settings that define a flip-table run.
 while IFS='=' read -r variable_name _; do
   case "$variable_name" in
-    FLIP_TABLE_RL_DEMO_ACTION_PATH)
-      # The host path above is deliberately remapped to a container path.
+    FLIP_TABLE_RL_DEMO_ACTION_PATH|FLIP_TABLE_RL_OUTPUT_DIR)
+      # Host paths above are deliberately remapped to container paths.
       ;;
     FLIP_TABLE_*|ROBOFINALS_*|WANDB_*)
       docker_args+=(-e "$variable_name")
@@ -91,8 +112,8 @@ docker --context default run --rm "${docker_tty_args[@]}" "${docker_args[@]}" "$
     set -euo pipefail
     backup=/workspace/robofinalsbak/robofinals/core/robots/unitree
     mkdir -p "$backup"
-    cp -a /workspace/robofinals/core/robots/unitree/g1.py "$backup/g1.py"
-    cp -a /workspace/robofinals/core/robots/unitree/assets_cfg.py "$backup/assets_cfg.py"
+    cp -a /workspace/robofinals/robofinals/core/robots/unitree/g1.py "$backup/g1.py"
+    cp -a /workspace/robofinals/robofinals/core/robots/unitree/assets_cfg.py "$backup/assets_cfg.py"
     mkdir -p /workspace/iros_2026_ramen/.checkpoints \
       /workspace/iros_2026_ramen/outputs
     chown -R "$LOCAL_UID:$LOCAL_GID" \

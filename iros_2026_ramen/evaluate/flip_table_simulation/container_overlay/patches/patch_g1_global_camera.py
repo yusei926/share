@@ -36,11 +36,16 @@ D405_VERTICAL_APERTURE = "26.482579798324018"
 HEAD_LEFT_OPTICAL_CENTER_POS = "(0.10209156, 0.02077481159355057, 0.42446595)"
 # The measured head baseline is 60.30046318710113 mm around the organizer V1
 # rig center y=-9.37542 mm.  Both sim eyes use the rectified optical rotation;
-# head-right is operator-only and never enters a policy feature map.
+# head-right is operator-only and never enters a policy feature map.  Its raw
+# sensor has a separately calibrated focal length, principal point, and Brown
+# distortion.  The centered USD focal below is the mean of its raw fx/fy; the
+# evaluation adapter restores the residual intrinsics and distortion.
 HEAD_RIGHT_OPTICAL_CENTER_POS = "(0.10209156, -0.039525651593550565, 0.42446595)"
 HEAD_LEFT_FOCAL_LENGTH = "24.0"
 HEAD_LEFT_HORIZONTAL_APERTURE = "45.56883749280177"
 HEAD_LEFT_VERTICAL_APERTURE = "34.176628119601325"
+HEAD_RIGHT_HORIZONTAL_APERTURE = "45.72970447536436"
+HEAD_RIGHT_VERTICAL_APERTURE = "34.29727835652327"
 # The competition Dex1/WBC configuration defines the wrist camera parent frames
 # and nominal bracket mount. The local Dex1-1 D405 bracket STEP and
 # Unitree Device.md confirm this is a wrist/M5010-ring mount, not a palm-frame
@@ -103,7 +108,10 @@ UNITREE_G1_PBR_MATERIALS = {
     "material_E5EAED": ((0.029933952, 0.030530358, 0.030888021), 1.0, 0.50, 0.22),
 }
 UPPER_BODY_JOINT_ACTION_CLASS = "FlipTableUpperBodyJointActionsCfg"
+FULL_BODY_JOINT_ACTION_CLASS = "FlipTableFullBodyJointActionsCfg"
 UPPER_BODY_JOINT_ACTION_ENV = "FLIP_TABLE_ACT_USE_JOINT_POSITION_ACTION"
+BALANCED_WBC_ACTION_CLASS = "FlipTableBalancedWBCActionsCfg"
+SIM_BODY_MODE_ENV = "FLIP_TABLE_SIM_BODY_MODE"
 PINK_EEF_ACTION_CLASS = "FlipTablePinkEEFActionsCfg"
 PINK_EEF_ACTION_ENV = "FLIP_TABLE_USE_PINK_EEF_ACTION"
 ROBOT_COLLISION_ENV = "FLIP_TABLE_ENABLE_ROBOT_COLLISIONS"
@@ -126,9 +134,9 @@ OFFICIAL_V1_ROBOT_FILES = (
 )
 OFFICIAL_V1_SOURCE_SHA256 = {
     "robofinals/core/robots/unitree/g1.py":
-        "4b42f29b5732e3e8cb7ded512ba67bae9cc40370c48b1a9e3c325cf6eb229ea9",
+        "da19a18ddff14d7cb0fd8878d7f8c3f55ce44bfba05a44d08c453c23cb7721a0",
     "robofinals/core/robots/unitree/assets_cfg.py":
-        "4ec02f85b65ba9588e7bd24e3785a280343149dc5e84da89e8b5bb50d02c114a",
+        "a8cec088b01198f105b7c6dac2652ba245e0da197c267512c2dcab9230041919",
 }
 # The V1 startup process generates the Dex1 USD after the immutable source tree
 # is unpacked. These first-write backups are therefore the pristine source for
@@ -197,8 +205,8 @@ POLICY_CAMERA_GEOMETRIES = (
         rot="(0.26523914, -0.27106013, -0.66472446, 0.64367383)",
         convention="opengl",
         focal_length=HEAD_LEFT_FOCAL_LENGTH,
-        horizontal_aperture=HEAD_LEFT_HORIZONTAL_APERTURE,
-        vertical_aperture=HEAD_LEFT_VERTICAL_APERTURE,
+        horizontal_aperture=HEAD_RIGHT_HORIZONTAL_APERTURE,
+        vertical_aperture=HEAD_RIGHT_VERTICAL_APERTURE,
         clipping_range="(0.1, 1.0e5)",
         update_period=POLICY_CAMERA_UPDATE_PERIOD,
         insert_if_missing=True,
@@ -934,6 +942,20 @@ def _ensure_gripper_controller_text(text: str) -> str:
                 break
         else:
             raise RuntimeError("Could not insert Dex1GripperCfg import in g1.py")
+    balanced_import = (
+        "from robofinals.core.mdp.actions.team_ramen_balanced_wbc_action "
+        "import TeamRamenBalancedWBCActionCfg"
+    )
+    if not any(line.strip() == balanced_import for line in lines):
+        for index, line in enumerate(lines):
+            if line.startswith("import robofinals.core.mdp as mdp"):
+                lines[index:index] = [
+                    balanced_import + "\n"
+                ]
+                changed = True
+                break
+        else:
+            raise RuntimeError("Could not insert Team RAMEN WBC adapter import in g1.py")
 
     if not any("G1_GRIPPER_CFG" in line and "from .assets_cfg import" in line for line in lines):
         for index, line in enumerate(lines):
@@ -1095,6 +1117,19 @@ def _format_upper_body_joint_action_class() -> list[str]:
         "\n",
         "\n",
         "@configclass\n",
+        f"class {BALANCED_WBC_ACTION_CLASS}:\n",
+        '    """16-D action: WBC arm14 plus native left/right Dex1 terms."""\n',
+        "\n",
+        "    base_action: TeamRamenBalancedWBCActionCfg = TeamRamenBalancedWBCActionCfg(\n",
+        '        asset_name="robot", joint_names=[".*"], base_height_m=0.74\n',
+        "    )\n",
+        "    left_hand_action: mdp.ActionTermCfg = None\n",
+        "    right_hand_action: mdp.ActionTermCfg = None\n",
+        "    left_arm_action: mdp.ActionTermCfg = None\n",
+        "    right_arm_action: mdp.ActionTermCfg = None\n",
+        "\n",
+        "\n",
+        "@configclass\n",
         f"class {UPPER_BODY_JOINT_ACTION_CLASS}:\n",
         '    """19-D absolute upper-body joint action for Team RAMEN policy evaluation."""\n',
         "\n",
@@ -1140,6 +1175,55 @@ def _format_upper_body_joint_action_class() -> list[str]:
         "\n",
         "\n",
         "@configclass\n",
+        f"class {FULL_BODY_JOINT_ACTION_CLASS}:\n",
+        '    """31-D body29 + native Dex1 action for offline controller identification."""\n',
+        "\n",
+        "    left_leg_action: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(\n",
+        '        asset_name="robot",\n',
+        '        joint_names=["left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint"],\n',
+        "        scale=1.0,\n",
+        "        use_default_offset=False,\n",
+        "        preserve_order=True,\n",
+        "    )\n",
+        "    right_leg_action: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(\n",
+        '        asset_name="robot",\n',
+        '        joint_names=["right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint", "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint"],\n',
+        "        scale=1.0,\n",
+        "        use_default_offset=False,\n",
+        "        preserve_order=True,\n",
+        "    )\n",
+        "    waist_action: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(\n",
+        '        asset_name="robot",\n',
+        '        joint_names=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],\n',
+        "        scale=1.0,\n",
+        "        use_default_offset=False,\n",
+        "        preserve_order=True,\n",
+        "    )\n",
+        "    left_arm_action: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(\n",
+        '        asset_name="robot",\n',
+        "        joint_names=[\n",
+        '            "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",\n',
+        '            "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",\n',
+        "        ],\n",
+        "        scale=1.0,\n",
+        "        use_default_offset=False,\n",
+        "        preserve_order=True,\n",
+        "    )\n",
+        "    right_arm_action: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(\n",
+        '        asset_name="robot",\n',
+        "        joint_names=[\n",
+        '            "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",\n',
+        '            "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",\n',
+        "        ],\n",
+        "        scale=1.0,\n",
+        "        use_default_offset=False,\n",
+        "        preserve_order=True,\n",
+        "    )\n",
+        "    left_hand_action: mdp.ActionTermCfg = None\n",
+        "    right_hand_action: mdp.ActionTermCfg = None\n",
+        "\n",
+        "\n",
+        "@configclass\n",
         f"class {PINK_EEF_ACTION_CLASS}:\n",
         '    """Absolute bimanual EEF actions solved by the organizer V1 PINK controller."""\n',
         "\n",
@@ -1168,7 +1252,11 @@ def _format_upper_body_joint_action_class() -> list[str]:
 
 
 def _insert_upper_body_joint_action_class(lines: list[str]) -> bool:
-    if any(line.startswith(f"class {UPPER_BODY_JOINT_ACTION_CLASS}") for line in lines):
+    if (
+        any(line.startswith(f"class {UPPER_BODY_JOINT_ACTION_CLASS}") for line in lines)
+        and any(line.startswith(f"class {BALANCED_WBC_ACTION_CLASS}") for line in lines)
+        and any(line.startswith(f"class {FULL_BODY_JOINT_ACTION_CLASS}") for line in lines)
+    ):
         return False
     for target_class in ("G1CameraCfg", "UnitreeG1GripperControllerDecoupledWBCEnvCfg"):
         for index, line in enumerate(lines):
@@ -1180,6 +1268,39 @@ def _insert_upper_body_joint_action_class(lines: list[str]) -> bool:
             lines[insert_index:insert_index] = _format_upper_body_joint_action_class()
             return True
     lines.extend(_format_upper_body_joint_action_class())
+    return True
+
+
+def _insert_balanced_wbc_action_import(lines: list[str]) -> bool:
+    """Import the Team RAMEN adapter without modifying the official WBC.
+
+    The pinned RoboFinals image already contains the organizer's gripper/WBC
+    environment class.  In that case the older embodiment bootstrap correctly
+    becomes a no-op, but the Team RAMEN action config below still needs its own
+    import.  Keep that dependency with the action-config patch rather than
+    relying on the optional bootstrap path.
+    """
+
+    import_line = (
+        "from robofinals.core.mdp.actions.team_ramen_balanced_wbc_action "
+        "import TeamRamenBalancedWBCActionCfg"
+    )
+    if any(line.strip() == import_line for line in lines):
+        return False
+
+    for index, line in enumerate(lines):
+        if line.startswith("import robofinals.core.mdp as mdp"):
+            lines[index:index] = [import_line + "\n"]
+            return True
+
+    # Synthetic/minimal configs used by contract tests may omit the regular
+    # import block.  Insert immediately before the first top-level class so
+    # the generated file remains valid and deterministic.
+    for index, line in enumerate(lines):
+        if line.startswith("class ") or line.strip() == "@configclass":
+            lines[index:index] = [import_line + "\n\n"]
+            return True
+    lines.append(import_line + "\n")
     return True
 
 
@@ -1218,7 +1339,7 @@ def _patch_gripper_controller_action_config(lines: list[str]) -> bool:
     if class_scope is None:
         raise RuntimeError("Could not find UnitreeG1GripperControllerDecoupledWBCEnvCfg in g1.py.")
     start, end = class_scope
-    marker = PINK_EEF_ACTION_ENV
+    marker = SIM_BODY_MODE_ENV
     for index in range(start, end):
         if marker in lines[index]:
             return False
@@ -1229,25 +1350,29 @@ def _patch_gripper_controller_action_config(lines: list[str]) -> bool:
             continue
         indent = _line_indent(lines[index])
         lines[index : index + 1] = [
-            f'{indent}if os.environ.get("{UPPER_BODY_JOINT_ACTION_ENV}", "").strip().lower() '
-            'in {"1", "true", "yes", "on"}:\n',
-            f"{indent}    self.action_config = {UPPER_BODY_JOINT_ACTION_CLASS}()\n",
-            f'{indent}elif os.environ.get("{PINK_EEF_ACTION_ENV}", "").strip().lower() '
-            'in {"1", "true", "yes", "on"}:\n',
-            f"{indent}    self.action_config = {PINK_EEF_ACTION_CLASS}()\n",
+            f'{indent}_flip_table_body_mode = os.environ.get("{SIM_BODY_MODE_ENV}", "balanced_wbc").strip().lower()\n',
+            f'{indent}if _flip_table_body_mode == "balanced_wbc":\n',
+            f"{indent}    self.action_config = {BALANCED_WBC_ACTION_CLASS}()\n",
+            f'{indent}elif _flip_table_body_mode == "fixed_diagnostic":\n',
+            f'{indent}    if os.environ.get("{PINK_EEF_ACTION_ENV}", "").strip().lower() in {{"1", "true", "yes", "on"}}:\n',
+            f"{indent}        self.action_config = {PINK_EEF_ACTION_CLASS}()\n",
+            f"{indent}    else:\n",
+            f"{indent}        self.action_config = {UPPER_BODY_JOINT_ACTION_CLASS}()\n",
+            f'{indent}elif _flip_table_body_mode == "full_body_diagnostic":\n',
+            f"{indent}    self.action_config = {FULL_BODY_JOINT_ACTION_CLASS}()\n",
             f"{indent}else:\n",
-            f"{indent}    self.action_config = G1DecoupledWBCActionsCfg()\n",
+            f'{indent}    raise ValueError(f"unsupported FLIP_TABLE_SIM_BODY_MODE={{_flip_table_body_mode!r}}")\n',
         ]
         return True
     return False
 
 
 def _patch_gripper_controller_root_lock(lines: list[str]) -> bool:
-    """Use the simulator's native fixed-root articulation for upper-body eval.
+    """Offer a native fixed root only to the explicit diagnostic body mode.
 
     Rewriting a floating-base pose every control step creates contact impulses
-    when the feet or workbench are close to the robot.  The evaluation contract
-    already fixes the lower body, so let PhysX enforce the root constraint too.
+    when the feet or workbench are close to the robot. Production balanced_wbc
+    never enables this switch; fixed_diagnostic may use it for fault isolation.
     """
     class_scope = _class_range(lines, "UnitreeG1GripperControllerDecoupledWBCEnvCfg")
     if class_scope is None:
@@ -1488,6 +1613,7 @@ def _patch_collision_filter_config(lines: list[str]) -> bool:
 def _patch_upper_body_joint_action_text(text: str) -> str:
     lines = text.splitlines(keepends=True)
     changed = _repair_configclass_decorators(lines)
+    changed = _insert_balanced_wbc_action_import(lines) or changed
     changed = _patch_g1_contact_sensor_fields(lines) or changed
     changed = _patch_gripper_contact_sensor_thresholds(lines) or changed
     changed = _remove_unsupported_shape_contact_filters(lines) or changed

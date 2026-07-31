@@ -36,12 +36,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_replay_buffer_and_balanced_sampling(tmp_path):
-    prior = ReplayBuffer(32, observation_dim=7, action_dim=19)
-    online = ReplayBuffer(32, observation_dim=7, action_dim=19)
+    prior = ReplayBuffer(32, observation_dim=7, action_dim=16)
+    online = ReplayBuffer(32, observation_dim=7, action_dim=16)
     for buffer, offset in ((prior, 0.0), (online, 10.0)):
         buffer.add(
             torch.full((16, 7), offset),
-            torch.zeros(16, 19),
+            torch.zeros(16, 16),
             torch.zeros(16, 1),
             torch.full((16, 7), offset + 1.0),
             torch.zeros(16, 1),
@@ -54,7 +54,7 @@ def test_replay_buffer_and_balanced_sampling(tmp_path):
     assert int((batch.observation[:, 0] == 10.0).sum()) == 6
 
     prior.save(tmp_path / "replay")
-    restored = ReplayBuffer(32, observation_dim=7, action_dim=19)
+    restored = ReplayBuffer(32, observation_dim=7, action_dim=16)
     restored.restore(tmp_path / "replay")
     assert restored.size == prior.size
     assert restored.position == prior.position
@@ -62,11 +62,11 @@ def test_replay_buffer_and_balanced_sampling(tmp_path):
 
 
 def test_replay_rejects_nonfinite_values():
-    replay = ReplayBuffer(8, observation_dim=3, action_dim=19)
+    replay = ReplayBuffer(8, observation_dim=3, action_dim=16)
     with pytest.raises(ValueError, match="NaN"):
         replay.add(
             torch.tensor([[float("nan"), 0.0, 0.0]]),
-            torch.zeros(1, 19),
+            torch.zeros(1, 16),
             torch.zeros(1, 1),
             torch.zeros(1, 3),
             torch.zeros(1, 1),
@@ -83,10 +83,10 @@ def test_rlpd_update_and_checkpoint_roundtrip(tmp_path):
         target_critic_sample_size=2,
     )
     agent = RLPDAgent(config)
-    replay = ReplayBuffer(64, observation_dim=11, action_dim=19)
+    replay = ReplayBuffer(64, observation_dim=11, action_dim=16)
     replay.add(
         torch.randn(32, 11),
-        torch.tanh(torch.randn(32, 19)),
+        torch.tanh(torch.randn(32, 16)),
         torch.randn(32, 1),
         torch.randn(32, 11),
         torch.zeros(32, 1),
@@ -97,7 +97,7 @@ def test_rlpd_update_and_checkpoint_roundtrip(tmp_path):
     assert 0.02 <= metrics["residual_std_mean"] <= 0.25
     assert 0.02 <= metrics["residual_std_max"] <= 0.25
     assert any(not torch.equal(old, new) for old, new in zip(before, agent.actor.parameters()))
-    assert agent.act(torch.zeros(3, 11), deterministic=True).shape == (3, 19)
+    assert agent.act(torch.zeros(3, 11), deterministic=True).shape == (3, 16)
 
     agent.save_pretrained(tmp_path)
     restored = RLPDAgent.from_pretrained(tmp_path)
@@ -131,7 +131,7 @@ def test_rlpd_critic_warmup_preserves_actor_and_reports_prior_bc():
     prior = torch.linspace(-0.6, 0.6, config.action_dim)
     agent.initialize_actor_residual(prior)
     before = [value.detach().clone() for value in agent.actor.parameters()]
-    replay = ReplayBuffer(64, observation_dim=11, action_dim=19)
+    replay = ReplayBuffer(64, observation_dim=11, action_dim=16)
     replay.add(
         torch.randn(32, 11),
         prior.expand(32, -1),
@@ -160,10 +160,10 @@ def test_rlpd_actor_uses_frozen_reference_and_normalized_q_objective():
     )
     agent = RLPDAgent(config)
     reference_before = [value.detach().clone() for value in agent.reference_actor.parameters()]
-    replay = ReplayBuffer(64, observation_dim=11, action_dim=19)
+    replay = ReplayBuffer(64, observation_dim=11, action_dim=16)
     replay.add(
         torch.randn(32, 11),
-        torch.zeros(32, 19),
+        torch.zeros(32, 16),
         torch.randn(32, 1),
         torch.randn(32, 11),
         torch.zeros(32, 1),
@@ -227,33 +227,30 @@ def test_residual_actor_rejects_degenerate_std_interval():
 def test_stage_mask_preserves_right_first_lift_before_left_hand_join():
     mask = stochastic_action_mask_for_stage("contact")
     assert [index for index, enabled in enumerate(mask) if enabled] == [
+        7,
+        8,
+        9,
         10,
         11,
         12,
         13,
-        14,
         15,
-        16,
-        18,
     ]
     lift_mask = stochastic_action_mask_for_stage("sequential_lift")
     assert [index for index, enabled in enumerate(lift_mask) if enabled] == [
-        0,
-        1,
-        2,
+        7,
+        8,
+        9,
         10,
         11,
         12,
         13,
-        14,
         15,
-        16,
-        18,
     ]
     # The next curriculum stage must be able to move both arms and both Dex1
     # commands so the left hand can join the right-lifted table.
-    assert stochastic_action_mask_for_stage("lift") == (1.0,) * 19
-    assert stochastic_action_mask_for_stage("flip") == (1.0,) * 19
+    assert stochastic_action_mask_for_stage("lift") == (1.0,) * 16
+    assert stochastic_action_mask_for_stage("flip") == (1.0,) * 16
     with pytest.raises(ValueError, match="unknown flip-table curriculum stage"):
         stochastic_action_mask_for_stage("invalid")
 
@@ -296,12 +293,12 @@ def test_residual_actor_mask_makes_inactive_axes_deterministic():
 
 
 def test_rlpd_config_rejects_invalid_stochastic_action_masks():
-    with pytest.raises(ValueError, match="exactly 19"):
-        RLPDConfig(observation_dim=8, stochastic_action_mask=(1.0,) * 18)
+    with pytest.raises(ValueError, match="exactly 16"):
+        RLPDConfig(observation_dim=8, stochastic_action_mask=(1.0,) * 15)
     with pytest.raises(ValueError, match="must be 0 or 1"):
-        RLPDConfig(observation_dim=8, stochastic_action_mask=(0.5,) + (1.0,) * 18)
+        RLPDConfig(observation_dim=8, stochastic_action_mask=(0.5,) + (1.0,) * 15)
     with pytest.raises(ValueError, match="enable at least one"):
-        RLPDConfig(observation_dim=8, stochastic_action_mask=(0.0,) * 19)
+        RLPDConfig(observation_dim=8, stochastic_action_mask=(0.0,) * 16)
 
 
 def test_rlpd_actor_can_initialize_from_a_successful_residual_prior():
@@ -361,18 +358,18 @@ def test_rlpd_cuda_rng_restore_uses_cpu_byte_tensors(tmp_path, monkeypatch):
 
 
 def test_residual_contract_uses_radians_for_body_and_command_scale_for_hands():
-    base = torch.zeros(1, 19)
-    base[:, 17:] = torch.tensor([0.0, 4.5])
-    residual = torch.ones(1, 19)
+    base = torch.zeros(1, 16)
+    base[:, 14:] = torch.tensor([0.0, 4.5])
+    residual = torch.ones(1, 16)
     result = apply_residual_to_base(base, residual)
 
-    torch.testing.assert_close(result[0, :17], torch.tensor(BODY_RESIDUAL_SCALE))
-    assert result[0, 17].item() == pytest.approx(0.0)
-    assert result[0, 18].item() == pytest.approx(0.0)
+    torch.testing.assert_close(result[0, :14], torch.tensor(BODY_RESIDUAL_SCALE))
+    assert result[0, 14].item() == pytest.approx(0.0)
+    assert result[0, 15].item() == pytest.approx(0.0)
 
     reverse = apply_residual_to_base(base, -residual)
-    assert reverse[0, 17].item() == pytest.approx(4.5)
-    assert reverse[0, 18].item() == pytest.approx(4.5)
+    assert reverse[0, 14].item() == pytest.approx(4.5)
+    assert reverse[0, 15].item() == pytest.approx(4.5)
 
 
 def test_policy_clock_maps_30_hz_to_50_hz_without_drift():
@@ -398,19 +395,19 @@ def test_policy_clock_rejects_unrepresentable_faster_policy():
 def test_target_safety_filter_matches_deploy_time_slew_limits():
     safety = UpperBodyTargetSafetyFilter(policy_hz=30.0)
     current = torch.zeros(1, 19)
-    target = torch.full((1, 19), 10.0)
+    target = torch.full((1, 16), 10.0)
 
     safe, clipped = safety.filter(target, current)
 
     expected_first_step = (75.0 / 30.0) / 30.0
     torch.testing.assert_close(
-        safe[0, :17], torch.full((17,), expected_first_step), rtol=1.0e-5, atol=1.0e-6
+        safe[0, :14], torch.full((14,), expected_first_step), rtol=1.0e-5, atol=1.0e-6
     )
     expected_first_hand_step = (400.0 / 30.0) / 30.0
     torch.testing.assert_close(
-        safe[0, 17:], torch.full((2,), expected_first_hand_step)
+        safe[0, 14:], torch.full((2,), expected_first_hand_step)
     )
-    assert clipped == 19
+    assert clipped == 16
 
     safety.reset()
     assert safety.previous_target is None
@@ -424,17 +421,19 @@ def test_target_safety_filter_rejects_nonfinite_measured_state():
     state = torch.zeros(1, 19)
     state[0, 0] = float("nan")
     with pytest.raises(ValueError, match="current_state"):
-        safety.filter(torch.zeros_like(state), state)
+        safety.filter(torch.zeros(1, 16), state)
 
 
 def test_target_safety_filter_preserves_contact_loaded_command_target():
     safety = UpperBodyTargetSafetyFilter(policy_hz=30.0)
-    commanded = torch.zeros(1, 19)
-    commanded[:, 10:17] = torch.tensor(
+    commanded = torch.zeros(1, 16)
+    commanded[:, 7:14] = torch.tensor(
         [-0.9, -0.6, 0.5, 1.3, -1.0, -0.4, 0.25]
     )
-    commanded[:, 18] = 0.0
-    measured = commanded.clone()
+    commanded[:, 15] = 0.0
+    measured = torch.zeros(1, 19)
+    measured[:, 3:17] = commanded[:, :14]
+    measured[:, 17:19] = commanded[:, 14:16]
     # A position-controlled gripper under load cannot reach its closed target.
     measured[:, 18] = 0.15
     safety.reset(commanded)
@@ -450,17 +449,18 @@ def test_absolute_target_delay_starts_from_measured_state():
     state = torch.full((1, 19), 0.25)
     delay.reset(state)
     delay.delay_steps.fill_(1)
-    first_target = torch.full((1, 19), 0.75)
-    second_target = torch.full((1, 19), 1.25)
+    initial_action = torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
+    first_target = torch.full((1, 16), 0.75)
+    second_target = torch.full((1, 16), 1.25)
 
-    torch.testing.assert_close(delay.apply(first_target), state)
+    torch.testing.assert_close(delay.apply(first_target), initial_action)
     torch.testing.assert_close(delay.apply(second_target), first_target)
 
 
 def test_absolute_target_delay_requires_reset():
     delay = AbsoluteTargetDelayBuffer(num_envs=1, max_delay_steps=0, device="cpu")
     with pytest.raises(RuntimeError, match="reset"):
-        delay.apply(torch.zeros(1, 19))
+        delay.apply(torch.zeros(1, 16))
 
 
 def test_flow_target_scheduler_uses_the_checkpoint_action_prefix():
@@ -472,7 +472,7 @@ def test_flow_target_scheduler_uses_the_checkpoint_action_prefix():
 
         def sample_actions(self, images, state):
             self.calls += 1
-            chunk = torch.arange(3 * 19, dtype=torch.float32).reshape(1, 3, 19)
+            chunk = torch.arange(3 * 16, dtype=torch.float32).reshape(1, 3, 16)
             return chunk + 100.0 * (self.calls - 1)
 
     flow = FakeFlow()
@@ -480,16 +480,16 @@ def test_flow_target_scheduler_uses_the_checkpoint_action_prefix():
     images = torch.zeros(1, 3, 3, 4, 4)
     state = torch.zeros(1, 19)
 
-    torch.testing.assert_close(scheduler.current(images, state), torch.arange(19.0).reshape(1, 19))
+    torch.testing.assert_close(scheduler.current(images, state), torch.arange(16.0).reshape(1, 16))
     scheduler.advance()
     torch.testing.assert_close(
         scheduler.current(images, state),
-        torch.arange(19.0, 38.0).reshape(1, 19),
+        torch.arange(16.0, 32.0).reshape(1, 16),
     )
     scheduler.advance()
     torch.testing.assert_close(
         scheduler.current(images, state),
-        torch.arange(100.0, 119.0).reshape(1, 19),
+        torch.arange(100.0, 116.0).reshape(1, 16),
     )
     assert flow.calls == 2
 
@@ -503,39 +503,41 @@ def test_flow_target_scheduler_reanchors_with_deployable_joint_state():
         config = SimpleNamespace(n_action_steps=2)
 
         def sample_actions(self, images, state):
-            return torch.stack((state + 0.4, state + 0.5), dim=1)
+            action_state = torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
+            return torch.stack((action_state + 0.4, action_state + 0.5), dim=1)
 
     scheduler = FlowTargetScheduler(FakeFlow())
     images = torch.zeros(1, 3, 3, 4, 4)
     state = torch.arange(19, dtype=torch.float32).reshape(1, 19)
 
-    torch.testing.assert_close(scheduler.anchor_to_state(images, state), state)
+    action_state = torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
+    torch.testing.assert_close(scheduler.anchor_to_state(images, state), action_state)
     scheduler.advance()
-    torch.testing.assert_close(scheduler.current(images, state), state + 0.1)
+    torch.testing.assert_close(scheduler.current(images, state), action_state + 0.1)
 
     scheduler.reset()
     assert scheduler.anchor_offset is None
 
     hold_scheduler = FlowTargetScheduler(FakeFlow(), motion_gain=0.0)
-    torch.testing.assert_close(hold_scheduler.anchor_to_state(images, state), state)
+    torch.testing.assert_close(hold_scheduler.anchor_to_state(images, state), action_state)
     hold_scheduler.advance()
-    torch.testing.assert_close(hold_scheduler.current(images, state), state)
+    torch.testing.assert_close(hold_scheduler.current(images, state), action_state)
 
     body_only = FlowTargetScheduler(
         FakeFlow(),
-        motion_mask=tuple([1.0] * 17 + [0.0, 0.0]),
+        motion_mask=tuple([1.0] * 14 + [0.0, 0.0]),
     )
-    torch.testing.assert_close(body_only.anchor_to_state(images, state), state)
+    torch.testing.assert_close(body_only.anchor_to_state(images, state), action_state)
     body_only.advance()
-    expected = state + 0.1
-    expected[:, 17:] = state[:, 17:]
+    expected = action_state + 0.1
+    expected[:, 14:] = action_state[:, 14:]
     torch.testing.assert_close(body_only.current(images, state), expected)
 
 
 def test_flow_target_scheduler_rejects_invalid_motion_mask():
     flow = SimpleNamespace(config=SimpleNamespace(n_action_steps=1))
-    with pytest.raises(ValueError, match="19 binary"):
-        FlowTargetScheduler(flow, motion_mask=(1.0,) * 18)
+    with pytest.raises(ValueError, match="16 binary"):
+        FlowTargetScheduler(flow, motion_mask=(1.0,) * 15)
 
 
 def test_flow_control_handoff_readiness_is_explicit():
@@ -581,8 +583,9 @@ def test_reset_settle_steps_hold_state_and_discard_sensor_ticks():
     assert settled_steps == [0, 1]
     assert len(gym_env.actions) == 2
     for action, target in zip(gym_env.actions, gym_env.targets, strict=True):
-        torch.testing.assert_close(action, torch.zeros_like(state))
-        torch.testing.assert_close(target, state)
+        torch.testing.assert_close(action, torch.zeros(2, 16))
+        expected_target = torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
+        torch.testing.assert_close(target, expected_target)
 
     with pytest.raises(ValueError, match="cannot be negative"):
         settle_after_reset(gym_env, env, steps=-1, state_reader=lambda _env: state)

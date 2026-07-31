@@ -42,7 +42,7 @@ class FourierTimeEmbedding(nn.Module):
 
 
 class FlowMatchingPolicy(nn.Module):
-    """Generate a smooth 19-D target chunk from three RGB views and joint state."""
+    """Generate a smooth 16-D arm/hand target chunk from RGB and 19-D state."""
 
     def __init__(
         self,
@@ -305,7 +305,7 @@ class FlowMatchingPolicy(nn.Module):
         return {
             "config": self.config.to_dict(),
             "policy_inputs": [*POLICY_CAMERAS, "observation.state"],
-            "policy_output": "19D upper-body absolute joint target chunk",
+            "policy_output": "16D arm/hand absolute joint target chunk (balance controller owns waist)",
             "privileged_inputs": [],
             "state_stats": {
                 "mean": self.state_mean.tolist(),

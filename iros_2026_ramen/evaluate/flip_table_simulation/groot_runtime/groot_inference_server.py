@@ -7,8 +7,10 @@ import importlib.metadata
 import io
 import json
 import os
+import random
 import socket
 import struct
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -16,11 +18,28 @@ from typing import Any
 
 import numpy as np
 
+try:
+    from policy.team_ramen_groot.n17_contract import (
+        validate_finalized_furniture_checkpoint,
+    )
+except ImportError:
+    repo_root = Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from model.subtask_policy_training.gr00t.n17_contract import (
+        validate_finalized_furniture_checkpoint,
+    )
+
 
 LEROBOT_VERSION = "0.6.0"
 STATE_DIM = 49
 ACTION_DIM = 53
+PACKED_DIM = 132
+ACTION_HORIZON = 40
+VALID_ACTION_DIM = 46
+VIDEO_HORIZON = 2
 EMBODIMENT_TAG = "real_g1_relative_eef_relative_joints"
+PINNED_BASE_MODEL_REVISION = "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
 CAMERA_KEYS = (
     "observation.images.head_left",
     "observation.images.left_wrist",
@@ -76,8 +95,12 @@ def validate_checkpoint(checkpoint: Path) -> dict[str, Any]:
         )
 
     config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
-    if config.get("type") != "groot":
-        raise ValueError(f"checkpoint policy type must be 'groot', got {config.get('type')!r}")
+    policy_type = config.get("type")
+    if policy_type not in {"groot", "furniture_groot"}:
+        raise ValueError(
+            "checkpoint policy type must be 'groot' or 'furniture_groot', "
+            f"got {policy_type!r}"
+        )
     if config.get("model_version", "n1.7") != "n1.7":
         raise ValueError(f"checkpoint model_version must be 'n1.7', got {config.get('model_version')!r}")
     if config.get("embodiment_tag") != EMBODIMENT_TAG:
@@ -110,8 +133,24 @@ def validate_checkpoint(checkpoint: Path) -> dict[str, Any]:
             "base_height, and navigate groups"
         )
     chunk_size = int(config.get("chunk_size", 0))
-    if chunk_size < 1:
-        raise ValueError(f"checkpoint chunk_size must be positive, got {chunk_size}")
+    if chunk_size != ACTION_HORIZON:
+        raise ValueError(
+            f"checkpoint must retain the N1.7 H{ACTION_HORIZON}, got H{chunk_size}"
+        )
+    if int(config.get("max_state_dim", 0)) != PACKED_DIM:
+        raise ValueError(f"checkpoint max_state_dim must be {PACKED_DIM}")
+    if int(config.get("max_action_dim", 0)) != PACKED_DIM:
+        raise ValueError(f"checkpoint max_action_dim must be {PACKED_DIM}")
+    if policy_type == "furniture_groot":
+        if int(config.get("valid_action_dim", 0)) != VALID_ACTION_DIM:
+            raise ValueError(
+                f"Furniture-GR00T valid_action_dim must be {VALID_ACTION_DIM}"
+            )
+        if config.get("base_model_revision") != PINNED_BASE_MODEL_REVISION:
+            raise ValueError(
+                "Furniture-GR00T base_model_revision must be the pinned N1.7 revision"
+            )
+        validate_finalized_furniture_checkpoint(checkpoint)
     return config
 
 
@@ -175,6 +214,15 @@ def validate_processor_contract(
             f"processor action horizons must cover {required_horizon} steps; "
             f"got action={pack.action_horizon}, valid={pack.valid_action_horizon}"
         )
+    if pack.action_horizon != ACTION_HORIZON or pack.valid_action_horizon != ACTION_HORIZON:
+        raise ValueError("processor must retain the official H40 action contract")
+    if pack.video_horizon != VIDEO_HORIZON:
+        raise ValueError(
+            f"processor video_horizon must be {VIDEO_HORIZON} for [-20,0], "
+            f"got {pack.video_horizon}"
+        )
+    if pack.max_state_dim != PACKED_DIM or pack.max_action_dim != PACKED_DIM:
+        raise ValueError("processor packed state/action dimensions must both be 132")
 
     modality = decode.modality_config or {}
     state_keys = tuple((modality.get("state") or {}).get("modality_keys") or ())
@@ -261,11 +309,17 @@ def _text(array: np.ndarray, name: str) -> str:
 
 
 class GrootRuntime:
-    def __init__(self, checkpoint: Path, device: str, n_action_steps: int) -> None:
+    def __init__(
+        self,
+        checkpoint: Path,
+        device: str,
+        n_action_steps: int,
+        seed: int,
+    ) -> None:
         version = importlib.metadata.version("lerobot")
         if version != LEROBOT_VERSION:
             raise RuntimeError(f"expected lerobot=={LEROBOT_VERSION}, found {version}")
-        validate_checkpoint(checkpoint)
+        checkpoint_config = validate_checkpoint(checkpoint)
 
         import torch
         from lerobot.policies.groot.modeling_groot import GrootPolicy
@@ -273,11 +327,27 @@ class GrootRuntime:
             make_groot_pre_post_processors_from_pretrained,
         )
 
+        policy_class: type[GrootPolicy]
+        if checkpoint_config["type"] == "furniture_groot":
+            from lerobot_policy_furniture_groot.modeling_furniture_groot import (
+                FurnitureGrootPolicy,
+            )
+            from lerobot_policy_furniture_groot.processor_furniture_groot import (
+                FurnitureGrootTemporalProgressStep,
+            )
+
+            del FurnitureGrootTemporalProgressStep
+            policy_class = FurnitureGrootPolicy
+        else:
+            policy_class = GrootPolicy
+
         self.torch = torch
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested but unavailable: {device}")
-        self.model = GrootPolicy.from_pretrained(
+        self._validate_seed(seed)
+        self._seed_everything(seed)
+        self.model = policy_class.from_pretrained(
             str(checkpoint),
             local_files_only=True,
             strict=True,
@@ -286,7 +356,7 @@ class GrootRuntime:
             raise ValueError(
                 f"n_action_steps must be in [1, {self.model.config.chunk_size}], got {n_action_steps}"
             )
-        self.model.config.n_action_steps = n_action_steps
+        self.model.config.n_action_steps = ACTION_HORIZON
         self.model.config.device = str(self.device)
         if self.model.config.action_decode_transform is not None:
             raise ValueError(
@@ -307,11 +377,28 @@ class GrootRuntime:
         validate_processor_contract(
             self.preprocessor,
             self.postprocessor,
-            required_horizon=n_action_steps,
+            required_horizon=ACTION_HORIZON,
         )
-        self.n_action_steps = n_action_steps
+        self.execution_steps = n_action_steps
+        self.current_seed = seed
 
-    def reset(self) -> None:
+    @staticmethod
+    def _validate_seed(seed: int) -> None:
+        if seed < 0 or seed > np.iinfo(np.uint32).max:
+            raise ValueError(f"inference seed must fit uint32, got {seed}")
+
+    def _seed_everything(self, seed: int) -> None:
+        self._validate_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        self.torch.manual_seed(seed)
+        if self.torch.cuda.is_available():
+            self.torch.cuda.manual_seed_all(seed)
+
+    def reset(self, seed: int | None = None) -> None:
+        if seed is not None:
+            self._seed_everything(seed)
+            self.current_seed = seed
         self.model.reset()
 
     def predict(self, request: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, float]:
@@ -327,14 +414,18 @@ class GrootRuntime:
             "observation.state": self.torch.from_numpy(state),
             "task": _text(request["task"], "task"),
         }
+        if raw["task"] != "flip table":
+            raise ValueError("Furniture-GR00T task instruction must be exactly 'flip table'")
         for target_key, request_key in zip(CAMERA_KEYS, ("head_left", "left_wrist", "right_wrist")):
             image = np.asarray(request[request_key])
-            if image.shape != (480, 640, 3) or image.dtype != np.uint8:
+            if image.shape != (VIDEO_HORIZON, 480, 640, 3) or image.dtype != np.uint8:
                 raise ValueError(
-                    f"{request_key} must be an unmodified uint8 480x640x3 image, "
+                    f"{request_key} must be unmodified uint8 [2,480,640,3] images, "
                     f"got shape={image.shape}, dtype={image.dtype}"
                 )
-            raw[target_key] = self.torch.from_numpy(np.ascontiguousarray(image))
+            raw[target_key] = self.torch.from_numpy(
+                np.ascontiguousarray(image.transpose(0, 3, 1, 2))
+            )
 
         started = time.perf_counter()
         processed = self.preprocessor(raw)
@@ -345,9 +436,9 @@ class GrootRuntime:
         normalized = normalized_chunk.detach().cpu().float().numpy()
         if decoded.ndim != 3 or decoded.shape[0] != 1 or decoded.shape[-1] != ACTION_DIM:
             raise RuntimeError(f"decoded action chunk must have shape [1,T,{ACTION_DIM}], got {decoded.shape}")
-        decoded = decoded[0, : self.n_action_steps]
-        normalized = normalized[0, : self.n_action_steps, :ACTION_DIM]
-        if decoded.shape[0] < 1 or not np.isfinite(decoded).all():
+        decoded = decoded[0, :ACTION_HORIZON]
+        normalized = normalized[0, :ACTION_HORIZON, :ACTION_DIM]
+        if decoded.shape != (ACTION_HORIZON, ACTION_DIM) or not np.isfinite(decoded).all():
             raise RuntimeError("decoded action chunk is empty or non-finite")
         if normalized.shape != decoded.shape or not np.isfinite(normalized).all():
             raise RuntimeError(
@@ -378,8 +469,19 @@ def serve(runtime: GrootRuntime, socket_path: Path) -> None:
                             if kind == "ping":
                                 send_archive(connection, ok=np.asarray([1], dtype=np.uint8))
                             elif kind == "reset":
-                                runtime.reset()
-                                send_archive(connection, ok=np.asarray([1], dtype=np.uint8))
+                                seed_array = request.get("seed")
+                                seed = None
+                                if seed_array is not None:
+                                    seed_array = np.asarray(seed_array)
+                                    if seed_array.size != 1:
+                                        raise ValueError("reset seed must contain one integer")
+                                    seed = int(seed_array.reshape(-1)[0])
+                                runtime.reset(seed)
+                                send_archive(
+                                    connection,
+                                    ok=np.asarray([1], dtype=np.uint8),
+                                    seed=np.asarray([runtime.current_seed], dtype=np.uint64),
+                                )
                             elif kind == "predict":
                                 action, normalized_action, elapsed = runtime.predict(request)
                                 send_archive(
@@ -412,13 +514,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--n-action-steps", type=int, default=16)
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=10,
+        help="Physical execution steps between H40 replans",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="Base uint32 seed; each simulator episode sends its explicit episode seed",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    runtime = GrootRuntime(args.checkpoint.resolve(), args.device, args.n_action_steps)
+    runtime = GrootRuntime(
+        args.checkpoint.resolve(),
+        args.device,
+        args.n_action_steps,
+        args.seed,
+    )
     serve(runtime, args.socket)
 
 

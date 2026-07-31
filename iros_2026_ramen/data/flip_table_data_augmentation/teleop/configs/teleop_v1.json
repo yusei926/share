@@ -2,16 +2,17 @@
   "schema_version": "team_ramen_flip_table_teleop/v1",
   "runtime": {
     "xr_repo": "unitreerobotics/xr_teleoperate",
-    "xr_revision": "4c0afdb81f2c19709f053c9c9890a98aca687b44",
-    "televuer_revision": "948f65f6852410610483345e69715a0c673a99eb",
+    "xr_revision": "7dc9aa1a6edbf4a9f4f887d8ab6fc449ea5135f6",
+    "televuer_revision": "766de45e74373ae0ea66321d942ce538385655a5",
     "robofinals_image": "paperc/robofinals:RoboFinals-IKEA-V1",
     "robofinals_digest": "sha256:6f62a73c48a0b1f97e15e9cc76a9fee8a052c0b3b9dcd324d25c1ed01020e9f1"
   },
   "rates": {
-    "physics_hz": 100,
+    "physics_hz": 200,
     "servo_hz": 50,
     "command_hz": 30,
     "camera_hz": 30,
+    "camera_poll_hz": 120,
     "record_hz": 30
   },
   "command_contract": {

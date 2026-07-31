@@ -24,13 +24,27 @@ Policy data remains limited to real G1 + Dex1-1 signals:
 - `cam_3`: right D405 RGB, 640x480
 - the existing six numeric features, with upper-body output only
 
-The AVP operator sees only the unmodified head-left/head-right stereo pair.
-The default official TeleVuer `ego` mode retains Apple Vision Pro pass-through
-around a stereoscopic robot-view window, so the operator can see the keyboard.
-The D405 wrist images are recorded for policy training but are not displayed
-in VR. Head-right, global images, object pose, segmentation, contact and
-simulator state are never policy inputs. Simulator GT is retained only in
-diagnostic sidecars for offline phase annotation and success validation.
+The simulator AVP view remains the unmodified head-left/head-right stereo pair
+for low latency. In the real backend only, the same central stereo pair is
+surrounded in both eyes by a left D405 panel with the measured left seven arm
+angles and a right D405 panel with the measured right seven arm angles. The
+wrist panels are deliberately duplicated monocular HUDs, not synthetic stereo;
+the head images remain the only stereoscopic camera content. The default
+official TeleVuer `ego` mode retains Apple Vision Pro pass-through around this
+compact operator window. In a real session, `HANDS READY` must be visible in
+that HUD before `r` can arm tracking; an early `r` is deliberately ignored so
+headset acquisition cannot arm the robot later by surprise. This display-only
+composition never changes the policy images or recorded camera payloads.
+The real launcher also opens a non-blocking Desktop monitor by default. Its
+2x2 layout shows head-left, head-right, left wrist, and right wrist at the same
+time, with the fourteen measured arm angles over the corresponding wrist
+tiles. It is display-only and drops preview updates rather than applying
+backpressure to AVP IK or control. Set
+`FLIP_TABLE_TELEOP_DESKTOP_PREVIEW=false` only for a headless run.
+Head-right, global images, object pose,
+segmentation, contact and simulator state are never policy inputs. Simulator
+GT is retained only in diagnostic sidecars for offline phase annotation and
+success validation.
 
 ## Production path
 
@@ -64,7 +78,11 @@ one trajectory can never cross train, validation, and test splits.
 
 ```text
 flip_table_data_augmentation/
-  teleop/        AVP input, sim/real backends, safety, and raw recording
+  teleop/
+    shared/      backend-neutral state/watchdog vocabulary
+    real/        physical G1 runner and official-motion safety
+    sim/         Isaac runner, socket backend, and simulation safety
+    contracts.py shared 14D arm + 2D Dex1 target/observation schema
   mimic/         Teleop conversion, PINK generation, and recording
   replicator/    Accepted-trajectory replay and appearance randomization
   export/        LeRobot v3 assembly, validation, and HF publication
@@ -74,8 +92,11 @@ flip_table_data_augmentation/
   outputs/       Generated artifacts; never source-controlled
 ```
 
-`teleop/configs/teleop_v1.json` owns the XR, V1, safety, clock, operator,
-policy, DR, and collection contract. `configs/pipeline_v1.json` owns Mimic,
+`teleop/configs/teleop_v1.json` owns the shared XR, V1, joint-envelope, clock,
+operator, policy, DR, and collection contract. Real and Sim do not share an
+actuator or safety-filter implementation: `teleop/real/` follows Unitree's
+250 Hz arm_sdk and 200 Hz Dex1 motion contracts, while `teleop/sim/` applies Isaac's 50 Hz
+action limits. `configs/pipeline_v1.json` owns Mimic,
 rendering, export, and the HF release contract. Secrets such as `HF_TOKEN` are
 environment variables only.
 
@@ -98,7 +119,7 @@ Tailscale/SSH, and runs the simulator and AVP server on that machine. Run the
 two one-time setup commands above on each machine used as the AVP host. The
 launcher accepts either the local `tv` environment or the workstation's
 `xr-teleop` environment. `FLIP_TABLE_SIM_EXECUTION=local|remote` is available
-as an explicit override; the normal command remains `run_teleop.sh sim`.
+as an explicit override; the normal command remains `run_sim_teleop.sh`.
 
 The simulator remains running after a simulated AVP session by default. The
 next invocation with the same teleop config, DR profile, and seed reconnects
@@ -111,7 +132,7 @@ FLIP_TABLE_TELEOP_DR_PROFILE=mild FLIP_TABLE_TELEOP_SEED=101 \
   data/flip_table_data_augmentation/stop_teleop_sim.sh
 ```
 
-Set `FLIP_TABLE_TELEOP_RESTART_SIMULATOR=true` before `run_teleop.sh sim` to
+Set `FLIP_TABLE_TELEOP_RESTART_SIMULATOR=true` before `run_sim_teleop.sh` to
 replace a running instance after code or environment changes. Set
 `FLIP_TABLE_TELEOP_KEEP_SIMULATOR_RUNNING=false` for one-shot behavior.
 
@@ -122,31 +143,36 @@ the tunnel and true head-stereo stream without exposing the real backend:
 FLIP_TABLE_TELEOP_TRANSPORT_PROBE=true \
   FLIP_TABLE_TELEOP_PROBE_FRAMES=180 \
   FLIP_TABLE_TELEOP_DR_PROFILE=mild FLIP_TABLE_TELEOP_SEED=100 \
-  data/flip_table_data_augmentation/run_teleop.sh sim
+  data/flip_table_data_augmentation/run_sim_teleop.sh
 ```
 
 The following small-motion probe exercises the same 30 Hz socket, safety
-filter, 19-D simulator action, and both Dex1 targets before a headset session.
+filter, 16-D arm/Dex1 action, and both Dex1 targets before a headset session.
 It moves only the two wrist-roll joints by 0.12 rad and saves measured spans
 under `outputs/flip_table_teleop/probes/`:
 
 ```bash
 FLIP_TABLE_TELEOP_CONTROL_PROBE=true \
   FLIP_TABLE_TELEOP_DR_PROFILE=mild FLIP_TABLE_TELEOP_SEED=101 \
-  data/flip_table_data_augmentation/run_teleop.sh sim
+  data/flip_table_data_augmentation/run_sim_teleop.sh
 ```
 
 Long transport probes fail below 28 Hz. The control probe additionally gates
-live stereo and sustained four-camera recording source/transport at 28 Hz,
-verifies all 15 leg-and-waist joints remain fixed, bounds unintended arm motion
-and tracking error, and exercises the full continuous opening range of both
-Dex1 hands. Its first two seconds are an IDLE warm-up, matching the interval
-before an operator presses `r`.
+live stereo before and after the collection toggle at 28 Hz,
+verifies the organizer WBC remains upright without fixing the root, legs, or
+waist, bounds unintended arm motion and tracking error, and exercises the full
+continuous opening range of both Dex1 hands. Its first two seconds are an IDLE
+warm-up, matching the interval before an operator presses `r`.
 
-The launcher isolates TeleVuer and the official G1 IK from the backend
+The launchers isolate TeleVuer and the official G1 IK from each backend
 transport. Only head stereo, measured arm/hand state, and real-compatible
 14-D arm plus two Dex1 targets cross that process boundary. Commands run at
-30 Hz, the sim joint servo at 50 Hz, and interactive sim physics at 100 Hz.
+30 Hz, the WBC action loop at 50 Hz, and interactive sim physics at 200 Hz.
+The real G1 `rt/arm_sdk` publisher is a separate official-protocol loop at
+250 Hz; the simulator rate must not be reused as its DDS publish rate.
+The real runner never imports the simulator backend/filter, and the simulator
+runner never imports Unitree DDS or the real backend. The old
+`run_teleop.sh real|sim` form remains only as a compatibility dispatcher.
 
 The assembled white table retains the original visual mesh and all exposed
 grasp/support surfaces. Its collision representation removes only internal
@@ -165,7 +191,7 @@ only while recording.
 
 ```bash
 FLIP_TABLE_TELEOP_DR_PROFILE=mild FLIP_TABLE_TELEOP_SEED=101 \
-  data/flip_table_data_augmentation/run_teleop.sh sim
+  data/flip_table_data_augmentation/run_sim_teleop.sh
 ```
 
 Set `FLIP_TABLE_TELEOP_XR_DISPLAY_MODE=immersive` only when a full-field robot
@@ -173,17 +199,42 @@ view is required. The default `ego` mode is the collection mode; TeleVuer's
 `pass-through`-only mode is intentionally excluded because it hides both robot
 camera images.
 
-Controls are `r` to clutch/re-anchor tracking, `s` to start recording and then
-save it, `d` to discard/reset, and `q` to release safely. Hold both hands still
-after pressing `r`; tracking starts only after the stable bilateral window is
-anchored to the measured robot pose. Every re-anchor clears the official IK
-warm start and moving-filter history.
+Controls are `r` to track/pause/resume, `s` to start recording and then save,
+and `d` to discard/reset. Both `q` (the left pedal) and real-backend `Ctrl+C`
+are accepted during either tracking or HOLD: they stop tracking, send an
+explicit IDLE/QUIT transition, blend arm ownership back to the regular
+controller over the pinned upstream XR controller's approximately two-second
+release interval, and exit only after weight=0 is published. In simulation,
+`q` safely ends only the current AVP job.
+While tracking, one `r` press pauses and holds the current arm/Dex1 target;
+it does not release arm authority or follow subsequently moving hands. Press
+`r` again to request a fresh anchor, then hold both hands still. Tracking
+resumes only after the stable bilateral window has been accepted. Every
+re-anchor clears the official IK warm start and moving-filter history. After
+the first no-motion target, TeleVuer's absolute left/right wrist poses are
+passed directly to the pinned official G1_29 IK; no extra relative-offset or
+deadband coordinate mapping is applied.
+The real arm path forwards both official IK outputs (`q` and RNEA
+feedforward torque) to `rt/arm_sdk`. It retains the official IK moving average
+and official measured-relative global 20→30 rad/s arm scaling, but does not
+stack the simulator's per-joint velocity/acceleration smoother on top. IK is
+returned before JPEG decode, HUD composition, and AVP/Desktop rendering.
 If either AVP heartbeat becomes genuinely stale, the watchdog holds the last
-safe pose, stops adding recording frames, and disarms tracking. Press `r` once
-after removing the headset or while putting it back on; the request remains
-queued until bilateral hand input is live, then establishes a unique fresh
-anchor before control resumes. Stale control never resumes without this
-explicit action.
+safe pose, stops adding recording frames, and pauses tracking. When hands are
+visible again and the HUD says `HANDS READY`, press `r` once to request a fresh
+anchor. An early `r` is ignored rather than queued. A recovered hand stream
+never resumes motion without this explicit action.
+Saving an episode does not disarm tracking or release `rt/arm_sdk`; it only
+atomically finalizes the files. A transient camera outage pauses on the last
+applied arm/Dex1 target, discards an in-progress recording, and requires a new
+`r` after all fresh streams recover. The Orin launcher publishes every acquired
+frame once (never duplicate-padding a nominal FPS) and recovers only the failed
+D405 pipeline instead of terminating the head and other wrist streams.
+The non-actuating real preflight measures three seconds of unique frames and
+refuses any camera below 28 Hz. Save-time validation also rejects a real
+episode when its sample rate is below 28 Hz or any camera's consecutive JPEG
+duplicate fraction exceeds 5%; rejected data is retained only under
+`raw/rejected/`.
 Each simulator launch saves the desktop-side timing and hand-tracking output
 to `outputs/flip_table_teleop/runtime/<run>/operator.log`. It also writes
 `operator_session_report.json`, which independently gates the 28 Hz camera,
@@ -215,10 +266,19 @@ python data/flip_table_data_augmentation/scripts/audit_teleop_collection.py \
   --output outputs/flip_table_teleop/collection_audit.json
 ```
 
-`run_teleop.sh real` uses official `rt/arm_sdk` and Dex1 DDS after
+`run_real_teleop.sh` uses official `rt/arm_sdk` and Dex1 DDS after
 non-actuating DDS, image, and AVP preflights. `G1_DDS_INTERFACE` and
-`G1_IMAGE_SERVER_IP` are required explicitly. It publishes nothing until the
-operator presses `r`; the lower body is never commanded.
+`G1_IMAGE_SERVER_IP` are required explicitly; `AVP_DESKTOP_IP` is also required
+when more than one Desktop IPv4 interface is active. The read-only preflight
+requires high-level FSM 501/mode 0 and a repository-wide G1 controller lock.
+It publishes nothing until the
+operator presses `r`. Operator/policy commands contain zero lower-body
+dimensions. The required `rt/arm_sdk` packet mirrors the official 35-slot
+G1_29 whole-body snapshot while overwriting only arm indices 15..28; Regular
+mode retains balance, waist/leg, and locomotion ownership. Normal lower-body
+motion is recorded diagnostically rather than treated as an arm fault.
+Camera timestamps are per-stream host receive times marked approximate because
+the pinned TeleImager protocol does not expose hardware capture timestamps.
 
 ## Mimic and release gates
 

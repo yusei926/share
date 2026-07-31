@@ -138,6 +138,17 @@ def _sim_head_image_path(
     return frame_dir / f"env_{environment_index:03d}" / "head_left_rgb.png"
 
 
+def _robot_mask_path(root: Path | None, frame: int) -> Path | None:
+    """Resolve an optional mask exported for the exact compared frame."""
+
+    if root is None:
+        return None
+    path = root / f"frame_{frame:04d}" / "head_left_robot_mask.png"
+    if not path.is_file():
+        raise FileNotFoundError(f"robot exclusion mask is missing for frame {frame}: {path}")
+    return path
+
+
 def compare(
     real_root: Path,
     sim_root: Path,
@@ -147,7 +158,11 @@ def compare(
     environment_index: int | None = None,
     source_episode_index: int | None = None,
     frame_map_source: str = "explicit",
+    real_robot_mask_root: Path | None = None,
+    simulated_robot_mask_root: Path | None = None,
 ) -> dict[str, Any]:
+    if (real_robot_mask_root is None) != (simulated_robot_mask_root is None):
+        raise ValueError("real and simulated robot mask roots must be supplied together")
     frames = []
     for real_frame, sim_frame in mapping:
         real = _estimate(real_root / f"frame_{real_frame:04d}" / "head_left.png", real=True)
@@ -158,7 +173,14 @@ def compare(
             sim_recorded_geometry=sim_recorded_geometry,
         )
         real_path = real_root / f"frame_{real_frame:04d}" / "head_left.png"
-        silhouette = compare_images(real_path, simulated_path)
+        real_robot_mask = _robot_mask_path(real_robot_mask_root, real_frame)
+        simulated_robot_mask = _robot_mask_path(simulated_robot_mask_root, sim_frame)
+        silhouette = compare_images(
+            real_path,
+            simulated_path,
+            real_robot_mask=real_robot_mask,
+            simulated_robot_mask=simulated_robot_mask,
+        )
         corner_rmse = _corner_rmse(
             np.asarray(real["corners_px"], dtype=np.float64),
             np.asarray(simulated["corners_px"], dtype=np.float64),
@@ -177,6 +199,10 @@ def compare(
                 "sim_frame": sim_frame,
                 "real": real,
                 "sim": simulated,
+                "real_robot_mask": None if real_robot_mask is None else str(real_robot_mask),
+                "simulated_robot_mask": (
+                    None if simulated_robot_mask is None else str(simulated_robot_mask)
+                ),
                 "corner_rmse_px": corner_rmse,
                 "center_error_px": center_error,
                 "silhouette_alignment": silhouette,
@@ -214,6 +240,13 @@ def compare(
         "frame_map_source": frame_map_source,
         "sim_recorded_geometry": sim_recorded_geometry,
         "environment_index": environment_index,
+        "robot_self_occlusion_excluded": real_robot_mask_root is not None,
+        "real_robot_mask_root": (
+            None if real_robot_mask_root is None else str(real_robot_mask_root)
+        ),
+        "simulated_robot_mask_root": (
+            None if simulated_robot_mask_root is None else str(simulated_robot_mask_root)
+        ),
         "frames": frames,
         "summary": {
             "frames": len(frames),
@@ -267,6 +300,16 @@ def main() -> None:
         type=int,
         help="read one batched simulator camera export (for example env_000)",
     )
+    parser.add_argument(
+        "--real-robot-mask-root",
+        type=Path,
+        help="root written by export_head_robot_masks.py source",
+    )
+    parser.add_argument(
+        "--simulated-robot-mask-root",
+        type=Path,
+        help="root written by export_head_robot_masks.py simulation",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.replay_actions is not None:
@@ -283,6 +326,16 @@ def main() -> None:
         environment_index=args.environment_index,
         source_episode_index=args.source_episode_index,
         frame_map_source=frame_map_source,
+        real_robot_mask_root=(
+            None
+            if args.real_robot_mask_root is None
+            else args.real_robot_mask_root.expanduser().resolve()
+        ),
+        simulated_robot_mask_root=(
+            None
+            if args.simulated_robot_mask_root is None
+            else args.simulated_robot_mask_root.expanduser().resolve()
+        ),
     )
     atomic_write_json(args.output.expanduser().resolve(), report)
     print(json.dumps({"decision": report["decision"], "summary": report["summary"]}, indent=2))

@@ -1048,12 +1048,25 @@ class TabletopPoseEstimator:
         *,
         tabletop_length_m: float = 0.58,
         tabletop_depth_m: float = 0.42,
+        cad_body_center_z_candidates_m: tuple[float, ...] | None = None,
     ) -> None:
         self.calibration = calibration or CameraCalibration.g1_head_left()
         if tabletop_depth_m <= 0.0 or tabletop_length_m <= tabletop_depth_m:
             raise ValueError("tabletop dimensions must be positive with length > depth")
         self.tabletop_length_m = float(tabletop_length_m)
         self.tabletop_depth_m = float(tabletop_depth_m)
+        if cad_body_center_z_candidates_m is None:
+            # Keep online CV behaviour fixed to the measured V1 fixture.  The
+            # source-RGB calibration path supplies an explicit bounded grid
+            # because its floating-base height is not the V1 reset height.
+            candidates = (self._TABLE_BODY_CENTER_Z_M,)
+        else:
+            candidates = tuple(float(value) for value in cad_body_center_z_candidates_m)
+            if not candidates or not np.isfinite(candidates).all():
+                raise ValueError("cad_body_center_z_candidates_m must be non-empty and finite")
+            if min(candidates) < -0.10 or max(candidates) > 0.10:
+                raise ValueError("cad_body_center_z_candidates_m must stay within [-0.10, 0.10] m")
+        self._cad_body_center_z_candidates_m = tuple(sorted(set(candidates)))
 
     # Exact V1 assembled-mesh bounds in the Table001_01 body frame. The table
     # is upside down initially, so its local +z tabletop surface faces down in
@@ -1286,12 +1299,11 @@ class TabletopPoseEstimator:
         coarse_candidates: list[tuple[float, float, np.ndarray]] = []
         for center_x in np.arange(0.30, 1.06, 0.05):
             for center_y in np.arange(-0.45, 0.46, 0.05):
-                for yaw in np.arange(0.0, 2.0 * math.pi, math.radians(10.0)):
-                    result = evaluate(
-                        center_x, center_y, self._TABLE_BODY_CENTER_Z_M, yaw
-                    )
-                    if result is not None:
-                        coarse_candidates.append(result)
+                for center_z in self._cad_body_center_z_candidates_m:
+                    for yaw in np.arange(0.0, 2.0 * math.pi, math.radians(10.0)):
+                        result = evaluate(center_x, center_y, center_z, yaw)
+                        if result is not None:
+                            coarse_candidates.append(result)
         if not coarse_candidates:
             return None
         # Use a bounded set for local refinement.  The later rim score is only
@@ -1302,21 +1314,26 @@ class TabletopPoseEstimator:
         for _, _, coarse_frame in coarse_candidates[:4]:
             coarse_center = coarse_frame[:3, 3]
             coarse_yaw = math.atan2(float(coarse_frame[1, 0]), float(coarse_frame[0, 0]))
+            refine_z = (
+                (float(coarse_center[2]),)
+                if len(self._cad_body_center_z_candidates_m) == 1
+                else tuple(
+                    float(value)
+                    for value in np.arange(coarse_center[2] - 0.008, coarse_center[2] + 0.0081, 0.002)
+                    if self._cad_body_center_z_candidates_m[0] <= value <= self._cad_body_center_z_candidates_m[-1]
+                )
+            )
             for center_x in np.arange(coarse_center[0] - 0.04, coarse_center[0] + 0.041, 0.01):
                 for center_y in np.arange(coarse_center[1] - 0.04, coarse_center[1] + 0.041, 0.01):
-                    for yaw in np.arange(
-                        coarse_yaw - math.radians(10.0),
-                        coarse_yaw + math.radians(10.1),
-                        math.radians(2.0),
-                    ):
-                        result = evaluate(
-                            center_x,
-                            center_y,
-                            self._TABLE_BODY_CENTER_Z_M,
-                            yaw,
-                        )
-                        if result is not None:
-                            refined.append(result)
+                    for center_z in refine_z:
+                        for yaw in np.arange(
+                            coarse_yaw - math.radians(10.0),
+                            coarse_yaw + math.radians(10.1),
+                            math.radians(2.0),
+                        ):
+                            result = evaluate(center_x, center_y, center_z, yaw)
+                            if result is not None:
+                                refined.append(result)
         if not refined:
             return None
         refined.sort(key=lambda item: item[0])
@@ -1325,22 +1342,27 @@ class TabletopPoseEstimator:
         # rim rather than allowing the 1 cm grid to visibly cut across it.
         selected_center = best[2][:3, 3]
         selected_yaw = math.atan2(float(best[2][1, 0]), float(best[2][0, 0]))
+        precise_z = (
+            (float(selected_center[2]),)
+            if len(self._cad_body_center_z_candidates_m) == 1
+            else tuple(
+                float(value)
+                for value in np.arange(selected_center[2] - 0.004, selected_center[2] + 0.0041, 0.001)
+                if self._cad_body_center_z_candidates_m[0] <= value <= self._cad_body_center_z_candidates_m[-1]
+            )
+        )
         precise: list[tuple[float, float, np.ndarray]] = []
         for center_x in np.arange(selected_center[0] - 0.008, selected_center[0] + 0.0081, 0.002):
             for center_y in np.arange(selected_center[1] - 0.008, selected_center[1] + 0.0081, 0.002):
-                for yaw in np.arange(
-                    selected_yaw - math.radians(2.0),
-                    selected_yaw + math.radians(2.01),
-                    math.radians(0.5),
-                ):
-                    result = evaluate(
-                        center_x,
-                        center_y,
-                        self._TABLE_BODY_CENTER_Z_M,
-                        yaw,
-                    )
-                    if result is not None:
-                        precise.append(result)
+                for center_z in precise_z:
+                    for yaw in np.arange(
+                        selected_yaw - math.radians(2.0),
+                        selected_yaw + math.radians(2.01),
+                        math.radians(0.5),
+                    ):
+                        result = evaluate(center_x, center_y, center_z, yaw)
+                        if result is not None:
+                            precise.append(result)
         # The boundary cue selects the physical rim at the coarse scale.  At
         # the final 2 mm scale, optimize only the geometric registration so a
         # dense re-evaluation of RGB patches cannot stall the 50 Hz servo loop.

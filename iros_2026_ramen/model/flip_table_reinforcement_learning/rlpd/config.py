@@ -6,14 +6,14 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-SCHEMA_VERSION = "team_ramen_residual_rlpd_v1"
-ALL_ACTIONS_MASK = (1.0,) * 19
+SCHEMA_VERSION = "team_ramen_residual_rlpd_v2"
+ALL_ACTIONS_MASK = (1.0,) * 16
 
 
 @dataclass(frozen=True)
 class RLPDConfig:
     observation_dim: int
-    action_dim: int = 19
+    action_dim: int = 16
     hidden_dim: int = 512
     hidden_layers: int = 3
     critic_ensemble_size: int = 10
@@ -36,8 +36,8 @@ class RLPDConfig:
     stochastic_action_mask: tuple[float, ...] = ALL_ACTIONS_MASK
 
     def __post_init__(self) -> None:
-        if self.observation_dim <= 0 or self.action_dim != 19:
-            raise ValueError("RLPD requires a positive observation dimension and 19-D residual action")
+        if self.observation_dim <= 0 or self.action_dim != 16:
+            raise ValueError("RLPD requires a positive observation dimension and 16-D residual action")
         if self.hidden_dim <= 0 or self.hidden_layers < 1:
             raise ValueError("RLPD hidden dimensions must be positive")
         if not 2 <= self.target_critic_sample_size <= self.critic_ensemble_size:
@@ -71,7 +71,7 @@ class RLPDConfig:
         if self.reference_bc_weight < 0:
             raise ValueError("reference BC weight must be non-negative")
         if len(self.stochastic_action_mask) != self.action_dim:
-            raise ValueError("stochastic action mask must contain exactly 19 values")
+            raise ValueError("stochastic action mask must contain exactly 16 values")
         if any(value not in {0.0, 1.0} for value in self.stochastic_action_mask):
             raise ValueError("stochastic action mask values must be 0 or 1")
         if not any(self.stochastic_action_mask):

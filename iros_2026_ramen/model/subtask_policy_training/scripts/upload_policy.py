@@ -5,16 +5,29 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 from huggingface_hub import HfApi
 
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from model.subtask_policy_training.gr00t.n17_contract import (  # noqa: E402
+    validate_finalized_furniture_checkpoint,
+)
+
+
 REQUIRED_POLICY_FILES = (
     "config.json",
+    "evaluation_report.json",
     "model.safetensors",
     "policy_postprocessor.json",
     "policy_preprocessor.json",
     "train_config.json",
+    "training_manifest.json",
+    "training_run_record.json",
 )
 PRESERVED_REMOTE_FILES = {".gitattributes", "README.md"}
 
@@ -45,6 +58,36 @@ def validate_model_dir(model_dir: Path) -> None:
             raise ValueError(f"invalid checkpoint metadata: {metadata_path}") from exc
         if not isinstance(payload, dict):
             raise ValueError(f"checkpoint metadata must be a JSON object: {metadata_path}")
+        if metadata_name == "config.json" and payload.get("type") == "furniture_groot":
+            required_groot_files = (
+                "candidate_selection.json",
+                "dex1_g1_synergy.json",
+                "eef_fk_audit.json",
+                "groot_contract.json",
+                "orientation_contact_sheet.approved",
+                "orientation_contact_sheet.jpg",
+                "progress_manifest.json",
+                "progress.jsonl",
+                "sim_candidate_selection.json",
+                "sim_evaluation_manifest.json",
+                "sim_release_evaluation.json",
+                "source_snapshot_manifest.json",
+                "visual_rotation_manifest.json",
+                "visual_rotation.jsonl",
+            )
+            missing_groot = [
+                name for name in required_groot_files if not (model_dir / name).is_file()
+            ]
+            if missing_groot:
+                raise FileNotFoundError(
+                    f"{model_dir} is missing Furniture-GR00T provenance files: "
+                    f"{missing_groot}"
+                )
+            if not (model_dir / "sim_evaluation").is_dir():
+                raise FileNotFoundError(
+                    f"{model_dir} is missing the simulator evaluation bundle"
+                )
+            validate_finalized_furniture_checkpoint(model_dir)
     for processor_name in ("policy_preprocessor.json", "policy_postprocessor.json"):
         processor_path = model_dir / processor_name
         try:
@@ -124,6 +167,11 @@ def main() -> int:
 
     api = HfApi()
     repo_url = api.create_repo(args.repo_id, repo_type="model", private=args.private, exist_ok=True)
+    repo_info = api.repo_info(args.repo_id, repo_type="model")
+    if args.private and not repo_info.private:
+        raise RuntimeError(
+            f"refusing to upload a policy to public repository {args.repo_id}; make it private first"
+        )
     local_files = {
         path.relative_to(model_dir).as_posix()
         for path in model_dir.rglob("*")

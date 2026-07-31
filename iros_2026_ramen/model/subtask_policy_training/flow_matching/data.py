@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
 
@@ -18,6 +17,47 @@ from .config import FlowMatchingConfig, POLICY_CAMERAS
 # about 0.2 ms. One millisecond covers that quantization error while remaining
 # far below the 33.3 ms frame interval, so it cannot select an adjacent frame.
 VIDEO_TIMESTAMP_TOLERANCE_S = 1.0e-3
+
+
+def valid_training_sample_indices(
+    camera_valid: list[bool],
+    episode_indices: list[int],
+    *,
+    action_horizon: int,
+    history_frames: int = 1,
+) -> list[int]:
+    """Exclude samples whose observation/action window crosses invalid RGB."""
+
+    if (
+        len(camera_valid) != len(episode_indices)
+        or action_horizon <= 0
+        or history_frames <= 0
+    ):
+        raise ValueError("invalid camera-valid training index inputs")
+    output: list[int] = []
+    run_start = 0
+    while run_start < len(episode_indices):
+        run_stop = run_start + 1
+        while (
+            run_stop < len(episode_indices)
+            and episode_indices[run_stop] == episode_indices[run_start]
+        ):
+            run_stop += 1
+        invalid_prefix = [0]
+        for valid in camera_valid[run_start:run_stop]:
+            invalid_prefix.append(invalid_prefix[-1] + int(not valid))
+        for index in range(run_start, run_stop):
+            window_start = max(run_start, index - history_frames + 1)
+            window_stop = min(run_stop, index + action_horizon)
+            relative_start = window_start - run_start
+            relative_stop = window_stop - run_start
+            if (
+                invalid_prefix[relative_stop]
+                == invalid_prefix[relative_start]
+            ):
+                output.append(index)
+        run_start = run_stop
+    return output
 
 
 class FlowMatchingDataset(Dataset):
@@ -31,6 +71,10 @@ class FlowMatchingDataset(Dataset):
         augment: bool,
         revision: str | None = None,
     ) -> None:
+        # Keep split/stat helpers importable in lightweight test and evaluation
+        # environments.  LeRobot is required only when samples are opened.
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
         delta_timestamps = {
             "action": [index / config.fps for index in range(config.action_horizon)]
         }
@@ -46,6 +90,23 @@ class FlowMatchingDataset(Dataset):
         )
         self.config = config
         self.transform = self._image_transform(augment)
+        self.sample_indices = list(range(len(self.dataset)))
+        hf_dataset = getattr(self.dataset, "hf_dataset", None)
+        column_names = tuple(getattr(hf_dataset, "column_names", ()))
+        if hf_dataset is not None and "camera_valid" in column_names:
+            if "episode_index" not in column_names:
+                raise ValueError(
+                    "camera_valid dataset must also expose episode_index"
+                )
+            self.sample_indices = valid_training_sample_indices(
+                [bool(value) for value in hf_dataset["camera_valid"]],
+                [int(value) for value in hf_dataset["episode_index"]],
+                action_horizon=config.action_horizon,
+            )
+            if not self.sample_indices:
+                raise ValueError(
+                    "camera_valid filtering removed every training sample"
+                )
 
     def _image_transform(self, augment: bool) -> v2.Transform:
         if not augment:
@@ -67,10 +128,10 @@ class FlowMatchingDataset(Dataset):
         )
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(self.sample_indices)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        sample = self.dataset[index]
+        sample = self.dataset[self.sample_indices[index]]
         images = torch.stack([self.transform(sample[key]) for key in POLICY_CAMERAS])
         state = sample["observation.state"].float()
         action = sample["action"].float()

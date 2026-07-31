@@ -37,6 +37,7 @@ from data.flip_table_data_augmentation.source_camera_projection import root_from
 from data.flip_table_data_augmentation.source_dataset import SourceDatasetIndex, extract_video_frame
 from evaluate.flip_table_simulation.container_overlay.policy.cv_rule_based.vision import (
     CameraCalibration,
+    TabletopEstimate,
     TabletopPoseEstimator,
 )
 from evaluate.flip_table_simulation.real_to_sim_calibration.stereo_geometry import HeadStereoCalibration
@@ -49,6 +50,11 @@ MINIMUM_EYE_CONFIDENCE = 0.25
 MAXIMUM_EYE_CAD_EDGE_ERROR_PX = 12.0
 MAXIMUM_STEREO_TRANSLATION_M = 0.050
 MAXIMUM_STEREO_ROTATION_DEG = 6.0
+# The online policy keeps the V1 fixture's fixed table-body height.  Source
+# RGB calibration must instead estimate the body height relative to the
+# recorded floating base.  This bounded grid is episode-invariant and uses
+# only CAD plus recorded stereo RGB; it is never exposed to a policy.
+SOURCE_CAD_BODY_CENTER_Z_CANDIDATES_M = tuple(np.arange(-0.030, 0.0501, 0.010))
 
 
 @dataclass(frozen=True)
@@ -81,10 +87,26 @@ def _right_from_left(stereo: HeadStereoCalibration) -> np.ndarray:
     return _transform(stereo.rotation_right_from_left, stereo.translation_right_from_left_mm.reshape(3) / 1000.0)
 
 
-def _root_from_head_eyes(root_from_torso: np.ndarray, left_camera: CameraConfig, stereo: HeadStereoCalibration) -> tuple[np.ndarray, np.ndarray]:
+def _root_from_head_eyes(
+    root_from_torso: np.ndarray,
+    left_camera: CameraConfig,
+    stereo: HeadStereoCalibration,
+    head_correction: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Compose FK with raw left-eye mount and measured head-stereo geometry."""
 
     root_from_left_opengl = root_from_camera(root_from_torso, left_camera)
+    if head_correction is not None:
+        offset = np.asarray(head_correction.get("torso_offset_m"), dtype=np.float64)
+        rpy = np.asarray(head_correction.get("camera_rotation_rpy_deg"), dtype=np.float64)
+        if offset.shape != (3,) or rpy.shape != (3,) or not np.isfinite(offset).all() or not np.isfinite(rpy).all():
+            raise ValueError("head correction must provide finite torso_offset_m and camera_rotation_rpy_deg")
+        if np.any(np.abs(offset) > 0.030) or np.any(np.abs(rpy) > 4.0):
+            raise ValueError("head correction exceeds the audited FK-first physical bounds")
+        torso_from_left = np.linalg.inv(root_from_torso) @ root_from_left_opengl
+        torso_from_left[:3, 3] += offset
+        torso_from_left[:3, :3] = torso_from_left[:3, :3] @ Rotation.from_euler("XYZ", rpy, degrees=True).as_matrix()
+        root_from_left_opengl = root_from_torso @ torso_from_left
     root_from_left_opencv = root_from_left_opengl @ OPENGL_FROM_OPENCV
     root_from_right_opencv = root_from_left_opencv @ np.linalg.inv(_right_from_left(stereo))
     return root_from_left_opencv, root_from_right_opencv
@@ -166,7 +188,30 @@ def _build_torso_fk(urdf: Path):
 
 def _estimate_eye(rgb_bgr: np.ndarray, calibration: CameraCalibration, *, frame_index: int, camera: str) -> tuple[PoseEstimate, np.ndarray]:
     rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-    estimate = TabletopPoseEstimator(calibration).estimate(rgb)
+    estimator = TabletopPoseEstimator(
+        calibration,
+        cad_body_center_z_candidates_m=SOURCE_CAD_BODY_CENTER_Z_CANDIDATES_M,
+    )
+    # ``TabletopPoseEstimator.estimate`` has a deliberately permissive
+    # quadrilateral/PnP fallback for the online CV policy. That fallback is
+    # useful for control, but it is not admissible source-calibration evidence:
+    # an inner brace can produce a plausible rectangle in one eye and break
+    # the stereo geometry. Source fitting must use exact V1 CAD rim and
+    # leg-axis registration or report this eye unavailable.
+    mask = estimator.segment_table_assembly(rgb)
+    cad_fit = estimator._estimate_from_cad_wireframe(mask, rgb)
+    if cad_fit is None:
+        raise ValueError("source CAD wireframe registration is unavailable")
+    root_from_table, camera_from_table, corners_px, reprojection, confidence = cad_fit
+    estimate = TabletopEstimate(
+        root_from_table=root_from_table,
+        camera_from_table=camera_from_table,
+        corners_px=corners_px,
+        mask=mask,
+        confidence=confidence,
+        reprojection_error_px=reprojection,
+        area_fraction=float(np.count_nonzero(mask)) / float(mask.size),
+    )
     return PoseEstimate(frame_index, camera, estimate.root_from_table, estimate.confidence, estimate.reprojection_error_px), TabletopPoseEstimator.render_debug(rgb, estimate)
 
 
@@ -177,7 +222,7 @@ def _parse_frames(values: list[int]) -> tuple[int, ...]:
     return frames
 
 
-def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple[int, ...], urdf: Path, stereo_calibration: Path, output_dir: Path, config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple[int, ...], urdf: Path, stereo_calibration: Path, output_dir: Path, config_path: Path = DEFAULT_CONFIG_PATH, head_correction: dict[str, Any] | None = None, q_current_offset_frames: int = 0) -> dict[str, Any]:
     """Fit a fixed pre-flip table pose using partial CAD edge evidence."""
 
     config = load_pipeline_config(config_path)
@@ -186,8 +231,11 @@ def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple
     episode = source.episode(episode_index)
     if frames[-1] >= episode.frame_count:
         raise ValueError(f"frame {frames[-1]} exceeds episode length {episode.frame_count}")
+    q_frames = tuple(frame + q_current_offset_frames for frame in frames)
+    if q_frames[0] < 0 or q_frames[-1] >= episode.frame_count:
+        raise ValueError("q_current offset moves source camera evidence outside the episode")
     stereo = HeadStereoCalibration.load(stereo_calibration)
-    rows = _load_rows(episode.data_path, episode_index, frames)
+    rows = _load_rows(episode.data_path, episode_index, q_frames)
     pin, model, data, joint_indices, torso_id = _build_torso_fk(urdf)
     output_dir.mkdir(parents=True, exist_ok=True)
     left_video = episode.video_slice("observation.images.cam_0")
@@ -199,7 +247,7 @@ def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple
     pair_rotation_errors: list[float] = []
 
     for frame_index in frames:
-        row = rows[frame_index]
+        row = rows[frame_index + q_current_offset_frames]
         q_source = np.asarray(row["observation.state.robot_q_current"], dtype=np.float64)
         if q_source.shape != (36,) or not np.isfinite(q_source).all():
             raise ValueError(f"frame {frame_index} has invalid robot_q_current")
@@ -207,7 +255,7 @@ def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple
         q[joint_indices] = q_source[7:]
         pin.framesForwardKinematics(model, data, q)
         torso = _transform(data.oMf[torso_id].rotation, data.oMf[torso_id].translation)
-        root_from_left, root_from_right = _root_from_head_eyes(torso, left_camera, stereo)
+        root_from_left, root_from_right = _root_from_head_eyes(torso, left_camera, stereo, head_correction)
         paths = {"head_left": output_dir / "raw" / f"frame_{frame_index:06d}_head_left.png", "head_right": output_dir / "raw" / f"frame_{frame_index:06d}_head_right.png"}
         extract_video_frame(left_video.path, left_video.timestamp_for_frame(frame_index, config.source.fps, episode.frame_count), paths["head_left"])
         extract_video_frame(right_video.path, right_video.timestamp_for_frame(frame_index, config.source.fps, episode.frame_count), paths["head_right"])
@@ -222,6 +270,7 @@ def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple
         frame_record: dict[str, Any] = {
             "frame_index": frame_index,
             "timestamp_s": float(row["timestamp"]),
+            "q_current_source_frame": frame_index + q_current_offset_frames,
             # These FK poses are offline calibration evidence. They make the
             # source and V1 head-camera frames directly comparable without
             # deriving a camera correction from a rendered image alone.
@@ -294,8 +343,8 @@ def align_source_episode(*, source_root: Path, episode_index: int, frames: tuple
     report = {
         "schema_version": SCHEMA_VERSION,
         "policy_use": "forbidden: offline fixed-scene calibration only",
-        "source": {"dataset_root": str(source_root), "episode_index": episode_index, "frames": list(frames)},
-        "method": {"description": "CAD rim and leg-axis registration to RGB edge/white support; no four-corner PnP", "cad_mesh": "data/flip_table_data_augmentation/outputs/source/v1-table-mesh/Table001_assembled_body_frame.obj", "tabletop_bounds_m": [0.580, 0.420], "yaw_180_symmetry_canonicalized": True, "requires_simulator_ground_truth": False},
+        "source": {"dataset_root": str(source_root), "episode_index": episode_index, "frames": list(frames), "q_current_offset_frames": q_current_offset_frames},
+        "method": {"description": "CAD rim and leg-axis registration to RGB edge/white support; no four-corner PnP", "cad_mesh": "data/flip_table_data_augmentation/outputs/source/v1-table-mesh/Table001_assembled_body_frame.obj", "tabletop_bounds_m": [0.580, 0.420], "body_center_z_candidates_m": list(SOURCE_CAD_BODY_CENTER_Z_CANDIDATES_M), "yaw_180_symmetry_canonicalized": True, "requires_simulator_ground_truth": False, "head_correction": head_correction},
         "fixed_scene_root_from_table": fixed_pose.tolist(),
         "temporal_consistency": temporal,
         "stereo_agreement": {
@@ -327,8 +376,9 @@ def main() -> None:
     parser.add_argument("--stereo-calibration", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--q-current-offset-frames", type=int, default=0)
     args = parser.parse_args()
-    report = align_source_episode(source_root=args.source_root.expanduser().resolve(), episode_index=args.episode_index, frames=_parse_frames(args.frames), urdf=args.urdf.expanduser().resolve(), stereo_calibration=args.stereo_calibration.expanduser().resolve(), output_dir=args.output_dir.expanduser().resolve(), config_path=args.config.expanduser().resolve())
+    report = align_source_episode(source_root=args.source_root.expanduser().resolve(), episode_index=args.episode_index, frames=_parse_frames(args.frames), urdf=args.urdf.expanduser().resolve(), stereo_calibration=args.stereo_calibration.expanduser().resolve(), output_dir=args.output_dir.expanduser().resolve(), config_path=args.config.expanduser().resolve(), q_current_offset_frames=args.q_current_offset_frames)
     print(json.dumps({"accepted": report["accepted_for_fixed_scene_proposal"], "stereo": report["stereo_agreement"]}, indent=2))
 
 

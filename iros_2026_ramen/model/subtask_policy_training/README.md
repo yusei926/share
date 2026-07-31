@@ -61,7 +61,7 @@ For ACT and Diffusion Policy, the local view materializes an upper-body-only
 non-walking policy interface:
 
 - `observation.state`: 19-D upper-body robot configuration state.
-- `action`: 19-D upper-body absolute robot configuration target action.
+- `action`: 16-D arm/Dex1 absolute target. Waist is observed, never commanded.
 
 State order:
 
@@ -80,11 +80,10 @@ when converting to prismatic-joint positions or normalized actuator commands.
 Action order:
 
 ```text
-0..2    waist_yaw/roll/pitch targets
-3..9    left shoulder/elbow/wrist targets
-10..16  right shoulder/elbow/wrist targets
-17      left_gripper_q_cmd
-18      right_gripper_q_cmd
+0..6    left shoulder/elbow/wrist targets
+7..13   right shoulder/elbow/wrist targets
+14      left_gripper_q_cmd
+15      right_gripper_q_cmd
 ```
 
 Root pose and lower-body joints are deliberately dropped for ACT/Diffusion
@@ -125,10 +124,13 @@ complete action chunk, the GR00T processor applies the checkpoint contract:
 - Base-height and navigation: zero because this non-walking dataset has no such
   commands. No leg or root-pose slots are exposed to the policy.
 
-The Dex1-1 open/close scalar occupies the first value of each official 7-D hand
-group; the six unavailable hand coordinates are explicit zeros. This bridge is
-recorded in `meta/modality.json` and must be reversed by the real-robot inference
-adapter. The shared HF dataset itself is unchanged and does not need re-uploading.
+Each Dex1-1 open/close scalar is mapped onto a fixed seven-joint G1 hand
+synergy. The open/closed endpoints are robustly estimated from the pinned
+official G1 data and stored in `gr00t/assets/dex1_g1_synergy.json`. Inference
+projects each predicted 7-D hand vector back onto the same synergy axis with
+least squares. The adapter audit requires a Dex1 round-trip error below `1e-4`
+and at most 5% of mapped values outside every official q01-q99 interval; it
+does not clip values to pass the audit. The shared HF dataset remains unchanged.
 
 ## Setup
 
@@ -214,8 +216,8 @@ Flow Matching behavior-cloning baseline for `flip_table`:
 SUBTASK=flip_table ./scripts/train_flow_matching.sh
 ```
 
-This repository-native policy uses the same three-camera, 19-D state, and 19-D
-absolute-target contract as ACT. The default model predicts a 24-target chunk
+This repository-native policy uses the same three-camera, 19-D state, and 16-D
+arm/Dex1 absolute-target contract as ACT. The default model predicts a 24-target chunk
 and executes 6 targets before replanning at the dataset's 30 Hz rate. Raw camera
 frames remain 640x480 at the runtime boundary and are resized deterministically
 inside the model. Training includes image augmentation, grouped train/validation
@@ -247,27 +249,32 @@ SUBTASK=pick_leg \
 This uses the shared LeRobot v3 dataset (`DATASET_REPO_ID`) and materializes the
 local REAL_G1 relative-EEF view before launching `lerobot-train`. The first run
 downloads the pinned base model and builds a local sidecar overlay. The overlay
-preserves the official state/action contract, statistics, and embodiment id;
-only the video keys are changed to the required current-frame three-camera
-layout. The wrapper injects these defaults:
+preserves the official 49-D state, 53-D logical action, 132-D packed tensor,
+H40 action horizon, statistics, and embodiment id. The only intentional input
+contract change is replacing the single official `ego_view` with head-left and
+both D405 wrist views while retaining the official `[-20,0]` image history.
+The wrapper injects these defaults:
 
 ```text
 --policy.type=groot
 --policy.base_model_path=nvidia/GR00T-N1.7-3B
 base revision: 2fc962b973bccdd5d8ce4f67cc63b264d6886495
 --policy.embodiment_tag=real_g1_relative_eef_relative_joints
---policy.chunk_size=16
---policy.n_action_steps=16
+--policy.chunk_size=40
+--policy.n_action_steps=10
 --policy.use_relative_actions=true
 --policy.use_bf16=true
---dataset.image_transforms.enable=true
+--dataset.image_transforms.enable=false
 ```
 
-Chunk length and execution length can still be overridden when needed:
+The H40 action horizon is fixed by the pinned base contract. Candidate
+comparison starts with 10 physical steps between replans; release evaluation
+selects the deployed interval and temporal decay from the validated sweep.
+Training uses one coherent GPU augmentation across all two timestamps and all
+three cameras in a sample; generic per-image CPU transforms stay disabled.
 
 ```bash
-GROOT_CHUNK_SIZE=40 \
-GROOT_N_ACTION_STEPS=25 \
+GROOT_N_ACTION_STEPS=10 \
 ./scripts/train_groot_n17.sh --steps=1000
 ```
 
@@ -277,6 +284,98 @@ fails before training if either is disabled or if a different embodiment tag is
 requested. `GROOT_RELATIVE_EXCLUDE_JOINTS` is fixed to
 `["hand","waist","base_height","navigate"]`; changing it would make the
 training processor and simulator decoder disagree about absolute action groups.
+The valid action loss mask covers only EEF 18D, hands 14D, and arms 14D
+(`0:46`). Waist, base-height, navigation, and packed padding never contribute
+to the action loss. FurnitureVLA-style progress is a separate `[B,40,1]`
+diagnostic head; no 54th action slot exists and progress never switches a
+policy phase or generates a command.
+
+The reproducible flip-table release run is launched as a detached process:
+
+```bash
+GROOT_PERSISTENT_RESULT_ROOT="$HOME/.cache/iros_groot_n17_transfer/results" \
+GROOT_TRAINING_TARGET=baseline \
+./scripts/launch_h100_flip_table_groot_n17.sh start
+
+./scripts/launch_h100_flip_table_groot_n17.sh status
+```
+
+Run it on one H100 with at least 75 GiB VRAM and a 90 GB `/dev/shm` budget.
+The launcher uses `nohup` and `setsid`, so closing the SSH connection does not
+terminate training. The H100 must also contain the tmpfiles exclusion emitted
+by the deployment setup for `/dev/shm/iros_2026_ramen_groot_n17`; the launcher
+refuses to run without it.
+
+Release training saves at 5,000-step intervals. Every save synchronously
+uploads a complete resumable checkpoint to a separate private repository:
+
+```text
+Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints
+Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_auxiliary_checkpoints
+```
+
+These checkpoints include model weights, optimizer and scheduler state, RNG
+state, processors, training configuration, and the exact training step. Each
+step is tagged on the Hub (`005000`, `010000`, `015000`, `020000`) and can be
+used automatically when the local tmpfs run is unavailable. W&B stores a
+second, model-only artifact at the same save points. After both remote writes,
+the runner keeps the latest local checkpoint generation; every older
+generation remains recoverable from its immutable Hub tag. This bounds tmpfs
+usage while retaining exact restart capability. The runner verifies the final
+Hub file set and hashes before deleting any completed local optimizer state.
+`GROOT_TRAINING_TARGET=baseline` stops after that verification;
+`GROOT_TRAINING_TARGET=both` continues with the auxiliary-progress candidate.
+
+The script pins dataset revision
+`0dc47877dfb2efbea796a059c81290c649bc773c`, verifies the official N1.7
+checkpoint contract and Dex1 synergy, builds the progress sidecar, and runs a
+four-episode overfit gate before the release training. It then trains the
+no-progress baseline and auxiliary-progress candidate with the same seed,
+20,000 optimizer steps, bf16, and global batch 64. Candidate selection uses
+the immutable 17-episode validation split and a same-seed five-episode
+simulator comparison. Both scene randomization and flow-matching sampling use
+the same per-episode seed (`base_seed + episode_index`) and the traces are
+validated before selection. Offline flow-matching evaluation likewise derives
+one seed from the base seed, source episode, and chunk ordinal, so model order
+and previous episode duration cannot change a comparison. The selected
+candidate is then evaluated once on the 18-episode test split. The remaining
+139 episodes are the only full-run training episodes.
+
+After both H100 candidates and offline validation reports are ready, the
+runner exits with code 75 and writes `runs/candidate_handoff.json`. This is an
+intentional release gate: copy the two candidate model directories and their
+validation reports to the RTX 5090 host, then run:
+
+```bash
+bash evaluate/flip_table_simulation/run_groot_candidate_comparison.sh \
+  /path/to/baseline/pretrained_model \
+  /path/to/auxiliary_progress/pretrained_model \
+  /path/to/eval_validation_baseline/report.json \
+  /path/to/eval_validation_auxiliary_progress/report.json \
+  outputs/flip_table_groot_candidate_comparison/release_candidate
+```
+
+Copy that output directory back to `runs/sim_evaluation_bundle`, and copy its
+`sim_candidate_selection.json` and `sim_release_evaluation.json` to `runs/`.
+Rerunning `run_h100_flip_table_groot_n17.sh` reuses both completed trainings,
+verifies the simulator evidence, evaluates the selected model on test exactly
+once, and continues to finalization and upload. A candidate that misses fixed
+scene 3/3 or unseen-DR 40/50 is not uploaded.
+
+The selected checkpoint is finalized with the complete release-time training,
+inference, and evaluation source bundle, its capture time, per-file hashes, git
+state, split, official contract audit,
+EEF/FK audit, the complete progress/visual sidecars and contact-sheet approval,
+lossless video-cache proof, W&B URL, and held-out metrics before private
+Hugging Face upload. The same-seed candidate comparison, simulator
+videos/traces, temporal sweep, fixed 3/3, and unseen-DR report are included in
+the model artifact. Every fixed-scene and DR trace must carry its declared
+per-episode flow-matching seed and exact DR profile. Candidate selection uses
+`validation_v1`; the final gate uses the categorically disjoint
+`held_out_v1` appearance/contact profile. Runtime contract verification rejects
+missing, extra, modified, profile-mismatched, or seed-incomplete evidence. A
+clean Hub download must reproduce the held-out report. Simulator success is not
+a real-robot result.
 
 Train another subtask by changing only `SUBTASK`:
 

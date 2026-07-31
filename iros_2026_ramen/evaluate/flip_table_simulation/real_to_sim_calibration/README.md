@@ -5,9 +5,17 @@ LeRobot dataset. It does not modify the dataset and does not use table pose,
 contact, segmentation, or global-camera signals as a policy input.
 
 `prepare.py` audits every numeric row, selects one anchor, two calibration, and
-five held-out validation episodes, then writes the exact 19-D fixed-base replay
-action stream. The root pose and lower-body labels are retained as reference;
-they must never be applied as per-frame teleports during a replay.
+five held-out validation episodes, then writes the deployable 16-D
+arms-plus-Dex1 replay stream. The organizer WBC remains responsible for the
+floating base, legs, and waist. Root and lower-body labels are retained as
+reference; they must never be applied as per-frame teleports during a replay.
+
+`replay.py materialize --full-body-diagnostic` additionally writes the recorded
+body29-plus-Dex1 stream for one narrow controller-identification experiment.
+That path deliberately leaves the root dynamic and reports root drift; it is
+not a policy, a deployment path, or valid camera/contact/held-out evidence.
+It exists to reject the tempting but invalid assumption that a sequence of
+recorded joint-position targets can replace G1's real balance controller.
 
 The calibration bundle records measured raw-MCAP head stereo and D405 intrinsics
 when the pinned raw metadata is available. Link extrinsics and contact physics
@@ -15,7 +23,7 @@ remain fitted quantities and must include uncertainty in the final report.
 
 ## What the dataset can identify
 
-The pinned LeRobot dataset contains synchronized RGB, head-stereo intrinsics,
+The pinned LeRobot dataset contains synchronized **raw** RGB, head-stereo intrinsics,
 D405 intrinsics, robot encoders, commands, and end-effector labels. It does
 **not** contain a camera-to-link transform, table 6-DoF pose, contact force,
 or a material/friction measurement. Those omissions matter: an RGB silhouette
@@ -57,6 +65,19 @@ workbench, exposure, reflections, and robot material differ from V1. The
 source fit remains valid when individual corners are occluded, because the
 accepted source pose was obtained from multi-frame rim/leg evidence before
 the four CAD corners are projected for the final metric check.
+
+`source_scene_candidate.py` must read the trace row synchronized to source
+frame zero (normally terminal warmup step `119`), not reset step `0`.
+The floating base can settle during warmup; using step `0` aliases that WBC
+motion into the table offset. The source CAD frame and the V1 assembled-table
+articulation may also have an unidentifiable vertical-origin difference. The
+candidate therefore identifies only workbench-plane `x/y` and yaw, fixes its
+vertical offset to zero, and records the V1 trace's **reset-time** local robot
+root only to prevent the ordinary placement heuristic from moving G1 when the
+table offset changes. It never writes the post-warmup dynamic root pose and
+never teleports the root after reset. V1's supported table height and
+WBC-owned floating base remain intact. The dynamic root and vertical
+differences are retained as diagnostic report fields.
 
 ```bash
 PYTHONPATH=$PWD conda run -n tv python -m \
@@ -113,7 +134,7 @@ applied to simulator policy images only after a raw-versus-rectified audit;
 the existing data-augmentation remapper is not evidence that the evaluator is
 already applying it.
 
-The evaluator applies the recorded image model to learned-policy camera inputs
+The evaluator applies the recorded raw-image model to learned-policy camera inputs
 without exposing calibration values as policy features. In particular, the
 D405 pinhole source is the mean of the two pinned raw color calibrations:
 `focal_length=24 mm`, `horizontal_aperture=35.310106 mm`, and
@@ -128,7 +149,83 @@ estimate both real and simulated head images with the raw calibrated
 intrinsics; interpreting those PNGs as simulator pinhole images would silently
 invalidate a fit.
 
+### Robot-occlusion-aware RGB comparison
+
+`visual_alignment.py` scores an RGB-derived table silhouette, not a rendered
+table mask. White G1/Dex1 links otherwise contaminate this score in both real
+and simulated images. Use `export_head_robot_masks.py` to project only the
+pinned G1 + Dex1-1 visual URDF from recorded/actual joint encoders and the
+logged head-camera pose, then pass both masks to the comparison tool. This is
+an offline self-occlusion exclusion: it must never use table pose, contact,
+segmentation, or simulator object state, and must never enter a policy,
+planner, reward, or inference-time branch.
+
+The mask-IoU gate is still independent from CAD camera/table reprojection. A
+poor RGB IoU can arise from material, exposure, reflection, or segmentation
+differences even when camera geometry is good. Do not tune a camera mount to
+one mask score; require the geometric gate and unused-episode evidence.
+
 ### Table-independent head-mount diagnostic
+
+### FK-first camera and scene order
+
+`fk_first_camera_calibration.py` is the release path for a source-only
+calibration: first fit one head-left correction from static, arm-visible
+`robot_q_current` poses; then fit the fixed table and its support plane with the accepted
+head stereo; finally fit each D405 against that fixed scene.  It fixes raw
+intrinsics, distortion, and the head stereo baseline.  It never changes a V1
+camera default by itself.
+
+Run the head and scene stages on the RTX host only:
+
+```bash
+PYTHONPATH="$PWD" conda run -n unitree python -m \
+  evaluate.flip_table_simulation.real_to_sim_calibration.fk_first_camera_calibration head \
+  --source-root <pinned_snapshot> --episodes 184 250 --urdf <g1_dex1_urdf> \
+  --output-dir outputs/flip_table_real_to_sim/<run>/head
+PYTHONPATH="$PWD" conda run -n unitree python -m \
+  evaluate.flip_table_simulation.real_to_sim_calibration.fk_first_camera_calibration scene \
+  --source-root <pinned_snapshot> --urdf <g1_dex1_urdf> \
+  --head-report outputs/flip_table_real_to_sim/<run>/head/head_camera_calibration.json \
+  --stereo-calibration <head_camera_params.yaml> \
+  --output-dir outputs/flip_table_real_to_sim/<run>/scene
+```
+
+The head stage emits annotated source frames and
+`manual_keypoints.template.json`.  Correct only low-confidence or visibly
+wrong elbow/wrist/hand-base features, rerun with `--manual-keypoints`, and
+retain both reports.  The scene stage refuses to run until the head hold-out
+gate passes.  Before wrist fitting, regenerate D405 mask evidence from the
+pinned RGB on the RTX host; never reuse a rejected mask merely because it is
+available on disk:
+
+```bash
+FLIP_TABLE_HEAD_STEREO_CALIBRATION=<head_camera_params.yaml> \
+evaluate/flip_table_simulation/real_to_sim_calibration/run_fk_first_wrist_evidence.sh \
+  <pinned_snapshot> outputs/flip_table_real_to_sim/<run>/wrist_evidence 184 250
+```
+
+The wrist proposal remains rejected until both sides have a shared-offset
+fit and an independent held-out real-image gate.  Do not replace missing D405
+evidence with simulator images, scene truth, or a hand-tuned mount.
+
+The table CAD identifies a support-plane normal and height, but not a complete
+`root_from_workbench` pose when a known bench edge or fiducial is absent from
+both head images. The scene manifest records that non-identifiability instead
+of inventing an in-plane translation or yaw.
+
+For a D405 time-offset sweep, generate one self-contained manifest per offset.
+It retains the exact RGB bytes and changes only the FK row paired to each
+image; it never substitutes a shifted video frame:
+
+```bash
+PYTHONPATH="$PWD" conda run -n unitree python -m \
+  evaluate.flip_table_simulation.real_to_sim_calibration.wrist_time_offset_manifest \
+  --input-manifest outputs/flip_table_real_to_sim/<run>/wrist_evidence/input/episode-184/manifest.json \
+  --source-root <pinned_snapshot> --source-urdf <g1_dex1_urdf> \
+  --q-current-offset-frames -1 \
+  --output-dir outputs/flip_table_real_to_sim/<run>/wrist_offset/episode-184-qminus1
+```
 
 If table CAD/PnP residuals are too high to constrain a shared head mount, use
 the early arm motion visible in real head-left RGB as an independent *offline*
@@ -166,6 +263,26 @@ The resulting `episodes/anchor.json` is directly compatible with the existing
 `RecordedJointTargetPolicy` through its `recorded_upper_body_target_and_hand_cmd`
 field after extraction to the policy's `actions` schema:
 
+The default roles are selected deterministically from the complete numeric
+audit and then frozen in `calibration_manifest.json`. If a nominal calibration
+episode cannot yield three direct, stereo-consistent V1-CAD registrations, it
+is unavailable as camera evidence even when its motion score is high. Create
+a reviewed `team_ramen_flip_table_selection_override/v1` JSON with the
+replacement role, the rejected and accepted CAD reports, and the reason, then
+run the same full audit with:
+
+```bash
+conda run -n tv python -m evaluate.flip_table_simulation.real_to_sim_calibration.prepare \
+  --dataset-root <pinned_hf_snapshot> \
+  --output-dir outputs/flip_table_real_to_sim/<run_id> \
+  --eef-fk-audit <all_episode_eef_fk_audit.json> \
+  --selection-override <reviewed_visual_selection.json>
+```
+
+An override cannot add an unaudited, duplicate, or EEF/FK-ineligible episode.
+The manifest records its digest and evidence beside the complete numeric audit;
+it is selection provenance only, never a camera correction or a policy input.
+
 ```bash
 evaluate/flip_table_simulation/real_to_sim_calibration/run_anchor_replay.sh \
   outputs/flip_table_real_to_sim/<run_id>/episodes/anchor.json
@@ -173,6 +290,80 @@ evaluate/flip_table_simulation/real_to_sim_calibration/run_anchor_replay.sh \
 
 The runner bind-mounts only the generated replay JSON into the container and
 emits `joint_tracking_report.json`. It never mount-writes the source dataset.
+Recorded replays retain 50 Hz control/action-state traces and native requested
+RGB evidence, while `FLIP_TABLE_REPLAY_REVIEW_VIDEO_HZ=10` limits only the
+human-review MP4. The resulting trace records this video stride; it must never
+be used for time alignment or actuator fitting.
+
+For a deterministic free-space PD comparison, use
+`run_actuator_probe.sh BUNDLE OUTPUT_DIR SOURCE_FRAME_END STIFFNESS_SCALE DAMPING_SCALE [SOURCE_FRAME_START [ARMATURE_SCALE]]`.
+The two scales are equal-endpoint reset values relative to the immutable
+persistent-worker actuator foundation; `ARMATURE_SCALE` defaults to `1`.
+The probe preserves the real command
+stream, source clock, table mass, and full control trace; it only bounds the
+simulated prefix and samples the review MP4. Set armature and friction to
+their baseline values unless armature is the explicit identification variable,
+then rank candidates by the reported simulator-to-real encoder metric rather
+than MP4 appearance.
+
+Do not freeze a profile merely because it has the lowest replay RMSE.  Pass
+two or more distinct calibration reports to `actuator_profile_selection.py`,
+and attach a strict source-CAD static-precision report for each episode.  The
+selector rejects a shared default when the real RGB evidence cannot establish
+the required pre-contact precision; a `recommended_candidate: null` result is
+the correct outcome in that case, not permission to pick the lowest-RMSE
+candidate.  It remains an offline diagnostic and does not establish contact
+forces or held-out performance.
+
+To test that controller-identification boundary explicitly, create a separate
+output directory and retain the report beside its trace. Do not use this result
+to tune a policy or replace the WBC replay:
+
+```bash
+python -m evaluate.flip_table_simulation.real_to_sim_calibration.replay materialize \
+  --episode-bundle outputs/flip_table_real_to_sim/<run_id>/episodes/calibration_0250.json \
+  --output-dir outputs/flip_table_real_to_sim/<run_id>/full_body_diagnostic \
+  --full-body-diagnostic
+
+python -m evaluate.flip_table_simulation.real_to_sim_calibration.replay \
+  analyze-full-body-trace \
+  --trace outputs/flip_table_real_to_sim/<run_id>/full_body_diagnostic/eval/test_0/action_state_trace.jsonl \
+  --output outputs/flip_table_real_to_sim/<run_id>/full_body_diagnostic/report.json
+```
+
+The full-body report separates lower-body, upper-body, and Dex1 tracking from
+floating-base and table displacement. A root drop or drift is a failed
+controller-model hypothesis, not a condition to hide with a lock, teleport,
+attachment, or direct table manipulation.
+
+### Dex1 contact-path diagnostic
+
+Before fitting table friction or contact stiffness, verify that each Dex1
+finger can generate and sustain contact against a 40 mm diagnostic fixture.
+`Dex1ForceCalibrationPolicy` is intentionally available only through the
+isolated runner: the fixture is authored before Isaac starts and is never part
+of a replay or policy-evaluation scene. Its center is derived from measured
+official Dex1 collision-STL bounds plus runtime link FK; V1's instance proxies
+do not provide usable runtime USD bounds. The fixture remains static throughout
+the diagnostic. The report records each finger's 20 N-limited drive effort,
+contact-sensor force, opening, sustained contact duration, and its full
+trajectory in the fixed fixture frame. The trajectory distinguishes a genuine
+missing collision from a WBC/reset motion that carries a finger away from the
+fixture. A failed report is a collider/sensor or fixture-geometry problem to
+fix before contact-parameter fitting, not grounds for increasing friction or
+relaxing a manipulation metric.
+
+```bash
+FLIP_TABLE_POLICY_NAME=Dex1ForceCalibrationPolicy \
+FLIP_TABLE_EVAL_MODE=nominal \
+FLIP_TABLE_TEST_NUM=1 \
+FLIP_TABLE_TIME_OUT_LIMIT=20 \
+FLIP_TABLE_SIM_OUTPUT_DIR="$PWD/outputs/flip_table_real_to_sim/<run_id>" \
+evaluate/flip_table_simulation/run_eval.sh
+```
+
+This fixture is diagnostic-only: its collision forces, geometry, and pass/fail
+result must never be exposed to a policy, planner, reward, or runtime branch.
 
 ### Persistent Isaac replay worker
 
@@ -233,7 +424,11 @@ of reset/replay variables. It refuses unknown environment variables, absolute
 or escaping paths, stale `test_0` output, and a missing worker. An offline
 `FLIP_TABLE_CALIBRATION_TABLE_POSES_JSON` candidate is permitted per job and
 is applied once during that job's reset; the worker clears it before the next
-job and restores authored camera xforms. It is not a policy server and does
+job. Calibration wrappers also request
+`FLIP_TABLE_PERSISTENT_RECREATE_ENV=true`: this rebuilds the Gym/task
+environment while retaining `SimulationApp`, so authored USD transforms and
+task caches cannot leak from one candidate to the next without paying an Isaac
+cold-start. It is not a policy server and does
 not change the fixed USD, contact profile, or policy inputs while it is alive;
 restart it after changing those foundation settings.
 
@@ -325,6 +520,15 @@ pre-contact frames; partial and intermittently occluded rims are expected. The
 fitter accepts a proposal only when CAD support is temporally stable and the
 two head eyes agree. Its debug images show the actual registered CAD evidence.
 
+The source fitter uses the exact V1 CAD rim and leg axes only. It deliberately
+does not use the online policy's permissive quadrilateral/PnP fallback: an
+inner brace can look like a plausible rectangle in one eye but is not valid
+stereo calibration evidence. Since the recorded floating-base height is not a
+known table-body height, source calibration searches one fixed, bounded body-Z
+grid shared by every episode. This is an offline source-fit variable, not a
+runtime camera or policy feature; a frame without a direct CAD wireframe fit is
+reported unavailable rather than filled in with a monocular estimate.
+
 ```bash
 conda run -n tv env PYTHONPATH=$PWD python -m \
   evaluate.flip_table_simulation.real_to_sim_calibration.source_cad_alignment \
@@ -362,8 +566,9 @@ files.
 For initial-scene sweeps, run candidate resets in parallel rather than
 restarting Isaac Sim for every candidate. Each candidate is a workbench-local
 `[x, y, z]` offset plus tabletop yaw applied once at reset. A fixed-base replay
-candidate also records the source-matched robot root position and yaw, so table
-placement does not implicitly move G1 through the ordinary placement policy. A candidate may
+candidate also records the baseline V1 reset root position and yaw, so table
+placement does not implicitly move G1 through the ordinary placement policy.
+This is not a source-root estimate and is never updated after reset. A candidate may
 also carry one shared `head_stereo_offset_local_m` and
 `head_stereo_rotation_rpy_deg` applied identically to both head eyes. This is
 an offline mount-identification probe, not domain randomization: the value is
@@ -389,6 +594,17 @@ python -m evaluate.flip_table_simulation.real_to_sim_calibration.parallel_scene_
   --manifest outputs/flip_table_real_to_sim/<run_id>/parallel_probe/parallel_probe_manifest.json \
   --output outputs/flip_table_real_to_sim/<run_id>/parallel_probe/scores.json
 ```
+
+Each probe also saves a diagnostic scene trace. Before ranking image scores,
+run `source_projection_conformance.py` against that trace to prove that the
+candidate reset actually realized the requested camera and table transforms.
+This telemetry is offline-only and must never become a policy input.
+
+If a source-derived reset has a systematic realized table/camera residual,
+use `refine_scene_candidate_from_trace.py` once to produce a new candidate.
+It corrects only the reset offset and planar yaw, checks workbench support,
+and requires a fresh reset/render for validation; it is not a per-frame table
+correction and cannot be used by a policy, planner, or reward.
 
 This score only ranks a single RGB frame. Candidates whose PnP confidence or
 reprojection error fail the same geometry gate are placed after reliable
@@ -481,18 +697,34 @@ probe acceptance and its output is never a shared simulator default by itself:
 ```bash
 python -m evaluate.flip_table_simulation.real_to_sim_calibration.source_head_mount_consensus \
   --report outputs/flip_table_real_to_sim/<run_id>/source_head_mount_candidate_0250.json \
-  --report outputs/flip_table_real_to_sim/<run_id>/source_head_mount_candidate_0499.json \
+  --report outputs/flip_table_real_to_sim/<run_id>/source_head_mount_candidate_0509.json \
   --output outputs/flip_table_real_to_sim/<run_id>/source_head_mount_consensus.json
 ```
+
+`source_head_mount_candidate.py` emits an **incremental** correction around
+the reset candidate that produced its simulator trace. When a candidate
+already contains a non-zero head offset or RPY correction, the tool composes
+the increment instead of replacing those fields: the task-local translation
+is added and the intrinsic-XYZ rotation is left-composed
+(`R_increment @ R_candidate`). This prevents repeated offline calibration
+passes from silently discarding an earlier mounted-camera correction. The
+composition is recorded in every candidate report and remains reset-only
+evidence, never a runtime camera correction.
+
+The report carries this same candidate-relative value in both `correction`
+(the stable consensus-tool contract) and `incremental_correction` (its
+unambiguous semantic name). The consensus tool also reads older reports that
+only contain `incremental_correction`; it never treats either field as an
+absolute simulator camera setting.
 
 Compose that shared head correction with one episode-specific table reset only
 for a fixed-scene probe. This does not change the simulator default:
 
 ```bash
 python -m evaluate.flip_table_simulation.real_to_sim_calibration.fixed_scene_probe_candidate \
-  --scene-candidate outputs/flip_table_real_to_sim/<run_id>/source_scene_candidate_0499.json \
+  --scene-candidate outputs/flip_table_real_to_sim/<run_id>/source_scene_candidate_0509.json \
   --head-mount-consensus outputs/flip_table_real_to_sim/<run_id>/source_head_mount_consensus.json \
-  --output outputs/flip_table_real_to_sim/<run_id>/fixed_scene_probe_0499.json
+  --output outputs/flip_table_real_to_sim/<run_id>/fixed_scene_probe_0509.json
 ```
 
 For episodes where the tabletop is partly hidden during manipulation, the

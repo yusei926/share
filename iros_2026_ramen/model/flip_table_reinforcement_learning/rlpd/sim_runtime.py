@@ -14,8 +14,8 @@ POLICY_INPUTS = (
     "left D405 RGB 640x480",
     "right D405 RGB 640x480",
     "19D upper-body joint state",
-    "19D Flow Matching base target",
-    "previous 19D residual",
+    "16D Flow Matching arm/hand base target",
+    "previous 16D residual",
 )
 
 
@@ -61,6 +61,14 @@ def dataset_joint_state(env: Any) -> torch.Tensor:
     return state
 
 
+def action_target_from_state(state: torch.Tensor) -> torch.Tensor:
+    """Project observed waist3+arms14+hands2 into arms14+hands2."""
+
+    if state.ndim != 2 or state.shape[1] != 19:
+        raise ValueError(f"state must be [B,19], got {tuple(state.shape)}")
+    return torch.cat((state[:, 3:17], state[:, 17:19]), dim=1)
+
+
 @torch.no_grad()
 def settle_after_reset(
     gym_env: Any,
@@ -80,12 +88,13 @@ def settle_after_reset(
     if steps < 0:
         raise ValueError("reset settle steps cannot be negative")
     for step in range(steps):
-        hold_target = state_reader(env).detach().clone()
-        if hold_target.shape != (env.num_envs, 19):
+        state = state_reader(env).detach().clone()
+        if state.shape != (env.num_envs, 19):
             raise ValueError(
                 "reset hold state must have shape "
-                f"[{env.num_envs},19], got {tuple(hold_target.shape)}"
+                f"[{env.num_envs},19], got {tuple(state.shape)}"
             )
+        hold_target = action_target_from_state(state)
         if not torch.isfinite(hold_target).all():
             raise ValueError("reset hold state contains NaN or Inf")
         env._flip_table_rlpd_absolute_target = hold_target
@@ -113,9 +122,9 @@ class FlowTargetScheduler:
         if not 0.0 <= motion_gain <= 1.0:
             raise ValueError("Flow motion gain must be in [0, 1]")
         if motion_mask is not None and (
-            len(motion_mask) != 19 or any(value not in {0.0, 1.0} for value in motion_mask)
+            len(motion_mask) != 16 or any(value not in {0.0, 1.0} for value in motion_mask)
         ):
-            raise ValueError("Flow motion mask must contain exactly 19 binary values")
+            raise ValueError("Flow motion mask must contain exactly 16 binary values")
         self.flow = flow
         self.motion_gain = float(motion_gain)
         self.motion_mask = motion_mask
@@ -140,7 +149,7 @@ class FlowTargetScheduler:
         self.raw_anchor_target = None
         self.command_anchor_target = None
         raw_target = self.current(images, state)
-        if raw_target.shape != state.shape or target.shape != state.shape:
+        if raw_target.shape != (state.shape[0], 16) or target.shape != (state.shape[0], 16):
             raise ValueError(
                 "Flow target and anchor must match state "
                 f"{tuple(state.shape)}, got {tuple(raw_target.shape)} and {tuple(target.shape)}"
@@ -156,7 +165,7 @@ class FlowTargetScheduler:
     def anchor_to_state(self, images: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         """Re-anchor future Flow targets to a measured deployable joint state."""
 
-        return self.anchor_to_target(images, state, state)
+        return self.anchor_to_target(images, state, action_target_from_state(state))
 
     @torch.no_grad()
     def current(self, images: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
@@ -178,7 +187,7 @@ class FlowTargetScheduler:
                     self.motion_mask,
                     dtype=motion.dtype,
                     device=motion.device,
-                ).reshape(1, 19)
+                ).reshape(1, 16)
                 motion = motion * mask
             target = self.command_anchor_target + self.motion_gain * motion
         return target
@@ -222,16 +231,16 @@ def set_flow_control_ready(env: Any, ready: bool) -> None:
 
 
 def last_commanded_target(env: Any) -> torch.Tensor:
-    """Read the latest 19-D target emitted by the deployable action adapter."""
+    """Read the latest 16-D target emitted by the deployable WBC adapter."""
 
     value = getattr(env, "_flip_table_rlpd_last_commanded_target", None)
     if value is None:
         raise RuntimeError("action adapter has not published a commanded target")
     target = torch.as_tensor(value, dtype=torch.float32, device=env.device)
-    if target.shape != (env.num_envs, 19) or not torch.isfinite(target).all():
+    if target.shape != (env.num_envs, 16) or not torch.isfinite(target).all():
         raise ValueError(
             "latest commanded target must be finite and shaped "
-            f"[{env.num_envs},19], got {tuple(target.shape)}"
+            f"[{env.num_envs},16], got {tuple(target.shape)}"
         )
     return target.clone()
 

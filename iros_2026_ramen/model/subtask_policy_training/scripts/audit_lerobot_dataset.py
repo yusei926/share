@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 
 REQUIRED_CAMERAS = (
     "observation.images.cam_0",
+    "observation.images.cam_1",
     "observation.images.cam_2",
     "observation.images.cam_3",
 )
@@ -142,24 +143,40 @@ def audit_episode_metadata(
     source_counts = Counter(source_names)
     duplicate_sources = sorted(name for name, count in source_counts.items() if name and count > 1)
 
-    source_intervals: dict[str, list[tuple[float, float, int]]] = defaultdict(list)
+    source_intervals: dict[str, list[tuple[str, float, float, int]]] = defaultdict(list)
     invalid_source_intervals: list[int] = []
     for row in episodes:
-        start = float(row.get("source_start_sec", math.nan))
-        end = float(row.get("source_end_sec", math.nan))
         episode_index = int(row["episode_index"])
+        if "source_start_sec" in row and "source_end_sec" in row:
+            interval_kind = "seconds"
+            start = float(row["source_start_sec"])
+            end = float(row["source_end_sec"])
+        elif "source_frame_start" in row and "source_frame_end" in row:
+            interval_kind = "frames"
+            start = float(row["source_frame_start"])
+            end = float(row["source_frame_end"])
+        else:
+            interval_kind = "missing"
+            start = math.nan
+            end = math.nan
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             invalid_source_intervals.append(episode_index)
-        source_intervals[str(row.get("source_episode_name", ""))].append((start, end, episode_index))
+        source_intervals[str(row.get("source_episode_name", ""))].append(
+            (interval_kind, start, end, episode_index)
+        )
     if invalid_source_intervals:
-        errors.append(f"invalid source time ranges in episodes {invalid_source_intervals[:20]}")
+        errors.append(f"invalid source ranges in episodes {invalid_source_intervals[:20]}")
 
     overlaps: list[tuple[int, int]] = []
     for intervals in source_intervals.values():
         intervals.sort()
         for previous, current in zip(intervals, intervals[1:], strict=False):
-            if current[0] < previous[1]:
-                overlaps.append((previous[2], current[2]))
+            if previous[0] != current[0]:
+                errors.append(
+                    "source recording mixes frame and second provenance intervals"
+                )
+            elif current[1] < previous[2]:
+                overlaps.append((previous[3], current[3]))
     if overlaps:
         warnings.append(f"overlapping slices from the same source episode: {overlaps[:20]}")
 
@@ -207,6 +224,11 @@ def audit_episode_metadata(
     if "success" not in features and "next.done" not in features:
         warnings.append("no explicit per-episode success label; demonstration success needs visual audit")
 
+    curation_split_counts = Counter(
+        str(row["curation_split"])
+        for row in episodes
+        if str(row.get("curation_split", "")).strip()
+    )
     duration_s = lengths / fps if fps > 0 else np.full_like(lengths, np.nan, dtype=np.float64)
     summary = {
         "episodes": len(episodes),
@@ -215,6 +237,7 @@ def audit_episode_metadata(
         "tasks": tasks,
         "unique_source_episodes": len(source_counts),
         "duplicate_source_episode_names": duplicate_sources,
+        "curation_split_episode_counts": dict(sorted(curation_split_counts.items())),
         "episode_length_frames": distribution_summary(lengths.astype(np.float64)),
         "episode_duration_seconds": distribution_summary(duration_s.astype(np.float64)),
     }

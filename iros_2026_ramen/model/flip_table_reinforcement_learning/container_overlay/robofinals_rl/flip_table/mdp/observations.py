@@ -141,7 +141,7 @@ def controller_joint_velocity(env) -> torch.Tensor:
 
 
 def controller_action_prior(env) -> torch.Tensor:
-    """Return the fixed 19-D residual prior available to the real controller."""
+    """Return the fixed 16-D arm/hand prior available to the real controller."""
 
     schedule = action_prior_schedule(env)
     return action_prior_at_steps(schedule, as_torch(env.episode_length_buf).long())
@@ -183,7 +183,7 @@ class DemoPriorObservation(ManagerTermBase):
         # the policy input and evaluation RNG stream.
         current = controller_joint_state_raw(env)
         target, self._progress = phase_demo_targets(
-            current[:, :17],
+            current[:, 3:17],
             self._demo,
             self._progress,
             env.episode_length_buf,

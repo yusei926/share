@@ -37,10 +37,16 @@ def _load(path: Path) -> dict[str, Any]:
     if document.get("schema_version") != "team_ramen_flip_table_source_head_mount_candidate/v1":
         raise ValueError(f"{path} is not a source head-mount candidate")
     source = document.get("source_alignment")
-    correction = document.get("correction")
+    # Candidate reports created before the inter-tool field was restored
+    # called this same candidate-relative value ``incremental_correction``.
+    # Accept that schema-compatible spelling, normalize it locally, and do
+    # not reinterpret it as an absolute camera configuration.
+    correction = document.get("correction", document.get("incremental_correction"))
     if not isinstance(source, str) or not isinstance(correction, dict):
         raise ValueError(f"{path} has incomplete source head-mount provenance")
-    return document
+    normalized = dict(document)
+    normalized["correction"] = correction
+    return normalized
 
 
 def _rotation_from_rpy_deg(value: object, label: str) -> Rotation:

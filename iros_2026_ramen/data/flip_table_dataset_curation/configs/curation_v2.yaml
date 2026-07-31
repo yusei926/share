@@ -1,0 +1,62 @@
+schema_version: team_ramen_flip_table_curation_config/v1
+seed: 42
+source:
+  repo_id: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_1
+  revision: 10a6ec05f9993b8d59faad2957e47153b0f15f37
+  expected_episodes: 531
+  expected_frames: 290941
+  fps: 30
+target:
+  repo_id: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2
+  private: true
+  minimum_episodes: 100
+assets:
+  urdf_path: inference/orin/ros2_ws/src/g1_description/urdf/unitree_g1/g1_29dof_mode_15_with_dex1_1.urdf
+  urdf_sha256: 8c4a704db208d399ca851cd6cb3fee87038af144932449825c7d7cac1a1171ef
+  yolo_weight_path: model/yolo_obb/runs/m_lowaug_v3/weights/best.pt
+  yolo_weight_sha256: 37aa511a01883edc03d92b7564fc09f95a7be804b678b3212ac2a2255f5d4a21
+walking:
+  median_window_frames: 5
+  floor_tolerance_m: 0.015
+  maximum_contact_speed_m_s: 0.08
+  minimum_contact_seconds: 0.20
+  step_displacement_m: 0.04
+trim:
+  arm_velocity_threshold_rad_s: 0.08
+  hand_velocity_threshold_units_s: 0.25
+  persistence_window_frames: 9
+  persistence_active_frames: 5
+  pre_roll_frames: 30
+  post_roll_frames: 60
+  minimum_frames: 90
+  minimum_terminal_stable_frames: 15
+orientation:
+  sample_frames: 5
+  sample_window_frames: 30
+  confidence: 0.25
+  minimum_detection_fraction: 0.60
+  min_cluster_size: 20
+  min_samples: 10
+trajectory:
+  resample_points: 64
+  pca_variance: 0.95
+  pca_max_components: 32
+  min_cluster_size_floor: 20
+  min_cluster_fraction: 0.05
+  min_samples: 10
+  # Robust scale calibration for HDBSCAN's single-cluster case. This prevents
+  # a continuous dominant procedure from collapsing to exactly 20 core points.
+  cluster_selection_epsilon_quantile: 0.75
+  bootstrap_runs: 20
+  bootstrap_fraction: 0.90
+  minimum_stability: 0.80
+split:
+  train: 0.80
+  validation: 0.10
+  test: 0.10
+video:
+  codec: libx264
+  crf: 18
+  preset: fast
+  pixel_format: yuv420p
+  gop: 30

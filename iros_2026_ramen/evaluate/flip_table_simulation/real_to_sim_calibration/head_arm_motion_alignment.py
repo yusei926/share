@@ -19,7 +19,6 @@ from typing import Iterable
 
 import cv2
 import numpy as np
-import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -41,6 +40,9 @@ DEFAULT_URDF = Path(
 )
 _MOTION_DISTANCE_CAP_PX = 32.0
 _MOTION_SUPPORT_DISTANCE_PX = 8.0
+_IMAGE_WIDTH = 640
+_IMAGE_HEIGHT = 480
+_MAX_SAMPLES_PER_SEGMENT = 512
 ARM_FRAME_NAMES = {
     side: tuple(
         f"{side}_{joint}_link"
@@ -84,16 +86,50 @@ def motion_support_mask(before_bgr: np.ndarray, after_bgr: np.ndarray) -> np.nda
     return cv2.dilate(mask, np.ones((9, 9), dtype=np.uint8), iterations=1).astype(bool)
 
 
+def _clip_segment_to_image(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return the visible portion of a finite pixel segment, if any."""
+
+    if not np.isfinite(start).all() or not np.isfinite(end).all():
+        return None
+    magnitude = max(float(np.abs(start).max()), float(np.abs(end).max()))
+    if magnitude > np.finfo(np.float64).max / 2.0:
+        return None
+    delta = end - start
+    if not np.isfinite(delta).all():
+        return None
+    lower = np.zeros(2, dtype=np.float64)
+    upper = np.asarray((_IMAGE_WIDTH - 1.0, _IMAGE_HEIGHT - 1.0), dtype=np.float64)
+    enter, exit = 0.0, 1.0
+    for coordinate in range(2):
+        if abs(delta[coordinate]) < 1.0e-12:
+            if start[coordinate] < lower[coordinate] or start[coordinate] > upper[coordinate]:
+                return None
+            continue
+        first = (lower[coordinate] - start[coordinate]) / delta[coordinate]
+        second = (upper[coordinate] - start[coordinate]) / delta[coordinate]
+        interval_low, interval_high = min(first, second), max(first, second)
+        enter = max(enter, interval_low)
+        exit = min(exit, interval_high)
+        if enter > exit:
+            return None
+    return start + enter * delta, start + exit * delta
+
+
 def sample_projected_segments(pixels_by_side: dict[str, np.ndarray]) -> np.ndarray:
-    """Sample FK arm links densely enough for a distance-transform score."""
+    """Sample only visible FK arm-link segments for a bounded image score."""
 
     samples: list[np.ndarray] = []
     for pixels in pixels_by_side.values():
         for start, end in zip(pixels[:-1], pixels[1:], strict=True):
-            if not np.isfinite(start).all() or not np.isfinite(end).all():
+            clipped = _clip_segment_to_image(start, end)
+            if clipped is None:
                 continue
-            count = max(2, int(np.ceil(np.linalg.norm(end - start) / 2.0)))
-            samples.append(np.linspace(start, end, count, endpoint=True))
+            visible_start, visible_end = clipped
+            count = min(
+                _MAX_SAMPLES_PER_SEGMENT,
+                max(2, int(np.ceil(np.linalg.norm(visible_end - visible_start) / 2.0))),
+            )
+            samples.append(np.linspace(visible_start, visible_end, count, endpoint=True))
     if not samples:
         return np.empty((0, 2), dtype=np.float64)
     return np.concatenate(samples, axis=0)
@@ -236,10 +272,22 @@ def _load_states(
     camera: CameraConfig,
     image_root: Path,
     extracted_image_root: Path | None,
+    q_current_offset_frames: int = 0,
 ) -> tuple[FrameState, ...]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - CLI environment dependency
+        raise RuntimeError("pyarrow is required to load source episode parquet") from exc
+
     episode = SourceDatasetIndex(source_root).episode(episode_index)
+    q_frames = tuple(frame + q_current_offset_frames for frame in frames)
     if frames[0] < 0 or frames[-1] >= episode.frame_count:
         raise ValueError(f"frames must be inside source episode [0, {episode.frame_count})")
+    if q_frames[0] < 0 or q_frames[-1] >= episode.frame_count:
+        raise ValueError(
+            "q-current offset moves requested frames outside source episode "
+            f"[0, {episode.frame_count})"
+        )
     rows = pq.read_table(
         episode.data_path,
         columns=["frame_index", "observation.state.robot_q_current"],
@@ -251,9 +299,9 @@ def _load_states(
     }
     video = episode.video_slice(camera.source_key) if extracted_image_root is None else None
     states = []
-    for frame in frames:
-        if frame not in q_by_frame:
-            raise ValueError(f"source q_current is missing frame {frame}")
+    for frame, q_frame in zip(frames, q_frames, strict=True):
+        if q_frame not in q_by_frame:
+            raise ValueError(f"source q_current is missing frame {q_frame}")
         image_path = (
             extracted_image_root / f"frame_{frame:06d}.png"
             if extracted_image_root is not None
@@ -271,7 +319,7 @@ def _load_states(
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None or image.shape != (camera.height, camera.width, 3):
             raise ValueError(f"source image is not {camera.width}x{camera.height}: {image_path}")
-        states.append(FrameState(frame, q_by_frame[frame], image))
+        states.append(FrameState(frame, q_by_frame[q_frame], image))
     return tuple(states)
 
 
@@ -279,10 +327,14 @@ def _overlay(image: np.ndarray, pixels: dict[str, np.ndarray], color: tuple[int,
     output = image.copy()
     for chain in pixels.values():
         for start, end in zip(chain[:-1], chain[1:], strict=True):
+            clipped = _clip_segment_to_image(start, end)
+            if clipped is None:
+                continue
+            visible_start, visible_end = clipped
             cv2.line(
                 output,
-                tuple(np.rint(start).astype(int)),
-                tuple(np.rint(end).astype(int)),
+                tuple(np.rint(visible_start).astype(int)),
+                tuple(np.rint(visible_end).astype(int)),
                 color,
                 2,
                 cv2.LINE_AA,
@@ -312,6 +364,15 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--maxiter", type=int, default=12)
+    parser.add_argument(
+        "--q-current-offset-frames",
+        type=int,
+        default=0,
+        help=(
+            "offline video-to-encoder diagnostic; positive means q_current[t + offset] "
+            "is paired with RGB[t]. It never shifts a replay or policy stream."
+        ),
+    )
     args = parser.parse_args()
     if args.maxiter < 1:
         raise ValueError("--maxiter must be positive")
@@ -328,6 +389,7 @@ def main() -> None:
         camera,
         output / "source_frames",
         args.image_root.expanduser().resolve() if args.image_root is not None else None,
+        args.q_current_offset_frames,
     )
     projector = ArmProjector(args.urdf.expanduser().resolve(), camera)
     nominal = np.zeros(6, dtype=np.float64)
@@ -364,6 +426,8 @@ def main() -> None:
         "policy_use": "forbidden: offline camera-identifiability diagnostic only",
         "source_episode_index": args.episode_index,
         "source_frames": list(frames),
+        "q_current_index_minus_video_frame": args.q_current_offset_frames,
+        "q_current_offset_s": args.q_current_offset_frames / 30.0,
         "camera_source_key": camera.source_key,
         "optimization": {
             "method": "differential_evolution on real RGB inter-frame motion support",
@@ -380,6 +444,7 @@ def main() -> None:
         "decision": "diagnostic_only_requires_cross_episode_consensus_and_heldout_rgb",
         "limitations": [
             "Motion support can contain table or exposure changes, so this tool cannot alone accept a camera mount.",
+            "The offset is an offline diagnostic; it must not shift source RGB, labels, or replay timing.",
             "No table pose, simulator ground truth, or policy-only signal is used in this score.",
             "The output correction is expressed at the source camera centre and is not a RoboFinals rig parameter until separately converted and verified.",
         ],

@@ -30,7 +30,9 @@ def restore_base_model_paths(root: Path, *, runtime_path: str, canonical_path: s
     changed = 0
     for path in sorted(root.rglob("config.json")):
         config = read_json(path)
-        if config.get("type") != "groot" or config.get("base_model_path") != runtime_path:
+        if config.get("type") not in {"groot", "furniture_groot"} or config.get(
+            "base_model_path"
+        ) != runtime_path:
             continue
         config["base_model_path"] = canonical_path
         temporary = path.with_suffix(path.suffix + ".tmp")

@@ -47,8 +47,39 @@ def _read_rgb(path: Path) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def table_silhouette(rgb: np.ndarray) -> np.ndarray:
-    """Return a conservative white-table mask for cross-domain comparison."""
+def _exclusion_mask(value: np.ndarray | None) -> np.ndarray | None:
+    """Validate an optional offline robot-occupancy exclusion mask."""
+
+    if value is None:
+        return None
+    mask = np.asarray(value)
+    if mask.shape != (480, 640):
+        raise ValueError("robot exclusion mask must be 480x640")
+    if mask.dtype == bool:
+        return mask
+    if not np.issubdtype(mask.dtype, np.number) or not np.isfinite(mask).all():
+        raise ValueError("robot exclusion mask must be finite")
+    return mask > 0
+
+
+def _read_mask(path: Path) -> np.ndarray:
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None or image.shape != (480, 640):
+        raise ValueError(f"expected 640x480 robot exclusion mask: {path}")
+    return image > 0
+
+
+def table_silhouette(
+    rgb: np.ndarray,
+    *,
+    robot_exclusion_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return a conservative RGB table mask, excluding known robot pixels.
+
+    The exclusion is generated from measured joints and a pinned robot visual
+    model outside this module.  It is not a table-CAD render and therefore
+    cannot make a candidate camera/table pose look correct by construction.
+    """
 
     source = TabletopPoseEstimator.segment_table_assembly(rgb)
     mask = np.zeros_like(source, dtype=np.uint8)
@@ -58,6 +89,9 @@ def table_silhouette(rgb: np.ndarray) -> np.ndarray:
     # filled tabletop rectangle.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    exclusion = _exclusion_mask(robot_exclusion_mask)
+    if exclusion is not None:
+        mask[exclusion] = 0
     return (mask > 0).astype(np.uint8)
 
 
@@ -79,19 +113,45 @@ def _iou(first: np.ndarray, second: np.ndarray) -> float:
     return float(np.logical_and(first > 0, second > 0).sum() / union.sum())
 
 
-def compare_images(real_path: Path, simulated_path: Path) -> dict[str, Any]:
+def compare_images(
+    real_path: Path,
+    simulated_path: Path,
+    *,
+    real_robot_mask: Path | None = None,
+    simulated_robot_mask: Path | None = None,
+) -> dict[str, Any]:
     """Compare a real/sim head image without assuming a PnP corner fit."""
 
-    real_mask = table_silhouette(_read_rgb(real_path))
-    simulated_mask = table_silhouette(_read_rgb(simulated_path))
+    real_exclusion = None if real_robot_mask is None else _read_mask(real_robot_mask)
+    simulated_exclusion = (
+        None if simulated_robot_mask is None else _read_mask(simulated_robot_mask)
+    )
+    real_mask = table_silhouette(
+        _read_rgb(real_path), robot_exclusion_mask=real_exclusion
+    )
+    simulated_mask = table_silhouette(
+        _read_rgb(simulated_path), robot_exclusion_mask=simulated_exclusion
+    )
     real_edge, simulated_edge = _edge(real_mask), _edge(simulated_mask)
     real_to_sim = _mean_distance(real_edge, simulated_edge)
     sim_to_real = _mean_distance(simulated_edge, real_edge)
     return {
-        "schema_version": "team_ramen_table_silhouette_alignment/v1",
+        "schema_version": "team_ramen_table_silhouette_alignment/v2",
         "policy_use": "forbidden: offline camera/scene calibration only",
         "real_image": str(real_path),
         "simulated_image": str(simulated_path),
+        "real_robot_exclusion_mask": (
+            None if real_robot_mask is None else str(real_robot_mask)
+        ),
+        "simulated_robot_exclusion_mask": (
+            None if simulated_robot_mask is None else str(simulated_robot_mask)
+        ),
+        "real_robot_exclusion_fraction": (
+            0.0 if real_exclusion is None else float(real_exclusion.mean())
+        ),
+        "simulated_robot_exclusion_fraction": (
+            0.0 if simulated_exclusion is None else float(simulated_exclusion.mean())
+        ),
         "roi_xyxy": [_ROI_X0, _ROI_Y0, _ROI_X1, _ROI_Y1],
         "real_mask_fraction": float(real_mask.mean()),
         "simulated_mask_fraction": float(simulated_mask.mean()),
@@ -102,10 +162,28 @@ def compare_images(real_path: Path, simulated_path: Path) -> dict[str, Any]:
     }
 
 
-def _debug_overlay(real_path: Path, simulated_path: Path, output: Path) -> None:
+def _debug_overlay(
+    real_path: Path,
+    simulated_path: Path,
+    output: Path,
+    *,
+    real_robot_mask: Path | None = None,
+    simulated_robot_mask: Path | None = None,
+) -> None:
     real = _read_rgb(real_path)
     simulated = _read_rgb(simulated_path)
-    real_mask, simulated_mask = table_silhouette(real), table_silhouette(simulated)
+    real_mask = table_silhouette(
+        real,
+        robot_exclusion_mask=(
+            None if real_robot_mask is None else _read_mask(real_robot_mask)
+        ),
+    )
+    simulated_mask = table_silhouette(
+        simulated,
+        robot_exclusion_mask=(
+            None if simulated_robot_mask is None else _read_mask(simulated_robot_mask)
+        ),
+    )
     overlay = np.zeros_like(real)
     overlay[..., 0] = real_mask * 255
     overlay[..., 1] = simulated_mask * 255
@@ -121,11 +199,40 @@ def main() -> None:
     parser.add_argument("--simulated", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--debug-overlay", type=Path)
+    parser.add_argument(
+        "--real-robot-mask",
+        type=Path,
+        help="optional projected real robot-occupancy mask; offline calibration only",
+    )
+    parser.add_argument(
+        "--simulated-robot-mask",
+        type=Path,
+        help="optional projected simulator robot-occupancy mask; offline calibration only",
+    )
     args = parser.parse_args()
-    result = compare_images(args.real.expanduser().resolve(), args.simulated.expanduser().resolve())
+    real_robot_mask = (
+        None if args.real_robot_mask is None else args.real_robot_mask.expanduser().resolve()
+    )
+    simulated_robot_mask = (
+        None
+        if args.simulated_robot_mask is None
+        else args.simulated_robot_mask.expanduser().resolve()
+    )
+    result = compare_images(
+        args.real.expanduser().resolve(),
+        args.simulated.expanduser().resolve(),
+        real_robot_mask=real_robot_mask,
+        simulated_robot_mask=simulated_robot_mask,
+    )
     atomic_write_json(args.output.expanduser().resolve(), result)
     if args.debug_overlay is not None:
-        _debug_overlay(args.real.expanduser().resolve(), args.simulated.expanduser().resolve(), args.debug_overlay)
+        _debug_overlay(
+            args.real.expanduser().resolve(),
+            args.simulated.expanduser().resolve(),
+            args.debug_overlay,
+            real_robot_mask=real_robot_mask,
+            simulated_robot_mask=simulated_robot_mask,
+        )
     print(json.dumps(result, indent=2))
 
 

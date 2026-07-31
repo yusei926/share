@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from model.subtask_policy_training.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
-from model.subtask_policy_training.flow_matching.data import load_episode_split
+from model.subtask_policy_training.flow_matching.data import (
+    load_episode_split,
+    valid_training_sample_indices,
+)
 
 
 def stats(size: int) -> dict[str, list[float]]:
@@ -36,10 +39,23 @@ def small_config() -> FlowMatchingConfig:
 
 
 def test_config_enforces_upper_body_contract():
-    with pytest.raises(ValueError, match="19-D"):
+    with pytest.raises(ValueError, match="19-D observed state and 16-D"):
         FlowMatchingConfig(state_dim=18)
+    with pytest.raises(ValueError, match="19-D observed state and 16-D"):
+        FlowMatchingConfig(action_dim=19)
     with pytest.raises(ValueError, match="within"):
         FlowMatchingConfig(action_horizon=4, n_action_steps=5)
+
+
+def test_invalid_camera_rows_remove_history_and_action_windows():
+    valid = [True, True, False, True, True, True, True, True]
+    episodes = [0, 0, 0, 0, 1, 1, 1, 1]
+    assert valid_training_sample_indices(
+        valid,
+        episodes,
+        action_horizon=2,
+        history_frames=2,
+    ) == [0, 4, 5, 6, 7]
 
 
 def test_flow_loss_sampling_and_checkpoint_roundtrip(tmp_path):
@@ -48,19 +64,19 @@ def test_flow_loss_sampling_and_checkpoint_roundtrip(tmp_path):
     model = FlowMatchingPolicy(
         config,
         state_stats=stats(19),
-        action_stats=stats(19),
+        action_stats=stats(16),
         load_pretrained_encoder=False,
     ).eval()
     images = torch.rand(2, 3, 3, 48, 64)
     state = torch.rand(2, 19)
-    actions = torch.rand(2, 4, 19)
+    actions = torch.rand(2, 4, 16)
     padding = torch.tensor([[False, False, False, False], [False, False, True, True]])
 
     loss = model.flow_loss(images, state, actions, padding)
     assert loss.ndim == 0
     assert torch.isfinite(loss)
     sampled = model.sample_actions(images, state)
-    assert sampled.shape == (2, 4, 19)
+    assert sampled.shape == (2, 4, 16)
     assert torch.isfinite(sampled).all()
     assert sampled.min() >= -2.0
     assert sampled.max() <= 2.0
@@ -71,7 +87,7 @@ def test_flow_loss_sampling_and_checkpoint_roundtrip(tmp_path):
     torch.testing.assert_close(sampled, restored_sample)
     metadata = json.loads((tmp_path / "flow_matching_policy.json").read_text())
     assert metadata["privileged_inputs"] == []
-    assert metadata["policy_output"].startswith("19D upper-body")
+    assert metadata["policy_output"].startswith("16D arm/hand")
 
 
 def test_episode_split_rejects_overlap(tmp_path):

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lerobot_policy_furniture_groot"
+version = "0.1.0"
+description = "GR00T N1.7 flip-table policy with a diagnostic FurnitureVLA-style progress head"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["lerobot_policy_furniture_groot"]

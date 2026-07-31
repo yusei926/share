@@ -88,7 +88,13 @@ def test_policy_uploader_validates_processor_state_files(tmp_path: Path) -> None
         "upload_policy_processor_contract",
         ROOT / "scripts" / "upload_policy.py",
     )
-    for name in ("config.json", "train_config.json"):
+    for name in (
+        "config.json",
+        "evaluation_report.json",
+        "train_config.json",
+        "training_manifest.json",
+        "training_run_record.json",
+    ):
         (tmp_path / name).write_text("{}", encoding="utf-8")
     (tmp_path / "model.safetensors").write_bytes(b"model")
     (tmp_path / "policy_preprocessor.json").write_text(
@@ -120,6 +126,59 @@ def test_policy_uploader_validates_processor_state_files(tmp_path: Path) -> None
     (tmp_path / "policy_preprocessor.json").write_text(json.dumps(processor), encoding="utf-8")
     with pytest.raises(ValueError, match="escapes model directory"):
         module.validate_model_dir(tmp_path)
+
+
+def test_policy_uploader_requires_finalized_furniture_groot_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_module(
+        "upload_policy_furniture_groot_contract",
+        ROOT / "scripts" / "upload_policy.py",
+    )
+    for name in module.REQUIRED_POLICY_FILES:
+        if name.endswith(".json"):
+            payload = {"type": "furniture_groot"} if name == "config.json" else {}
+            (tmp_path / name).write_text(json.dumps(payload), encoding="utf-8")
+        else:
+            (tmp_path / name).write_bytes(b"model")
+    for processor_name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+        (tmp_path / processor_name).write_text(
+            json.dumps({"steps": []}),
+            encoding="utf-8",
+        )
+    for name in (
+        "candidate_selection.json",
+        "dex1_g1_synergy.json",
+        "groot_contract.json",
+        "orientation_contact_sheet.approved",
+        "orientation_contact_sheet.jpg",
+        "progress_manifest.json",
+        "progress.jsonl",
+        "sim_candidate_selection.json",
+        "sim_evaluation_manifest.json",
+        "sim_release_evaluation.json",
+        "source_snapshot_manifest.json",
+        "visual_rotation_manifest.json",
+        "visual_rotation.jsonl",
+    ):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="eef_fk_audit.json"):
+        module.validate_model_dir(tmp_path)
+
+    (tmp_path / "eef_fk_audit.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="simulator evaluation bundle"):
+        module.validate_model_dir(tmp_path)
+    (tmp_path / "sim_evaluation").mkdir()
+    validated: list[Path] = []
+    monkeypatch.setattr(
+        module,
+        "validate_finalized_furniture_checkpoint",
+        lambda path: validated.append(path),
+    )
+    module.validate_model_dir(tmp_path)
+    assert validated == [tmp_path]
 
 
 def test_resolve_default_training_config(monkeypatch) -> None:
@@ -174,7 +233,7 @@ def test_resolve_default_training_config(monkeypatch) -> None:
     assert values["UPLOAD_AFTER_TRAIN"] == "true"
     assert values["CONTROL_SCOPE"] == "upper_body"
     assert values["STATE_DIM"] == "19"
-    assert values["ACTION_DIM"] == "19"
+    assert values["ACTION_DIM"] == "16"
     assert values["CAMERAS"] == "head_left,left_wrist,right_wrist"
     assert values["MATERIALIZE_TRAINING_VIEW"] == "true"
     assert values["TRAINING_VIEW_ROOT"] == "outputs/training_views/act_pick_leg"
@@ -191,7 +250,7 @@ def test_resolve_default_training_config(monkeypatch) -> None:
         "observation.images.left_wrist": "observation.images.cam_2",
         "observation.images.right_wrist": "observation.images.cam_3",
     }
-    assert values["POLICY_VIEW_LAYOUT"] == "robot_q_upper_body_19d"
+    assert values["POLICY_VIEW_LAYOUT"] == "robot_q_state19_action16"
     input_features = json.loads(values["POLICY_INPUT_FEATURES"])
     output_features = json.loads(values["POLICY_OUTPUT_FEATURES"])
     assert list(input_features) == [
@@ -206,7 +265,7 @@ def test_resolve_default_training_config(monkeypatch) -> None:
         "shape": [3, 480, 640],
     }
     assert input_features["observation.state"] == {"type": "STATE", "shape": [19]}
-    assert output_features == {"action": {"type": "ACTION", "shape": [19]}}
+    assert output_features == {"action": {"type": "ACTION", "shape": [16]}}
     assert "GROOT_BASE_MODEL_PATH" not in values
 
 
@@ -236,7 +295,7 @@ def test_resolve_flow_matching_defaults(monkeypatch) -> None:
 
     assert values["CONTROL_SCOPE"] == "upper_body"
     assert values["STATE_DIM"] == "19"
-    assert values["ACTION_DIM"] == "19"
+    assert values["ACTION_DIM"] == "16"
     assert values["FLOW_ACTION_HORIZON"] == "24"
     assert values["FLOW_N_ACTION_STEPS"] == "6"
     assert values["FLOW_INFERENCE_STEPS"] == "10"
@@ -285,9 +344,12 @@ def test_resolve_groot_n17_defaults(monkeypatch) -> None:
 
     values = module.resolve(config)
 
-    assert values["DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_1"
-    assert values["GROOT_DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_1"
-    assert values["POLICY_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_1"
+    assert values["DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
+    assert values["DATASET_REVISION"] == "0dc47877dfb2efbea796a059c81290c649bc773c"
+    assert values["GROOT_DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
+    assert values["POLICY_REPO_ID"] == (
+        "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2"
+    )
     assert values["WANDB_PROJECT"] == "iros2026-ramen-flip-table"
     assert values["CONTROL_SCOPE"] == "upper_body_relative_eef"
     assert values["STATE_DIM"] == "49"
@@ -305,8 +367,18 @@ def test_resolve_groot_n17_defaults(monkeypatch) -> None:
     assert values["GROOT_BASE_MODEL_PATH"] == "nvidia/GR00T-N1.7-3B"
     assert values["GROOT_BASE_MODEL_REVISION"] == "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
     assert values["GROOT_EMBODIMENT_TAG"] == "real_g1_relative_eef_relative_joints"
-    assert values["GROOT_CHUNK_SIZE"] == "16"
-    assert values["GROOT_N_ACTION_STEPS"] == "16"
+    assert values["GROOT_POLICY_IMPL"] == "furniture_groot"
+    assert values["GROOT_CHUNK_SIZE"] == "40"
+    assert values["GROOT_N_ACTION_STEPS"] == "10"
+    assert values["GROOT_VALID_ACTION_DIM"] == "46"
+    assert values["GROOT_TUNE_TOP_LLM_LAYERS"] == "0"
+    assert values["GROOT_PROGRESS_ENABLED"] == "true"
+    assert values["GROOT_PROGRESS_LOSS_WEIGHT"] == "0.050000000000000003"
+    assert values["GROOT_PROGRESS_MONOTONICITY_WEIGHT"] == "0.01"
+    assert values["GROOT_PROGRESS_HIDDEN_DIM"] == "512"
+    assert values["GROOT_PROGRESS_SIDECAR"] == (
+        "outputs/progress_sidecars/flip_table_v2/progress.jsonl"
+    )
     assert values["GROOT_USE_RELATIVE_ACTIONS"] == "true"
     assert values["GROOT_RELATIVE_EXCLUDE_JOINTS"] == '["hand","waist","base_height","navigate"]'
     assert values["GROOT_REQUIRE_NATIVE_RELATIVE_EEF_PROCESSOR"] == "true"
@@ -314,9 +386,30 @@ def test_resolve_groot_n17_defaults(monkeypatch) -> None:
         "outputs/groot_base_overlays/real_g1_relative_eef_3cam"
     )
     assert values["GROOT_USE_BF16"] == "true"
-    assert values["GROOT_IMAGE_TRANSFORMS_ENABLE"] == "true"
+    assert values["GROOT_IMAGE_TRANSFORMS_ENABLE"] == "false"
+    assert values["GROOT_CONSISTENT_GPU_AUGMENTATION"] == "true"
     assert values["GROOT_BATCH_SIZE"] == "64"
     assert values["GROOT_STEPS"] == "20000"
+    assert values["GROOT_WARMUP_STEPS"] == "1000"
+
+
+def test_resolve_groot_warmup_steps_follow_training_length(monkeypatch) -> None:
+    module = load_module(
+        "resolve_training_config_warmup",
+        ROOT / "scripts" / "resolve_training_config.py",
+    )
+    config = module.load_config(ROOT / "configs" / "subtask_training.json")
+
+    monkeypatch.setenv("POLICY_TYPE", "groot")
+    monkeypatch.setenv("GROOT_STEPS", "1000")
+    monkeypatch.setenv("GROOT_WARMUP_RATIO", "0.05")
+
+    values = module.resolve(config)
+
+    assert values["GROOT_WARMUP_STEPS"] == "50"
+    script = (ROOT / "scripts" / "train_lerobot.sh").read_text(encoding="utf-8")
+    assert '--policy.max_steps="$GROOT_STEPS"' in script
+    assert "--scheduler.num_warmup_steps" not in script
 
 
 def test_resolve_groot_n17_allows_temporal_overrides_but_not_slot_semantics(monkeypatch) -> None:
@@ -336,6 +429,19 @@ def test_resolve_groot_n17_allows_temporal_overrides_but_not_slot_semantics(monk
 
     monkeypatch.setenv("GROOT_RELATIVE_EXCLUDE_JOINTS", '["left_gripper","right_gripper"]')
     with pytest.raises(ValueError, match="must be exactly"):
+        module.resolve(config)
+
+
+def test_resolve_groot_n17_forbids_unfreezing_top_llm_layers(monkeypatch) -> None:
+    module = load_module(
+        "resolve_training_config_tuning_scope",
+        ROOT / "scripts" / "resolve_training_config.py",
+    )
+    config = module.load_config(ROOT / "configs" / "subtask_training.json")
+    monkeypatch.setenv("POLICY_TYPE", "groot")
+    monkeypatch.setenv("GROOT_TUNE_TOP_LLM_LAYERS", "1")
+
+    with pytest.raises(ValueError, match="tuning scope"):
         module.resolve(config)
 
 
@@ -395,6 +501,7 @@ def test_train_wrapper_passes_policy_feature_overrides() -> None:
     assert "prepare_groot_n17_real_g1_overlay.py" in script
     assert "patch_lerobot_groot_relative_eef.py --check" in script
     assert "restore_groot_base_model_path.py" in script
+    assert '--policy.tune_top_llm_layers="$GROOT_TUNE_TOP_LLM_LAYERS"' in script
     assert '--dataset.root="$TRAINING_VIEW_ROOT"' in script
 
 
@@ -427,7 +534,7 @@ def test_lerobot_training_view_materializer_maps_official_schema() -> None:
         policy_type="act",
     )
     assert state_rows == [[float(i) for i in range(19, 38)]]
-    assert action_rows == [[float(i) for i in range(119, 138)]]
+    assert action_rows == [[float(i) for i in range(122, 138)]]
 
     state_rows, action_rows = module.build_policy_vectors_from_table(
         table,
@@ -437,16 +544,195 @@ def test_lerobot_training_view_materializer_maps_official_schema() -> None:
     assert len(state_rows[0]) == 49
     assert len(action_rows[0]) == 53
     assert state_rows[0][0:9] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-    assert state_rows[0][18:25] == [36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    synergy = load_module("dex1_hand_synergy", ROOT / "gr00t" / "dex1_hand_synergy.py")
+    assert state_rows[0][18:25] == pytest.approx(
+        synergy.dex1_to_hand(36.0, side="left", kind="state")
+    )
     assert state_rows[0][32:39] == [22, 23, 24, 25, 26, 27, 28]
     assert state_rows[0][39:46] == [29, 30, 31, 32, 33, 34, 35]
     assert state_rows[0][46:49] == [19, 20, 21]
     assert action_rows[0][0:9] == [1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-    assert action_rows[0][18:25] == [136.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert action_rows[0][18:25] == pytest.approx(
+        synergy.dex1_to_hand(136.0, side="left", kind="action")
+    )
     assert action_rows[0][32:39] == [122, 123, 124, 125, 126, 127, 128]
     assert action_rows[0][39:46] == [129, 130, 131, 132, 133, 134, 135]
     assert action_rows[0][46:49] == [119, 120, 121]
     assert action_rows[0][49:53] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_delta_action_contract_encodes_and_decodes_chunk_boundaries() -> None:
+    from model.subtask_policy_training import delta_action
+
+    state = [0.0, 0.0, 0.0] + [float(index) for index in range(14)] + [0.2, 0.3]
+    first_target = [float(index + 10) for index in range(14)] + [1.1, 1.2]
+    second_target = [float(index + 12) for index in range(14)] + [1.3, 1.4]
+
+    first = delta_action.encode_action(
+        state=state, absolute_action=first_target, previous_arm_target=None
+    )
+    second = delta_action.encode_action(
+        state=state,
+        absolute_action=second_target,
+        previous_arm_target=first_target[:14],
+    )
+
+    assert first[:14] == [10.0] * 14
+    assert second[:14] == [2.0] * 14
+    assert first[14:] == [1.1, 1.2]
+    assert second[14:] == [1.3, 1.4]
+    assert delta_action.decode_action_chunk(initial_state=state, delta_actions=[first, second]) == [
+        first_target,
+        second_target,
+    ]
+
+
+def test_materializer_delta_resets_at_episode_boundaries_and_keeps_gripper_absolute() -> None:
+    module = load_module(
+        "materialize_lerobot_training_view_delta",
+        ROOT / "scripts" / "materialize_lerobot_training_view.py",
+    )
+    pa = __import__("pyarrow")
+    config = json.loads((ROOT / "configs" / "subtask_training.json").read_text())
+    table = pa.table(
+        {
+            "observation.state.robot_q_current": [
+                [float(index) for index in range(36)],
+                [float(index) for index in range(36)],
+                [float(index + 20) for index in range(36)],
+            ],
+            "observation.state.hand_state": [[0.0, 0.0]] * 3,
+            "action.robot_q_desired": [
+                [float(index + 100) for index in range(36)],
+                [float(index + 102) for index in range(36)],
+                [float(index + 300) for index in range(36)],
+            ],
+            "action.hand_cmd": [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+            "timestamp": [0.0, 1.0 / 30.0, 0.0],
+            "frame_index": [0, 1, 0],
+            "episode_index": [10, 10, 11],
+            "index": [0, 1, 2],
+            "task_index": [0, 0, 0],
+        }
+    )
+
+    state_rows, action_rows = module.build_policy_vectors_from_table(
+        table,
+        config=config,
+        policy_type="act",
+        action_representation="arm_delta_gripper_absolute",
+    )
+
+    assert state_rows[0][3:17] == [float(index) for index in range(22, 36)]
+    assert action_rows[0][:14] == [100.0] * 14
+    assert action_rows[1][:14] == [2.0] * 14
+    assert action_rows[2][:14] == [300.0 - 20.0] * 14
+    assert action_rows[0][14:] == [1.0, 2.0]
+    assert action_rows[1][14:] == [3.0, 4.0]
+    assert action_rows[2][14:] == [5.0, 6.0]
+
+
+def test_fixed_heldout_split_has_no_validation_or_training_leakage(tmp_path) -> None:
+    materializer = load_module(
+        "materialize_lerobot_training_view_fixed_split",
+        ROOT / "scripts" / "materialize_lerobot_training_view.py",
+    )
+    resolver = load_module(
+        "resolve_training_split_fixed_split",
+        ROOT / "scripts" / "resolve_training_split.py",
+    )
+    pq = __import__("pyarrow.parquet", fromlist=["parquet"])
+    pa = __import__("pyarrow")
+    config = json.loads((ROOT / "configs" / "subtask_training.json").read_text())
+    episode_path = tmp_path / "source" / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episode_path.parent.mkdir(parents=True)
+    (tmp_path / "source" / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 10}), encoding="utf-8"
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": list(range(10)),
+                "tasks": [["flip table"] for _ in range(10)],
+                "source_episode_name": [f"recording_{index:02d}" for index in range(10)],
+            }
+        ),
+        episode_path,
+    )
+
+    split = materializer.build_grouped_episode_split(
+        tmp_path / "source",
+        config=config,
+        pq=pq,
+        validation_fraction=0.0,
+        heldout_episode_indices=[2, 7],
+    )
+    assert split["splits"]["test"]["episode_indices"] == [2, 7]
+    assert split["splits"]["validation"]["episode_indices"] == []
+    assert 2 not in split["splits"]["train"]["episode_indices"]
+    assert 7 not in split["splits"]["train"]["episode_indices"]
+    assert split["fractions"] == {"train": 0.8, "validation": 0.0, "test": 0.2}
+
+    dataset_root = tmp_path / "view"
+    split_path = dataset_root / resolver.SPLIT_PATH
+    split_path.parent.mkdir(parents=True)
+    split_path.write_text(json.dumps(split), encoding="utf-8")
+    resolved = resolver.resolve_split(dataset_root, allow_empty_validation=True)
+    assert resolved["DATASET_EVAL_SPLIT"] == "0"
+    assert resolved["VALIDATION_EPISODE_COUNT"] == 0
+
+
+def test_fixed_training_and_heldout_splits_leave_other_episodes_unused(tmp_path) -> None:
+    materializer = load_module(
+        "materialize_lerobot_training_view_fixed_train_split",
+        ROOT / "scripts" / "materialize_lerobot_training_view.py",
+    )
+    pq = __import__("pyarrow.parquet", fromlist=["parquet"])
+    pa = __import__("pyarrow")
+    config = json.loads((ROOT / "configs" / "subtask_training.json").read_text())
+    episode_path = tmp_path / "source" / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episode_path.parent.mkdir(parents=True)
+    (tmp_path / "source" / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 6}), encoding="utf-8"
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": list(range(6)),
+                "tasks": [["flip table"] for _ in range(6)],
+                "source_episode_name": [f"recording_{index:02d}" for index in range(6)],
+            }
+        ),
+        episode_path,
+    )
+
+    split = materializer.build_grouped_episode_split(
+        tmp_path / "source",
+        config=config,
+        pq=pq,
+        validation_fraction=0.0,
+        training_episode_indices=[0, 1, 2],
+        heldout_episode_indices=[4, 5],
+    )
+
+    assert split["splits"]["train"]["episode_indices"] == [0, 1, 2]
+    assert split["splits"]["validation"]["episode_indices"] == []
+    assert split["splits"]["test"]["episode_indices"] == [4, 5]
+
+
+def test_chunk_reset_metrics_are_zero_for_exact_decoded_targets() -> None:
+    evaluator = load_module(
+        "evaluate_delta_chunk_reset", ROOT / "scripts" / "evaluate_delta_chunk_reset.py"
+    )
+    target = __import__("numpy").asarray(
+        [[float(index) for index in range(16)], [float(index + 1) for index in range(16)]],
+        dtype="float32",
+    )
+    metrics = evaluator.compute_metrics(target, target.copy())
+    assert metrics["arm_rmse_rad"] == 0.0
+    assert metrics["arm_p95_abs_error_rad"] == 0.0
+    assert metrics["gripper_mae"] == 0.0
+    assert metrics["gripper_transition_f1"] == 1.0
 
 
 def test_materializer_rejects_nonfinite_source_values() -> None:
@@ -505,6 +791,51 @@ def test_grouped_split_is_disjoint_and_resolves_for_lerobot(tmp_path) -> None:
     assert math.ceil(len(selected) * float(resolved["DATASET_EVAL_SPLIT"])) == len(
         episode_sets["validation"]
     )
+
+
+def test_overfit_split_is_a_checked_subset_and_keeps_test_unused(tmp_path) -> None:
+    resolver = load_module(
+        "resolve_training_split_overfit",
+        ROOT / "scripts" / "resolve_training_split.py",
+    )
+    payload = {
+        "schema_version": "team_ramen_grouped_episode_split_v1",
+        "splits": {
+            "train": {
+                "episode_indices": [0, 1, 8, 20, 21],
+                "source_episode_names": ["e0", "e1", "e8", "e20", "e21"],
+            },
+            "validation": {
+                "episode_indices": [139, 140],
+                "source_episode_names": ["e139", "e140"],
+            },
+            "test": {
+                "episode_indices": [156, 157],
+                "source_episode_names": ["e156", "e157"],
+            },
+        },
+    }
+    unsigned = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    payload["sha256"] = __import__("hashlib").sha256(unsigned).hexdigest()
+    split_path = tmp_path / resolver.SPLIT_PATH
+    split_path.parent.mkdir(parents=True)
+    split_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    resolved = resolver.resolve_split(
+        tmp_path,
+        overfit_train_episodes=[0, 1, 8, 20],
+        overfit_validation_count=1,
+    )
+
+    assert json.loads(resolved["DATASET_EPISODES_JSON"]) == [0, 1, 8, 20, 139]
+    assert resolved["TRAIN_EPISODE_COUNT"] == 4
+    assert resolved["VALIDATION_EPISODE_COUNT"] == 1
+    assert resolved["TEST_EPISODE_COUNT"] == 2
+    assert resolved["OVERFIT_MODE"] is True
+    assert math.ceil(5 * float(resolved["DATASET_EVAL_SPLIT"])) == 1
+
+    with pytest.raises(ValueError, match="declared train split"):
+        resolver.resolve_split(tmp_path, overfit_train_episodes=[0, 139])
 
 
 def test_training_view_fingerprint_changes_with_source_data(tmp_path) -> None:
@@ -629,7 +960,7 @@ def test_training_view_stats_exclude_validation_and_test_episodes(tmp_path) -> N
     )
 
     assert stats["observation.state"]["mean"] == pytest.approx([0.0] * 19)
-    assert stats["action"]["mean"] == pytest.approx([1.0] * 19)
+    assert stats["action"]["mean"] == pytest.approx([1.0] * 16)
 
 
 def test_lerobot_training_view_features_and_stats_use_cam0_as_head_left() -> None:
@@ -668,7 +999,7 @@ def test_lerobot_training_view_features_and_stats_use_cam0_as_head_left() -> Non
         "names": ["height", "width", "channels"],
     }
     assert features["observation.state"]["shape"] == [19]
-    assert features["action"]["shape"] == [19]
+    assert features["action"]["shape"] == [16]
 
     source_stats = {
         "observation.state.robot_q_current": {"min": list(range(36)), "max": list(range(36)), "count": [10]},
@@ -697,6 +1028,7 @@ def test_lerobot_training_view_features_and_stats_use_cam0_as_head_left() -> Non
 
 def test_groot_real_g1_relative_eef_slot_mapping() -> None:
     module = load_module("g1_full_body_mapping", ROOT / "gr00t" / "g1_full_body_mapping.py")
+    synergy = load_module("dex1_hand_synergy_mapping", ROOT / "gr00t" / "dex1_hand_synergy.py")
     state, action = module.map_source_row_to_real_g1_relative_eef(
         ee_state=[0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.4, -0.2, 0.1, 0.0, 0.0, math.pi / 2],
         ee_action=[0.2, 0.4, 0.6, 0.0, 0.0, math.pi / 2, 0.3, -0.1, 0.2, 0.0, 0.0, 0.0],
@@ -710,12 +1042,22 @@ def test_groot_real_g1_relative_eef_slot_mapping() -> None:
     assert len(action) == 53
     assert state[:9] == pytest.approx([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
     assert state[9:18] == pytest.approx([0.4, -0.2, 0.1, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0])
-    assert state[18:32] == [4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert state[18:25] == pytest.approx(
+        synergy.dex1_to_hand(4.0, side="left", kind="state")
+    )
+    assert state[25:32] == pytest.approx(
+        synergy.dex1_to_hand(3.0, side="right", kind="state")
+    )
     assert state[32:39] == [22, 23, 24, 25, 26, 27, 28]
     assert state[39:46] == [29, 30, 31, 32, 33, 34, 35]
     assert state[46:49] == [19, 20, 21]
     assert action[:9] == pytest.approx([0.2, 0.4, 0.6, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0])
-    assert action[18:32] == [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert action[18:25] == pytest.approx(
+        synergy.dex1_to_hand(2.0, side="left", kind="action")
+    )
+    assert action[25:32] == pytest.approx(
+        synergy.dex1_to_hand(1.0, side="right", kind="action")
+    )
     assert action[32:39] == [122, 123, 124, 125, 126, 127, 128]
     assert action[39:46] == [129, 130, 131, 132, 133, 134, 135]
     assert action[46:49] == [119, 120, 121]
@@ -769,6 +1111,9 @@ def test_groot_real_g1_relative_eef_modality_contract() -> None:
         "state_key": "left_wrist_eef_9d",
     }
     assert list(modality["video"]) == ["head_left", "left_wrist", "right_wrist"]
+    assert modality["meta"]["dex1_hand_mapping"] == (
+        "fixed official G1 seven-joint synergy with least-squares inverse"
+    )
 
 
 def test_lerobot_groot_processor_converts_complete_eef_chunk_from_current_state() -> None:
@@ -796,9 +1141,21 @@ def test_lerobot_groot_processor_converts_complete_eef_chunk_from_current_state(
     ):
         action[:, :, span[0] + 3 : span[1]] = identity
 
+    left_state_eef = mapping.REAL_G1_RELATIVE_EEF_STATE_SLICES["left_wrist_eef_9d"]
     left_eef = mapping.REAL_G1_RELATIVE_EEF_ACTION_SLICES["left_wrist_eef_9d"]
-    action[0, 0, left_eef[0] : left_eef[0] + 3] = torch.tensor([0.1, 0.0, 0.0])
-    action[0, 1, left_eef[0] : left_eef[0] + 3] = torch.tensor([0.2, 0.0, 0.0])
+    current_eef = mapping.source_euler_xyz_pose_to_xyz_rot6d(
+        [1.0, 2.0, 3.0, 0.0, 0.0, math.pi / 2]
+    )
+    target_eef = [
+        mapping.source_euler_xyz_pose_to_xyz_rot6d(
+            [1.0, 3.0, 3.0, 0.0, 0.0, math.pi]
+        ),
+        mapping.source_euler_xyz_pose_to_xyz_rot6d(
+            [0.0, 2.0, 3.0, 0.0, 0.0, 0.0]
+        ),
+    ]
+    state[0, slice(*left_state_eef)] = torch.tensor(current_eef)
+    action[0, :, slice(*left_eef)] = torch.tensor(target_eef)
     left_arm_state = mapping.REAL_G1_RELATIVE_EEF_STATE_SLICES["left_arm"]
     left_arm_action = mapping.REAL_G1_RELATIVE_EEF_ACTION_SLICES["left_arm"]
     state[:, slice(*left_arm_state)] = 1.0
@@ -831,8 +1188,15 @@ def test_lerobot_groot_processor_converts_complete_eef_chunk_from_current_state(
 
     converted = processor._convert_relative_action_groups_for_training(action, state)
 
-    assert converted[0, :, left_eef[0] : left_eef[0] + 3] == pytest.approx(
-        torch.tensor([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]])
+    expected_eef = torch.tensor(
+        [
+            mapping.absolute_eef_xyz_rot6d_to_relative(current_eef, target)
+            for target in target_eef
+        ]
+    )
+    assert converted[0, :, slice(*left_eef)] == pytest.approx(
+        expected_eef,
+        abs=1e-6,
     )
     assert converted[0, :, slice(*left_arm_action)] == pytest.approx(
         torch.tensor([[0.5] * 7, [1.0] * 7])
@@ -911,7 +1275,7 @@ def test_prepare_groot_overlay_preserves_action_contract_and_enables_three_camer
     output = overlay_module.prepare_overlay(
         source_root=source,
         output_root=tmp_path / "overlay",
-        model_path="nvidia/GR00T-N1.7-3B",
+        model_path="fixture/gr00t-n1.7",
         revision="fixture-revision",
         force=False,
     )
@@ -919,7 +1283,7 @@ def test_prepare_groot_overlay_preserves_action_contract_and_enables_three_camer
     overlay_config = json.loads((output / "processor_config.json").read_text())
     overlay_modality = overlay_config["processor_kwargs"]["modality_configs"][tag]
     assert overlay_modality["video"] == {
-        "delta_indices": [0],
+        "delta_indices": [-20, 0],
         "modality_keys": ["head_left", "left_wrist", "right_wrist"],
     }
     assert overlay_modality["action"] == processor_config["processor_kwargs"]["modality_configs"][tag][
@@ -929,10 +1293,39 @@ def test_prepare_groot_overlay_preserves_action_contract_and_enables_three_camer
     assert overlay_module.prepare_overlay(
         source_root=source,
         output_root=output,
-        model_path="nvidia/GR00T-N1.7-3B",
+        model_path="fixture/gr00t-n1.7",
         revision="fixture-revision",
         force=False,
     ) == output
+
+
+def test_groot_contract_is_49d_53d_packed_132d_and_never_54d() -> None:
+    contract = load_module("n17_contract", ROOT / "gr00t" / "n17_contract.py")
+    mapping = load_module("g1_full_body_mapping_contract", ROOT / "gr00t" / "g1_full_body_mapping.py")
+
+    assert contract.LOGICAL_STATE_DIM == mapping.REAL_G1_RELATIVE_EEF_STATE_DIM == 49
+    assert contract.LOGICAL_ACTION_DIM == mapping.REAL_G1_RELATIVE_EEF_ACTION_DIM == 53
+    assert contract.PACKED_STATE_DIM == mapping.GROOT_N17_PACKED_STATE_DIM == 132
+    assert contract.PACKED_ACTION_DIM == mapping.GROOT_N17_PACKED_ACTION_DIM == 132
+    assert contract.ACTION_HORIZON == mapping.GROOT_N17_NATIVE_ACTION_HORIZON == 40
+    assert contract.VALID_ACTION_DIM == mapping.GROOT_N17_VALID_ACTION_DIM == 46
+    with pytest.raises(ValueError, match="53-D"):
+        mapping._require_dim("logical action", [0.0] * 54, 53)
+
+
+def test_dex1_official_synergy_roundtrip_and_direction() -> None:
+    synergy = load_module("dex1_hand_synergy_roundtrip", ROOT / "gr00t" / "dex1_hand_synergy.py")
+
+    for side in ("left", "right"):
+        for kind in ("state", "action"):
+            opened = synergy.dex1_to_hand(4.5, side=side, kind=kind)
+            closed = synergy.dex1_to_hand(0.0, side=side, kind=kind)
+            assert opened != closed
+            for dex1 in (0.0, 0.5, 2.25, 4.0, 4.5):
+                hand = synergy.dex1_to_hand(dex1, side=side, kind=kind)
+                assert synergy.hand_to_dex1(hand, side=side, kind=kind) == pytest.approx(
+                    dex1, abs=1e-12
+                )
 
 
 def test_restore_groot_base_model_path_makes_checkpoints_portable(tmp_path) -> None:

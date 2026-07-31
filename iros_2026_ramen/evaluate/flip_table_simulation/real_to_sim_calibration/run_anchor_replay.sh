@@ -62,6 +62,7 @@ if [[ -n "${FLIP_TABLE_PERSISTENT_EVAL_ROOT:-}" ]]; then
     --runtime-env "$OUTPUT_DIR/replay_runtime.env" \
     --persistent-root "$FLIP_TABLE_PERSISTENT_EVAL_ROOT" \
     --output-dir "$OUTPUT_DIR" \
+    --environment FLIP_TABLE_PERSISTENT_RECREATE_ENV=true \
     --seed "${FLIP_TABLE_EVAL_SEED:-42}" \
     --wait
 else

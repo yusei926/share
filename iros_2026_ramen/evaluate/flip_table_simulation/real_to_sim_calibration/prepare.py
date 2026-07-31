@@ -2,7 +2,7 @@
 """Create a pinned, auditable calibration bundle from the real flip-table data.
 
 This command is intentionally CPU-only.  It prepares the exact real evidence
-and 19-D replay actions consumed by the existing V1 simulator runner; physics
+and 16-D arm/hand replay actions consumed by the WBC simulator runner; physics
 fitting and image matching run later on the RTX5090 against this immutable
 bundle.
 """
@@ -37,11 +37,14 @@ from .contracts import (
     SOURCE_REPO_ID,
     SOURCE_REVISION,
     SOURCE_Q_DIM,
+    EpisodeSelection,
     EpisodeSignals,
     episode_signals,
     select_episode_roles,
-    source_19d_actions,
+    source_16d_actions,
     source_19d_observation,
+    source_31d_actions,
+    source_31d_observation,
 )
 
 
@@ -259,8 +262,10 @@ def _episode_bundle(table: Any, episode: int, episode_metadata: dict[str, Any]) 
     hand_state = np.asarray(table["observation.state.hand_state"].to_pylist(), dtype=np.float64)[rows]
     hand_cmd = np.asarray(table["action.hand_cmd"].to_pylist(), dtype=np.float64)[rows]
     timestamps = np.asarray(table["timestamp"].to_pylist(), dtype=np.float64)[rows]
-    action_19d = source_19d_actions(q_desired, hand_cmd)
+    action_16d = source_16d_actions(q_desired, hand_cmd)
+    action_31d = source_31d_actions(q_desired, hand_cmd)
     observed_state_19d = source_19d_observation(q_current, hand_state)
+    observed_state_31d = source_31d_observation(q_current, hand_state)
     return {
         "source_episode_index": int(episode),
         "source_episode_name": episode_metadata.get("source_episode_name"),
@@ -270,10 +275,12 @@ def _episode_bundle(table: Any, episode: int, episode_metadata: dict[str, Any]) 
         # This is a reference record only: the fixed-base diagnostic never
         # writes it as a per-frame simulator root pose.
         "initial_root_pose_xyz_wxyz": q_current[0, :7].tolist(),
+        "observed_root_pose_xyz_wxyz": q_current[:, :7].tolist(),
         "initial_body_joint_position_rad": q_current[0, 7:].tolist(),
         "recorded_root_pose_reference_xyz_wxyz": q_desired[:, :7].tolist(),
         "recorded_full_body_target_rad": q_desired[:, 7:].tolist(),
-        "recorded_upper_body_target_and_hand_cmd": action_19d.tolist(),
+        "recorded_arm_hand_target_16d": action_16d.tolist(),
+        "recorded_full_body_hand_target_31d": action_31d.tolist(),
         # These EEF streams are a second label for the joint state/action and
         # are retained for FK and time-alignment diagnostics. The fixed-base
         # simulator continues to replay only the recorded joint targets.
@@ -292,9 +299,16 @@ def _episode_bundle(table: Any, episode: int, episode_metadata: dict[str, Any]) 
         # recorded timestamp.  Treating q_desired as the reset pose erases
         # real controller lag and corrupts camera/extrinsic fitting.
         "observed_upper_body_state_and_hand_state": observed_state_19d.tolist(),
-        "action_layout": "waist_3_left_arm_7_right_arm_7_left_hand_cmd_right_hand_cmd",
+        "observed_full_body_state_and_hand_state": observed_state_31d.tolist(),
+        "state_layout": "waist_3_left_arm_7_right_arm_7_left_hand_state_right_hand_state",
+        "action_layout": "left_arm_7_right_arm_7_left_hand_cmd_right_hand_cmd",
+        "state_dim": 19,
+        "action_dim": 16,
+        "full_body_diagnostic_state_layout": "left_leg_6_right_leg_6_waist_3_left_arm_7_right_arm_7_left_hand_state_right_hand_state",
+        "full_body_diagnostic_action_layout": "left_leg_6_right_leg_6_waist_3_left_arm_7_right_arm_7_left_hand_cmd_right_hand_cmd",
+        "full_body_diagnostic_dim": 31,
         "root_replay": "forbidden_per_frame; reference_and_initialization_only",
-        "lower_body_replay": "forbidden_in_fixed_base_policy_replay; retained_as_reference_only",
+        "lower_body_replay": "retained_for_full_body_diagnostic_only; production_balanced_wbc_replay_uses_arms14_only",
         "policy_camera_keys": list(CALIBRATION_CAMERA_KEYS),
         "video_metadata": {key: value for key, value in episode_metadata.items() if str(key).startswith("videos/")},
     }
@@ -343,6 +357,60 @@ def _eef_fk_eligible_episode_indices(path: Path | None) -> tuple[set[int] | None
     }
 
 
+def _selection_from_override(
+    path: Path,
+    *,
+    available_episode_indices: set[int],
+    eligible_episode_indices: set[int] | None,
+) -> tuple[EpisodeSelection, dict[str, object]]:
+    """Load a reviewed visual-selection result without bypassing the audit.
+
+    Numeric activity alone cannot prove that a pre-contact table is visible in
+    both head cameras.  A reviewed override is therefore allowed only after
+    the full numeric audit above, only for eight already-audited episodes, and
+    only when it records the rejected candidate and the direct-CAD evidence
+    that replaced it.
+    """
+
+    source = path.expanduser().resolve()
+    document = json.loads(source.read_text(encoding="utf-8"))
+    if document.get("schema_version") != "team_ramen_flip_table_selection_override/v1":
+        raise ValueError("selection override has an unsupported schema")
+    selection_value = document.get("selection")
+    if not isinstance(selection_value, dict):
+        raise ValueError("selection override lacks selection")
+    try:
+        selection = EpisodeSelection(
+            anchor=int(selection_value["anchor"]),
+            calibration=tuple(int(value) for value in selection_value["calibration"]),
+            validation=tuple(int(value) for value in selection_value["validation"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("selection override has invalid episode indices") from exc
+    if len(selection.calibration) != 2 or len(selection.validation) != 5:
+        raise ValueError("selection override must contain one anchor, two calibration, and five validation episodes")
+    selected = set(selection.all_indices())
+    if len(selected) != 8:
+        raise ValueError("selection override episode roles must be disjoint")
+    if not selected <= available_episode_indices:
+        raise ValueError("selection override references an episode outside the audited dataset")
+    if eligible_episode_indices is not None and not selected <= eligible_episode_indices:
+        raise ValueError("selection override references an EEF/FK-ineligible episode")
+    rationale = document.get("rationale")
+    visual_evidence = document.get("visual_evidence")
+    if not isinstance(rationale, str) or not rationale.strip() or not isinstance(visual_evidence, list):
+        raise ValueError("selection override requires rationale and visual_evidence")
+    return selection, {
+        "mode": "reviewed_visual_evidence_override",
+        "path": str(source),
+        "sha256": sha256_file(source),
+        "rationale": rationale,
+        "visual_evidence": visual_evidence,
+        "numeric_audit_still_executed": True,
+        "eef_fk_eligibility_still_enforced": eligible_episode_indices is not None,
+    }
+
+
 def prepare_bundle(
     dataset_root: Path,
     output_dir: Path,
@@ -350,11 +418,24 @@ def prepare_bundle(
     config_path: Path,
     raw_root: Path | None,
     eef_fk_audit: Path | None = None,
+    selection_override: Path | None = None,
 ) -> dict[str, Any]:
     source = dataset_root.expanduser().resolve()
     signals, numeric_audit, table = audit_numeric_contract(source)
     eligible_episode_indices, eef_fk_selection = _eef_fk_eligible_episode_indices(eef_fk_audit)
-    selection = select_episode_roles(signals, eligible_episode_indices=eligible_episode_indices)
+    if selection_override is None:
+        selection = select_episode_roles(signals, eligible_episode_indices=eligible_episode_indices)
+        selection_provenance: dict[str, object] = {
+            "mode": "deterministic_numeric_activity",
+            "numeric_audit_still_executed": True,
+            "eef_fk_eligibility_still_enforced": eligible_episode_indices is not None,
+        }
+    else:
+        selection, selection_provenance = _selection_from_override(
+            selection_override,
+            available_episode_indices={item.episode_index for item in signals},
+            eligible_episode_indices=eligible_episode_indices,
+        )
     metadata = _episodes_metadata(source, selection.all_indices())
     output = output_dir.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -374,6 +455,7 @@ def prepare_bundle(
             "read_only": True,
         },
         "selection": selection.json(),
+        "selection_provenance": selection_provenance,
         "numeric_audit": numeric_audit,
         "eef_fk_selection": eef_fk_selection,
         "camera_provenance": camera_provenance,
@@ -409,6 +491,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="all-episode EEF/FK audit; restricts the selected episodes to passing source labels",
     )
+    parser.add_argument(
+        "--selection-override",
+        type=Path,
+        help=(
+            "reviewed visual-evidence selection JSON; numeric and EEF/FK audits still run, "
+            "and all eight selected episodes must pass them"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -420,6 +510,7 @@ def main() -> None:
         config_path=args.config,
         raw_root=args.raw_root,
         eef_fk_audit=args.eef_fk_audit,
+        selection_override=args.selection_override,
     )
     print(json.dumps({"selection": manifest["selection"], "output": str(args.output_dir)}, indent=2))
 

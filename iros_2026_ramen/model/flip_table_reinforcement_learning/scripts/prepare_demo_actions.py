@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Export one real flip-table episode as the 19-D residual-policy prior."""
+"""Export one real flip-table episode as the canonical 16-D policy prior."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -13,14 +14,19 @@ from huggingface_hub import snapshot_download
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
+from data.flip_table_data_augmentation.teleop.shared.policy_contract import (
+    ACTION_CONVERSION_VERSION,
+)
+
 
 DEFAULT_REPO_ID = "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_1"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT = REPOSITORY_ROOT / ".checkpoints" / "flip_table_episode0_actions.json"
 ROBOT_Q_DESIRED_KEY = "action.robot_q_desired"
 HAND_COMMAND_KEY = "action.hand_cmd"
-# robot_q_desired is root pose (7), lower body (12), then waist and both arms (17).
-UPPER_BODY_SLICE = slice(19, 36)
+# robot_q_desired is root pose (7), lower body (12), waist (3), then both arms (14).
+LEGACY_UPPER_BODY_SLICE = slice(19, 36)
+ARM_SLICE = slice(22, 36)
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +105,7 @@ def export_demo_actions(
         raise ValueError(f"episode {episode} frame_index is not contiguous from zero")
 
     actions: list[list[float]] = []
+    legacy_actions: list[list[float]] = []
     for row_index, (desired_raw, hand_raw) in enumerate(
         zip(
             table[ROBOT_Q_DESIRED_KEY].to_pylist(),
@@ -118,17 +125,31 @@ def export_demo_actions(
         )
         if any(value < 0.0 or value > 4.5 for value in hands):
             raise ValueError(f"frame {row_index} hand_cmd is outside the real [0,4.5] range")
-        actions.append(desired[UPPER_BODY_SLICE] + hands)
+        legacy = desired[LEGACY_UPPER_BODY_SLICE] + hands
+        legacy_actions.append(legacy)
+        actions.append(desired[ARM_SLICE] + hands)
+
+    source_action_bytes = json.dumps(
+        legacy_actions,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
     episode_metadata = _episode_metadata(source_root, episode)
     return {
-        "schema_version": "team_ramen_flip_table_demo_prior_v1",
+        "schema_version": "team_ramen_flip_table_demo_prior_v2",
         "source_repo_id": repo_id,
         "source_revision": revision,
         "source_episode_index": episode,
         "source_episode_name": episode_metadata.get("source_episode_name"),
         "fps": 30,
-        "action_layout": "waist_3_left_arm_7_right_arm_7_left_hand_right_hand",
+        "state_layout": "waist_3_left_arm_7_right_arm_7_left_hand_right_hand",
+        "action_layout": "left_arm_7_right_arm_7_left_hand_right_hand",
+        "state_dim": 19,
+        "action_dim": 16,
+        "legacy_action_conversion_version": ACTION_CONVERSION_VERSION,
+        "legacy_source_actions_sha256": hashlib.sha256(source_action_bytes).hexdigest(),
+        "dropped_action_fields": ["waist_3"],
         "hand_command_range": [0.0, 4.5],
         "actions": actions,
     }
@@ -165,7 +186,7 @@ def main() -> None:
         encoding="utf-8",
     )
     temporary.replace(args.output)
-    print(f"Wrote {len(payload['actions'])} real 19-D targets to {args.output}")
+    print(f"Wrote {len(payload['actions'])} real 16-D targets to {args.output}")
 
 
 if __name__ == "__main__":

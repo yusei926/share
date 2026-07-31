@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+.pixi/
+.env
+.pytest_cache/
+.vscode/
+.issue70_teleop_stage/
+.issue70_teleop_direct_stage/
+.issue70_force_probe_stage/
+*.egg-info/
+
+.claude/settings.local.json
+
+data/vit_phase1/results/
+data/vit_phase1/audit/
+data/vit_phase1/hf_cache/
+# jpg pre-decoded cache (Issue #18、~28GB / 50ep、~200GB / 533ep)
+data/vit_phase1/frames/
+
+# Training artifacts (Issue #18)
+outputs/
+.checkpoints/
+wandb/
+
+# Sweep / eval / autonomous cron logs (Issue #28)
+logs/
+
+# Vendored SDK clone for Phase C runtime env (Issue #39)。upstream から clone、非管理。
+third_party/
+
+# ultralytics が repo root に自動 DL する pretrained weight (Issue #46)
+yolo*.pt

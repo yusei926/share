@@ -3,6 +3,7 @@ set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_DIR="${1:-${FLIP_TABLE_GROOT_RUNTIME_DIR:-/workspace/flip_table_groot_runtime}}"
+PLUGIN_DIR="${FLIP_TABLE_FURNITURE_GROOT_PLUGIN_DIR:-/workspace/flip_table_furniture_groot_plugin}"
 BASE_PYTHON="${FLIP_TABLE_GROOT_BASE_PYTHON:-${CONDA_PREFIX:-/opt/conda/envs/robofinals}/bin/python}"
 UV_BIN="${FLIP_TABLE_GROOT_UV_BIN:-$(command -v uv || true)}"
 
@@ -24,6 +25,14 @@ mkdir -p "$RUNTIME_DIR"
   --python "$RUNTIME_DIR/.venv/bin/python" \
   --torch-backend cu128 \
   --requirements "$SOURCE_DIR/requirements.txt"
+if [[ ! -f "$PLUGIN_DIR/pyproject.toml" ]]; then
+  echo "ERROR: Furniture-GR00T plugin not found: $PLUGIN_DIR" >&2
+  exit 1
+fi
+"$UV_BIN" pip install \
+  --python "$RUNTIME_DIR/.venv/bin/python" \
+  --no-deps \
+  --editable "$PLUGIN_DIR"
 
 "$RUNTIME_DIR/.venv/bin/python" - <<'PY'
 import importlib.metadata
@@ -37,6 +46,10 @@ from lerobot.policies.groot.processor_groot import (
     GrootN17PackInputsStep,
     make_groot_pre_post_processors_from_pretrained,
 )
+from lerobot_policy_furniture_groot.modeling_furniture_groot import FurnitureGrootPolicy
+from lerobot_policy_furniture_groot.processor_furniture_groot import (
+    FurnitureGrootTemporalProgressStep,
+)
 
 version = importlib.metadata.version("lerobot")
 if version != "0.6.0":
@@ -44,6 +57,7 @@ if version != "0.6.0":
 print(
     "GR00T evaluation runtime ready: "
     f"lerobot={version}, torch={torch.__version__}, numpy={numpy.__version__}, "
-    f"cuda={torch.cuda.is_available()}"
+    f"cuda={torch.cuda.is_available()}, furniture_groot={FurnitureGrootPolicy.name}, "
+    f"temporal_step={FurnitureGrootTemporalProgressStep.__name__}"
 )
 PY

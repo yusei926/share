@@ -21,7 +21,7 @@ from robofinals_tasks.local_auto_tasks.assemble_table_task import AssembleTableT
 
 from . import mdp
 from .actions import DemoResidualDex1ActionCfg, DemoResidualJointPositionActionCfg
-from .common import DEFAULT_STAGE, JOINT_POSITION_LIMITS_RAD, RESIDUAL_SCALE_RAD
+from .common import DEFAULT_STAGE
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -98,75 +98,11 @@ def _configure_flip_table_contact_sensors(embodiment) -> None:
         )
 
 
-WAIST_RESIDUAL_SCALE = {
-    name: RESIDUAL_SCALE_RAD[name]
-    for name in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
-}
-WAIST_POSITION_LIMITS = {
-    name: JOINT_POSITION_LIMITS_RAD[name]
-    for name in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
-}
-LEFT_ARM_RESIDUAL_SCALE = {
-    pattern: value
-    for pattern, value in RESIDUAL_SCALE_RAD.items()
-    if pattern.startswith(".*_")
-}
-RIGHT_ARM_RESIDUAL_SCALE = dict(LEFT_ARM_RESIDUAL_SCALE)
-LEFT_ARM_POSITION_LIMITS = {
-    pattern: value
-    for pattern, value in JOINT_POSITION_LIMITS_RAD.items()
-    if pattern.startswith(".*_") or pattern == "left_shoulder_roll_joint"
-}
-RIGHT_ARM_POSITION_LIMITS = {
-    pattern: value
-    for pattern, value in JOINT_POSITION_LIMITS_RAD.items()
-    if pattern.startswith(".*_") or pattern == "right_shoulder_roll_joint"
-}
-
 @configclass
 class FlipTableResidualActionsCfg:
-    waist_action: DemoResidualJointPositionActionCfg = DemoResidualJointPositionActionCfg(
+    base_action: DemoResidualJointPositionActionCfg = DemoResidualJointPositionActionCfg(
         asset_name="robot",
-        joint_names=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
-        scale=WAIST_RESIDUAL_SCALE,
-        offset=0.0,
-        clip=WAIST_POSITION_LIMITS,
-        use_default_offset=False,
-        preserve_order=True,
-        sample_shared_delay=True,
-    )
-    left_arm_action: DemoResidualJointPositionActionCfg = DemoResidualJointPositionActionCfg(
-        asset_name="robot",
-        joint_names=[
-            "left_shoulder_pitch_joint",
-            "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint",
-            "left_elbow_joint",
-            "left_wrist_roll_joint",
-            "left_wrist_pitch_joint",
-            "left_wrist_yaw_joint",
-        ],
-        scale=LEFT_ARM_RESIDUAL_SCALE,
-        offset=0.0,
-        clip=LEFT_ARM_POSITION_LIMITS,
-        use_default_offset=False,
-        preserve_order=True,
-    )
-    right_arm_action: DemoResidualJointPositionActionCfg = DemoResidualJointPositionActionCfg(
-        asset_name="robot",
-        joint_names=[
-            "right_shoulder_pitch_joint",
-            "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint",
-            "right_elbow_joint",
-            "right_wrist_roll_joint",
-            "right_wrist_pitch_joint",
-            "right_wrist_yaw_joint",
-        ],
-        scale=RIGHT_ARM_RESIDUAL_SCALE,
-        offset=0.0,
-        clip=RIGHT_ARM_POSITION_LIMITS,
-        use_default_offset=False,
+        joint_names=[".*"],
         preserve_order=True,
     )
     left_hand_action: DemoResidualDex1ActionCfg = DemoResidualDex1ActionCfg(
@@ -176,7 +112,7 @@ class FlipTableResidualActionsCfg:
         offset=0.0,
         use_default_offset=False,
         preserve_order=True,
-        demo_column=17,
+        demo_column=14,
     )
     right_hand_action: DemoResidualDex1ActionCfg = DemoResidualDex1ActionCfg(
         asset_name="robot",
@@ -185,7 +121,7 @@ class FlipTableResidualActionsCfg:
         offset=0.0,
         use_default_offset=False,
         preserve_order=True,
-        demo_column=18,
+        demo_column=15,
     )
 
 
@@ -389,7 +325,7 @@ class FlipTableResidualStateRL(LwRL):
     def modify_env_cfg(self, env_cfg):
         env_cfg = super().modify_env_cfg(env_cfg)
         env_cfg.sim.dt = _env_float("FLIP_TABLE_RL_SIM_DT_S", 0.005)
-        control_hz = _env_float("FLIP_TABLE_RL_CONTROL_HZ", 20.0)
+        control_hz = _env_float("FLIP_TABLE_RL_CONTROL_HZ", 50.0)
         if env_cfg.sim.dt <= 0.0 or control_hz <= 0.0:
             raise ValueError("FLIP_TABLE_RL_SIM_DT_S and FLIP_TABLE_RL_CONTROL_HZ must be positive")
         requested_decimation = 1.0 / (env_cfg.sim.dt * control_hz)
