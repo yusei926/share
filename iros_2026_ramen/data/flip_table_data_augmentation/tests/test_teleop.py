@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 import threading
 import types
+import queue
 
 import numpy as np
 import pytest
@@ -43,6 +44,7 @@ from data.flip_table_data_augmentation.teleop.operator_process import (
     _operator_hand_status,
     operator_camera_roles,
 )
+from data.flip_table_data_augmentation.teleop.desktop_preview import _offer_latest
 from data.flip_table_data_augmentation.teleop.xr_runtime import (
     IncoherentBilateralHandFrame,
 )
@@ -388,6 +390,13 @@ def test_desktop_preview_defaults_on_and_has_explicit_boolean_override(
     monkeypatch.setenv("FLIP_TABLE_TELEOP_DESKTOP_PREVIEW", "invalid")
     with pytest.raises(ValueError, match="must be boolean"):
         _desktop_preview_enabled()
+
+
+def test_desktop_preview_queue_always_retains_latest_update() -> None:
+    updates: queue.Queue[object] = queue.Queue(maxsize=1)
+    _offer_latest(updates, "old")
+    _offer_latest(updates, "new")
+    assert updates.get_nowait() == "new"
 
 
 def test_real_operator_camera_contract_includes_both_wrist_cameras() -> None:

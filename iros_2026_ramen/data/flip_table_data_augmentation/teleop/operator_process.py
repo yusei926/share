@@ -10,10 +10,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import multiprocessing as mp
-import os
 from pathlib import Path
-import queue
 import socket
 import subprocess
 import sys
@@ -25,9 +22,13 @@ from typing import Any
 import numpy as np
 
 from .config import DEFAULT_TELEOP_CONFIG_PATH, TeleopConfig, load_teleop_config
+from .desktop_preview import (
+    DesktopPreviewProcess,
+    decode_camera_jpeg as _decode_jpeg,
+    environment_flag,
+)
 from .operator_view import (
     compose_head_stereo_view,
-    compose_real_desktop_view,
     compose_real_operator_stereo_view,
 )
 from .transport import FramedSocket
@@ -76,15 +77,6 @@ class _TrackingFaultLatch:
         return generation > 0 and generation == self.generation
 
 
-def _decode_jpeg(payload: bytes) -> np.ndarray:
-    import cv2
-
-    value = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if value is None or value.shape != (480, 640, 3):
-        raise ValueError("camera JPEG does not decode to 640x480 RGB")
-    return cv2.cvtColor(value, cv2.COLOR_BGR2RGB)
-
-
 def operator_camera_roles(backend: str) -> tuple[str, ...]:
     """Return the camera payload required by each AVP display layout."""
 
@@ -116,112 +108,7 @@ def _operator_hand_status(
 
 
 def _desktop_preview_enabled() -> bool:
-    raw = os.environ.get("FLIP_TABLE_TELEOP_DESKTOP_PREVIEW", "true").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError("FLIP_TABLE_TELEOP_DESKTOP_PREVIEW must be boolean")
-
-
-def _desktop_preview_worker(updates) -> None:
-    """Run OpenCV GUI in an isolated process; never participate in control."""
-
-    if not os.environ.get("DISPLAY"):
-        print(
-            "Desktop camera monitor disabled because DISPLAY is unset.",
-            flush=True,
-        )
-        return
-    import cv2
-
-    window = "IROS 2026 RAMEN - Teleoperation Monitor"
-    try:
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window, 1200, 900)
-        while True:
-            update = updates.get()
-            if update is None:
-                return
-            images = {
-                role: _decode_jpeg(payload)
-                for role, payload in update["camera_jpeg"].items()
-            }
-            view = compose_real_desktop_view(
-                images["head_left"],
-                images["head_right"],
-                images["left_wrist"],
-                images["right_wrist"],
-                np.asarray(update["arm_joint_position_rad"], dtype=np.float64),
-                str(update["hand_status"]),
-            )
-            # Composition uses RGB; OpenCV windows consume BGR.
-            cv2.imshow(window, view[..., ::-1])
-            cv2.waitKey(1)
-            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                return
-    except BaseException as exc:  # noqa: BLE001
-        # A Desktop/Qt failure must not stop AVP IK or the robot safety loop.
-        print(f"Desktop camera monitor stopped: {type(exc).__name__}: {exc}", flush=True)
-    finally:
-        try:
-            cv2.destroyWindow(window)
-        except Exception:
-            pass
-
-
-class DesktopPreviewProcess:
-    """Non-blocking latest-frame publisher for the real Desktop monitor."""
-
-    def __init__(self) -> None:
-        context = mp.get_context("spawn")
-        self._updates = context.Queue(maxsize=1)
-        self._process = context.Process(
-            target=_desktop_preview_worker,
-            args=(self._updates,),
-            name="flip-table-desktop-monitor",
-            daemon=True,
-        )
-        self._process.start()
-
-    def submit(
-        self,
-        camera_jpeg: dict[str, bytes],
-        arm_joint_position_rad: list[float],
-        hand_status: str,
-    ) -> None:
-        if not self._process.is_alive():
-            return
-        update = {
-            "camera_jpeg": dict(camera_jpeg),
-            "arm_joint_position_rad": list(arm_joint_position_rad),
-            "hand_status": hand_status,
-        }
-        try:
-            self._updates.put_nowait(update)
-        except queue.Full:
-            # Never make AVP/control wait for a Desktop paint. The queued item
-            # is at most one camera period old and the next free submit wins.
-            pass
-
-    def close(self) -> None:
-        if self._process.is_alive():
-            try:
-                self._updates.put_nowait(None)
-            except queue.Full:
-                try:
-                    self._updates.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._updates.put_nowait(None)
-                except queue.Full:
-                    pass
-            self._process.join(timeout=2.0)
-        if self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=2.0)
-        self._updates.close()
+    return environment_flag("FLIP_TABLE_TELEOP_DESKTOP_PREVIEW", default=True)
 
 
 def _worker_args() -> argparse.Namespace:

@@ -22,7 +22,7 @@ from data.flip_table_data_augmentation.teleop.config import load_teleop_config
 
 from .artifacts import load_prepared_spec, validate_prepared_artifacts
 from .cli import runner_argv
-from .recording import CAPTURE_ENV
+from .recording import CAPTURE_ENV, PREVIEW_ENV
 from .wandb_export import (
     DEFAULT_MINIMUM_SECONDS,
     DEFAULT_WANDB_ENTITY,
@@ -70,6 +70,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT),
     )
     parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument(
+        "--no-camera-preview",
+        action="store_true",
+        help="Disable the non-blocking four-camera Desktop monitor.",
+    )
     return parser.parse_args(argv)
 
 
@@ -191,6 +196,7 @@ def main() -> int:
         [*(str(path) for path in paths), *([old] if old else [])]
     )
     env[CAPTURE_ENV] = str(run_dir / "capture")
+    env[PREVIEW_ENV] = "false" if args.no_camera_preview else "true"
     metadata = {
         "run_id": run_id,
         "started_at_jst": started.isoformat(timespec="seconds"),
@@ -205,6 +211,7 @@ def main() -> int:
         "lower_body_command_dimensions": 0,
         "requested_max_seconds": args.max_seconds,
         "actuated": args.actuate,
+        "desktop_camera_preview_enabled": not args.no_camera_preview,
         "source_commit": _source_commit(),
         "safety_limit_overrides": {
             name: value
@@ -234,6 +241,14 @@ def main() -> int:
     if not args.actuate:
         print("[registry] live read-only preflight; no --actuate passed", flush=True)
     print(f"[recording] local run directory: {run_dir}", flush=True)
+    if args.no_camera_preview:
+        print("[preview] four-camera Desktop monitor disabled", flush=True)
+    else:
+        print(
+            "[preview] four-camera Desktop monitor enabled (head L/R, wrist L/R, "
+            "measured arm angles); q/Esc closes only the monitor",
+            flush=True,
+        )
     process = subprocess.Popen(argv, env=env)
     try:
         runner_returncode = process.wait()

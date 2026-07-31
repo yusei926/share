@@ -32,6 +32,7 @@ def _status_color(status: str) -> tuple[int, int, int]:
         "ANCHORING": (80, 220, 255),
         "PRESS R": (80, 165, 255),
         "HANDS WAIT": (255, 190, 80),
+        "MODEL EVALUATION": (80, 255, 120),
     }.get(status, (80, 180, 255))
 
 

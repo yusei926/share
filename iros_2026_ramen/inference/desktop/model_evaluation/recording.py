@@ -16,8 +16,14 @@ import threading
 import time
 from typing import Any
 
+from data.flip_table_data_augmentation.teleop.desktop_preview import (
+    DesktopPreviewProcess,
+    environment_flag,
+)
+
 
 CAPTURE_ENV = "IROS_REAL_EVAL_CAPTURE_DIR"
+PREVIEW_ENV = "IROS_REAL_EVAL_DESKTOP_PREVIEW"
 CAPTURE_SCHEMA = "team_ramen_real_policy_capture/v1"
 CAMERA_ROLES = ("head_left", "head_right", "left_wrist", "right_wrist")
 
@@ -40,7 +46,13 @@ class _ActionItem:
 class RealEvaluationRecorder:
     """Write state, requested targets, and unique JPEG generations off-thread."""
 
-    def __init__(self, root: Path, *, queue_capacity: int = 1024) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        queue_capacity: int = 1024,
+        preview: Any | None = None,
+    ) -> None:
         if queue_capacity < 32:
             raise ValueError("evaluation capture queue must hold at least 32 records")
         self.root = root.expanduser().resolve()
@@ -54,6 +66,8 @@ class RealEvaluationRecorder:
         self._lock = threading.Lock()
         self._closed = False
         self._errors: list[str] = []
+        self._preview_errors: list[str] = []
+        self._preview = preview
         self._queue_drops = 0
         self._observation_count = 0
         self._action_count = 0
@@ -73,11 +87,42 @@ class RealEvaluationRecorder:
         value = os.environ.get(CAPTURE_ENV)
         if not value:
             return None
-        return cls(Path(value))
+        preview_enabled = environment_flag(PREVIEW_ENV, default=True)
+        recorder = cls(Path(value))
+        if preview_enabled:
+            try:
+                recorder._preview = DesktopPreviewProcess(
+                    window_title="IROS 2026 RAMEN - Real Policy Evaluation"
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A missing/broken GUI must never prevent a sealed policy
+                # runner from completing its normal safety checks.
+                recorder._preview_errors.append(f"{type(exc).__name__}: {exc}")
+        return recorder
 
     def record_observation(self, observation: Any) -> None:
         if self._closed:
             return
+        if self._preview is not None:
+            try:
+                camera_jpeg = {
+                    role: bytes(observation.camera_jpeg[role])
+                    for role in CAMERA_ROLES
+                }
+                body_position = list(observation.body_joint_position_rad)
+                if len(body_position) != 29:
+                    raise ValueError("live G1 body state must be 29-D")
+                self._preview.submit(
+                    camera_jpeg,
+                    body_position[15:29],
+                    "MODEL EVALUATION",
+                )
+            except Exception as exc:  # noqa: BLE001
+                # The monitor is diagnostic-only.  Never make a GUI issue
+                # alter robot control, capture completeness, or run outcome.
+                with self._lock:
+                    if not self._preview_errors:
+                        self._preview_errors.append(f"{type(exc).__name__}: {exc}")
         state = {
             "schema_version": CAPTURE_SCHEMA,
             "type": "state",
@@ -184,6 +229,12 @@ class RealEvaluationRecorder:
         if self._closed:
             return self.report()
         self._closed = True
+        if self._preview is not None:
+            try:
+                self._preview.close()
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self._preview_errors.append(f"{type(exc).__name__}: {exc}")
         try:
             self._queue.put(None, timeout=2.0)
         except queue.Full:
@@ -220,6 +271,7 @@ class RealEvaluationRecorder:
                 "camera_effective_hz": rates,
                 "queue_drop_count": self._queue_drops,
                 "errors": list(self._errors),
+                "desktop_preview_errors": list(self._preview_errors),
                 "complete": (
                     not self._thread.is_alive()
                     and self._queue_drops == 0

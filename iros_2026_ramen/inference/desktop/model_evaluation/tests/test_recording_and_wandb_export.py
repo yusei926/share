@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from inference.desktop.model_evaluation import recording as recording_module
 from inference.desktop.model_evaluation.recording import (
     CAMERA_ROLES,
     RealEvaluationRecorder,
@@ -68,6 +69,59 @@ def test_recorder_deduplicates_camera_generations_and_keeps_numeric_logs(
     frames = [json.loads(line) for line in (tmp_path / "camera_frames.jsonl").read_text().splitlines()]
     assert len(frames) == 8
     assert all((tmp_path / row["relative_path"]).is_file() for row in frames)
+
+
+class _FakePreview:
+    def __init__(self) -> None:
+        self.updates: list[tuple[dict[str, bytes], list[float], str]] = []
+        self.closed = False
+
+    def submit(
+        self,
+        camera_jpeg: dict[str, bytes],
+        arm_joint_position_rad: list[float],
+        status: str,
+    ) -> None:
+        self.updates.append((camera_jpeg, arm_joint_position_rad, status))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_recorder_feeds_four_camera_preview_without_changing_capture(
+    tmp_path: Path,
+) -> None:
+    preview = _FakePreview()
+    recorder = RealEvaluationRecorder(tmp_path, preview=preview)
+    observation = _observation(1, 1)
+    recorder.record_observation(observation)
+    report = recorder.close()
+
+    assert len(preview.updates) == 1
+    camera_jpeg, arm_joint_position_rad, status = preview.updates[0]
+    assert tuple(camera_jpeg) == CAMERA_ROLES
+    assert arm_joint_position_rad == list(observation.body_joint_position_rad[15:29])
+    assert status == "MODEL EVALUATION"
+    assert preview.closed is True
+    assert report["complete"] is True
+    assert report["desktop_preview_errors"] == []
+
+
+def test_broken_desktop_gui_does_not_prevent_capture(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def fail_preview(**_kwargs):
+        raise RuntimeError("GUI unavailable")
+
+    monkeypatch.setenv(recording_module.CAPTURE_ENV, str(tmp_path))
+    monkeypatch.setenv(recording_module.PREVIEW_ENV, "true")
+    monkeypatch.setattr(recording_module, "DesktopPreviewProcess", fail_preview)
+    recorder = RealEvaluationRecorder.from_environment()
+    assert recorder is not None
+    recorder.record_observation(_observation(1, 1))
+    report = recorder.close()
+    assert report["complete"] is True
+    assert report["desktop_preview_errors"] == ["RuntimeError: GUI unavailable"]
 
 
 def _candidate_run(tmp_path: Path, *, span_s: float = 9.8) -> Path:

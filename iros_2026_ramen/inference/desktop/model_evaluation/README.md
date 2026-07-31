@@ -234,6 +234,14 @@ entity:  ken05-matuo-llm-88_llm_2025_suzuki
 project: iros-2026-ramen-real-policy-evaluation
 ```
 
+共通launcherの起動中は、Desktopに4カメラmonitorも自動表示されます。上段が
+head-left/head-right、下段がleft-wrist/right-wristで、左右腕の実測関節角も
+重ねて表示します。表示は別processのlatest-only経路なので、画面描画が遅れても
+推論、実機指令、30 Hz収録を待たせません。ウィンドウ上の`q`/`Esc`または閉じる
+操作はmonitorだけを終了し、ロボット停止操作にはなりません。実機停止には従来どおり
+E-stopまたは起動terminalのCtrl+Cを使用してください。GUIのないSSH sessionなどで
+表示しない場合は共通launcherへ`--no-camera-preview`を付けます。
+
 自動uploadは、`--actuate`付き、policy実行10秒以上、runner exit code 0、
 `return_motion_complete`確認、収録drop/error 0、4カメラMP4完成のすべてを
 満たすrunだけを対象にします。閾値は `--wandb-min-seconds` で変更できます。
