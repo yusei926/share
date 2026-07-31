@@ -226,4 +226,3 @@ class RealEvaluationRecorder:
                     and not self._errors
                 ),
             }
-

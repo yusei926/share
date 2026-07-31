@@ -31,6 +31,8 @@ case "$training_target" in
 esac
 
 mkdir -p "$work_root" "$run_root" "$sidecar_root" "$work_root/tmp"
+export WANDB_DATA_DIR="${WANDB_DATA_DIR:-$work_root/wandb_data}"
+mkdir -p "$WANDB_DATA_DIR"
 persist_run_artifacts() {
   local status="$?"
   mkdir -p "$persistent_result_root"

@@ -132,6 +132,7 @@ def test_h100_runner_has_independent_resumable_backups() -> None:
     assert "HF_XET_HIGH_PERFORMANCE" in runner
     assert "_uncheckpointed_${run_started_utc}" in runner
     assert "WANDB_DISABLE_ARTIFACT=" in runner
+    assert "WANDB_DATA_DIR" in runner
     assert "--save_checkpoint_to_hub=" in trainer
     assert "nohup setsid env" in launcher
     assert "/etc/tmpfiles.d/iros-groot-n17.conf" in launcher
