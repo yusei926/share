@@ -219,6 +219,7 @@ class RealDdsBackend(TeleopBackend):
         )
 
         self._evaluation_recorder = RealEvaluationRecorder.from_environment()
+        self._preview_status = "CAMERAS: CONNECTING"
         self._types = {
             "MotorCmds": MotorCmds_,
             "MotorCmd": unitree_go_msg_dds__MotorCmd_,
@@ -666,6 +667,25 @@ class RealDdsBackend(TeleopBackend):
                 print(f"[safety] {reason}; releasing arm control.", flush=True)
             self._tracking = False
 
+    def _arm_interlock_is_required(self) -> bool:
+        """Return whether arm ownership is active or has been requested.
+
+        A heavyweight policy loader can briefly starve the local DDS reader
+        before any physical command has been requested.  That condition must
+        still make a contemporaneous observation fail closed, but it must not
+        permanently latch the arm-sdk release interlock: there is no arm-sdk
+        ownership to release yet.  Once TRACK/HOLD is requested, a packet has
+        been published, or the blend weight is non-zero, the same stale state
+        remains a hard latched interlock.
+        """
+
+        with self._command_lock:
+            return bool(
+                self._tracking
+                or self._published
+                or self._arm_sdk_weight > 0.0
+            )
+
     def _next_arm_sdk_weight(self, *, active: bool, releasing: bool) -> float:
         if active:
             self._arm_sdk_weight = min(
@@ -825,7 +845,10 @@ class RealDdsBackend(TeleopBackend):
                 # Never leave the last nonzero arm_sdk blend latched merely
                 # because DDS state access failed.  The last validated state
                 # is used only to send the documented gradual release packet.
-                self._trip_arm_interlock(f"G1 or Dex1 state unavailable ({exc})")
+                if self._arm_interlock_is_required():
+                    self._trip_arm_interlock(
+                        f"G1 or Dex1 state unavailable ({exc})"
+                    )
                 if self._published and self._last_valid_state is not None:
                     last_all_motor, last_body, last_mode, last_hand = self._last_valid_state
                     self._release_arm_sdk(
@@ -847,7 +870,8 @@ class RealDdsBackend(TeleopBackend):
                 now_ns=now_ns,
                 maximum_age_s=self.config.safety.command_hold_timeout_s,
             ):
-                self._trip_arm_interlock("G1 lowstate became stale")
+                if self._arm_interlock_is_required():
+                    self._trip_arm_interlock("G1 lowstate became stale")
                 tracking = False
             dex1_state_stale = np.asarray(
                 [
@@ -1223,8 +1247,34 @@ class RealDdsBackend(TeleopBackend):
         )
         evaluation_recorder = getattr(self, "_evaluation_recorder", None)
         if evaluation_recorder is not None:
-            evaluation_recorder.record_observation(observation)
+            with self._command_lock:
+                preview_status = self._preview_status
+            evaluation_recorder.record_observation(
+                observation,
+                preview_status=preview_status,
+            )
         return observation
+
+    def set_preview_status(self, status: str) -> None:
+        """Set the diagnostic-only label rendered on the live camera monitor."""
+
+        normalized = str(status).strip()
+        if not normalized:
+            raise ValueError("camera preview status must be non-empty")
+        with self._command_lock:
+            self._preview_status = normalized
+
+    def start_evaluation_recording(self) -> bool:
+        """Start file capture without affecting the always-live preview."""
+
+        recorder = getattr(self, "_evaluation_recorder", None)
+        return False if recorder is None else bool(recorder.start_capture())
+
+    def stop_evaluation_recording(self) -> bool:
+        """Stop file capture; camera preview continues until backend close."""
+
+        recorder = getattr(self, "_evaluation_recorder", None)
+        return False if recorder is None else bool(recorder.stop_capture())
 
     def apply(self, target: ArmHandTarget) -> None:
         with self._command_lock:

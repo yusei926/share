@@ -28,8 +28,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from inference.desktop.upper_policy.act_pick_leg_contract import (  # noqa: E402
-    ACTION_MAX,
-    ACTION_MIN,
     CAMERA_KEYS,
     MODEL_ACTION_DIM,
     MODEL_ACTION_HORIZON,
@@ -117,10 +115,19 @@ def validate_checkpoint(path: Path, expected_hash: str) -> dict[str, Any]:
     stats = load_file(str(stats_path), device="cpu")
     minimum = stats["action.min"].detach().cpu().numpy().astype(np.float64)
     maximum = stats["action.max"].detach().cpu().numpy().astype(np.float64)
-    if not np.allclose(minimum, ACTION_MIN, atol=1.0e-5, rtol=0.0):
-        raise ValueError("serialized action minimum differs from physical contract")
-    if not np.allclose(maximum, ACTION_MAX, atol=1.0e-5, rtol=0.0):
-        raise ValueError("serialized action maximum differs from physical contract")
+    if (
+        minimum.shape != (MODEL_ACTION_DIM,)
+        or maximum.shape != (MODEL_ACTION_DIM,)
+        or not np.isfinite(minimum).all()
+        or not np.isfinite(maximum).all()
+        or np.any(minimum > maximum)
+    ):
+        raise ValueError("serialized ACT action support is invalid")
+    # All joint16 checkpoints in this trusted family use physical Dex1 values
+    # in [0, 4.5]. Arm safety remains independently enforced against the G1
+    # joint envelope and measured-pose delta by the physical parent process.
+    if np.any(minimum[14:] < -1.0e-6) or np.any(maximum[14:] > 4.5 + 1.0e-6):
+        raise ValueError("serialized Dex1 support is outside physical [0,4.5]")
 
     model_hash = sha256(path / "model.safetensors")
     if model_hash != expected_hash:
@@ -137,6 +144,8 @@ def validate_checkpoint(path: Path, expected_hash: str) -> dict[str, Any]:
         "lower_body_command_dimensions": 0,
         "camera_keys": list(CAMERA_KEYS),
         "dex1_open_value": 4.5,
+        "action_min": minimum.tolist(),
+        "action_max": maximum.tolist(),
     }
 
 

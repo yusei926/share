@@ -134,15 +134,20 @@ Publish topics (namespace `/wrist_{side}/camera/` prefix):
 この実機のD405はRGB/IRとも`848x480x30` profileを広告する。640幅を要求しても
 driverが848x480へfallbackするため、launchは実profileを明示している。
 
-実映像で左右対応付け確認後、間違ってたら **launch arg で swap 可能** (image rebuild 不要):
+実映像で左右対応付け確認後、機体固有の対応をcamera-only serviceにも保存する。
+USBの`/dev/videoN`番号ではなくserialで固定するため、再起動や抜き差し後も左右を維持できる。
 
 ```bash
-# 例: 実映像で左右逆と判明した場合
-WRIST_LEFT_SERIAL=128422271925 WRIST_RIGHT_SERIAL=128422271048 \
-docker compose run --rm ramen_inference \
-    ros2 launch g1_bringup system.launch.py \
-    mock_hardware:=false enable_wrist_cameras:=true
+# 現在の実機で目視確認済みの物理対応
+sudo tee /etc/default/iros-ramen-avp-teleimager >/dev/null <<'EOF'
+WRIST_LEFT_SERIAL=128422271048
+WRIST_RIGHT_SERIAL=128422271925
+EOF
+sudo systemctl restart avp_teleimager.service
 ```
+
+別機体・交換後は必ず実映像で左右を確認し、この2値を更新する。片側だけの指定、
+同一serialの指定、存在しないserialはsafe launcherが起動を拒否する。
 
 **CLAUDE.md Key Facts (確定事項)**:
 - **IR projector OFF** (`depth_module.emitter_enabled=0`)。dataset G1_WBT の passive stereo と整合、active stereo は使わない

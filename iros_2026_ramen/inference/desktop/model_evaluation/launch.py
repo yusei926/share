@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from data.flip_table_data_augmentation.teleop.config import load_teleop_config
@@ -210,6 +211,7 @@ def main() -> int:
         "lower_body_owner": "unitree_regular_mode",
         "lower_body_command_dimensions": 0,
         "requested_max_seconds": args.max_seconds,
+        "execution_steps": spec.execution_steps,
         "actuated": args.actuate,
         "desktop_camera_preview_enabled": not args.no_camera_preview,
         "source_commit": _source_commit(),
@@ -261,17 +263,49 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             process.terminate()
             runner_returncode = process.wait(timeout=10.0)
-    package = subprocess.run(
-        [
-            str(python),
-            "-m",
-            "inference.desktop.model_evaluation.package_recording",
-            str(run_dir / "capture"),
-            "--delete-frames",
-        ],
-        env=env,
-        check=False,
-    )
+    package_returncode: int | None = None
+    capture_report_path = run_dir / "capture" / "capture_report.json"
+    capture_report: dict[str, Any] = {}
+    if capture_report_path.is_file():
+        try:
+            capture_report = json.loads(capture_report_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            capture_report = {}
+    recording_started = bool(capture_report.get("recording_started", False))
+    if runner_returncode == 0 and recording_started:
+        package = subprocess.run(
+            [
+                str(python),
+                "-m",
+                "inference.desktop.model_evaluation.package_recording",
+                str(run_dir / "capture"),
+                "--delete-frames",
+            ],
+            env=env,
+            check=False,
+        )
+        package_returncode = package.returncode
+        package_status = "completed" if package_returncode == 0 else "failed"
+    elif runner_returncode == 0:
+        # Read-only preflight and pre-motion-only runs intentionally never
+        # open the policy recording interval. The live four-camera monitor is
+        # still available, but there is nothing meaningful to package.
+        package_status = "skipped_no_policy_interval"
+        print(
+            "[recording] no policy interval was started; skipping video packaging",
+            flush=True,
+        )
+    else:
+        # Failed policy runs are ineligible for W&B. Preserve their raw JPEGs
+        # and JSONL diagnostics for investigation, but do not make the operator
+        # wait for an expensive four-video conversion after the robot has
+        # already returned to Regular Mode.
+        print(
+            "[recording] runner failed; retaining raw diagnostic capture and "
+            "skipping video packaging",
+            flush=True,
+        )
+        package_status = "skipped_runner_failed"
     decision = evaluate_run(
         run_dir,
         runner_returncode=runner_returncode,
@@ -282,7 +316,8 @@ def main() -> int:
     metadata["finished_at_jst"] = datetime.now(
         ZoneInfo("Asia/Tokyo")
     ).isoformat(timespec="seconds")
-    metadata["video_packager_returncode"] = package.returncode
+    metadata["video_packager_returncode"] = package_returncode
+    metadata["video_packager_status"] = package_status
     write_summary(run_dir, metadata=metadata, decision=decision)
     if not decision["eligible"]:
         status = {

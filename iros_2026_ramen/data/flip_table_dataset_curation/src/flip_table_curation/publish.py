@@ -82,16 +82,22 @@ def publish(config: CurationConfig) -> dict:
             )
         except Exception as error:
             raise RuntimeError("target main already contains an unrecognized dataset") from error
-        if sha256_file(Path(remote_manifest)) != manifest_sha:
+        if sha256_file(Path(remote_manifest)) == manifest_sha:
+            return {
+                "repo_id": config.target_repo_id,
+                "main_commit_sha": main_sha,
+                "reused_existing_main": True,
+                "local_validation": local_validation,
+            }
+        existing_manifest = json.loads(Path(remote_manifest).read_text(encoding="utf-8"))
+        if (
+            existing_manifest.get("schema_version") != MANIFEST_SCHEMA
+            or existing_manifest.get("target_repo_id") != config.target_repo_id
+            or not bool(config.section("target").get("allow_replace_existing_main", False))
+        ):
             raise RuntimeError(
-                "target main contains a different manifest; refusing to overwrite"
+                "target main contains a different manifest and is not an explicitly replaceable curated dataset"
             )
-        return {
-            "repo_id": config.target_repo_id,
-            "main_commit_sha": main_sha,
-            "reused_existing_main": True,
-            "local_validation": local_validation,
-        }
     stage = f"staging-{manifest_sha[:16]}"
     api.create_branch(
         repo_id=config.target_repo_id,
@@ -172,7 +178,7 @@ def publish(config: CurationConfig) -> dict:
         revision="main",
         parent_commit=main_sha,
         operations=operations,
-        commit_message="Publish verified flip_table_2 curated LeRobot v3 dataset",
+        commit_message="Publish verified manually curated flip_table_3 LeRobot v3 dataset",
     )
     final_files = set(
         api.list_repo_files(

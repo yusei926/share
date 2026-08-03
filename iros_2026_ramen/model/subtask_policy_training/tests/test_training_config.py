@@ -344,11 +344,11 @@ def test_resolve_groot_n17_defaults(monkeypatch) -> None:
 
     values = module.resolve(config)
 
-    assert values["DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
-    assert values["DATASET_REVISION"] == "0dc47877dfb2efbea796a059c81290c649bc773c"
-    assert values["GROOT_DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
+    assert values["DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_3"
+    assert values["DATASET_REVISION"] == "c06d69f319e9c3a0738f2144a647b848eb01cd28"
+    assert values["GROOT_DATASET_REPO_ID"] == "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_3"
     assert values["POLICY_REPO_ID"] == (
-        "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2"
+        "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_3"
     )
     assert values["WANDB_PROJECT"] == "iros2026-ramen-flip-table"
     assert values["CONTROL_SCOPE"] == "upper_body_relative_eef"

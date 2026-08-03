@@ -26,6 +26,12 @@ def environment_flag(name: str, *, default: bool) -> bool:
     raise ValueError(f"{name} must be boolean")
 
 
+def enable_camera_preview_for_policy_runner() -> None:
+    """Enable the monitor for direct real-policy runners unless opted out."""
+
+    os.environ.setdefault("IROS_REAL_EVAL_DESKTOP_PREVIEW", "true")
+
+
 def decode_camera_jpeg(payload: bytes) -> np.ndarray:
     import cv2
 

@@ -125,6 +125,32 @@ FAMILY_CONTRACTS: Mapping[str, FamilyContract] = {
             {"head_left", "left_wrist", "right_wrist"}
         ),
     ),
+    "furniture_groot_candidate_v1": FamilyContract(
+        family="furniture_groot_candidate_v1",
+        runner="inference.desktop.upper_policy.run_flip_table_furniture_groot",
+        worker=(
+            "model/subtask_policy_training/deployment/"
+            "real_furniture_groot_v2_candidate_worker.py"
+        ),
+        state_dim=49,
+        # The trusted worker decodes the model-native 53-D H40 output and
+        # exposes only physical arms14 + Dex1 2 at this boundary.
+        action_dim=16,
+        action_horizon=40,
+        observation_horizon=2,
+        state_semantics="eef_xyz_rot6d18+hand7x2+arms14+waist3",
+        action_semantics=(
+            "model_decoded_absolute53;worker_exposes_absolute_arms14+"
+            "dex1_physical2;discard_eef,waist,base,navigation;"
+            "intermediate_unselected_candidate"
+        ),
+        allowed_camera_roles=frozenset(
+            {"head_left", "left_wrist", "right_wrist"}
+        ),
+        required_camera_roles=frozenset(
+            {"head_left", "left_wrist", "right_wrist"}
+        ),
+    ),
 }
 SUPPORTED_FAMILIES = frozenset(FAMILY_CONTRACTS)
 _MANIFEST_FIELDS = frozenset(

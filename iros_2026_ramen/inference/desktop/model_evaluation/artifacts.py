@@ -327,6 +327,20 @@ def _validate_static_contract(checkpoint: Path, spec: ModelSpec) -> None:
             raise ValueError("Diffusion state normalization is not 19-D")
         if len((normalization.get("action") or {}).get("mean", ())) != 16:
             raise ValueError("Diffusion action normalization is not 16-D")
+    elif spec.family == "furniture_groot_candidate_v1":
+        from inference.desktop.upper_policy.furniture_groot_contract import (
+            validate_legacy_v2_candidate_checkpoint,
+        )
+
+        if spec.expected_model_sha256 is None:
+            raise ValueError("Furniture-GR00T candidate model hash is not pinned")
+        validate_legacy_v2_candidate_checkpoint(
+            checkpoint,
+            expected_model_sha256=spec.expected_model_sha256,
+            # validate_artifacts already checked this exact model hash before
+            # entering the static contract validator.
+            verify_model_hash=False,
+        )
 
 
 def _read_json(path: Path) -> dict[str, Any]:

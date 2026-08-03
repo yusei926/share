@@ -23,7 +23,7 @@
   防止しています。速度・加速度など8個の安全制限だけを、レビュー済み上限内で
   model family共通に指定できます。
 
-現在のtrusted familyは次の4種類です。
+現在のtrusted familyは次の5種類です。
 
 | family | model入力 | model出力 | canonical化 |
 |---|---|---|---|
@@ -31,6 +31,14 @@
 | `groot_absolute_joint_v1` | 4 RGB + 38D | absolute 38D | root/脚/腰を破棄し腕・Dex1だけ |
 | `groot_relative_eef_v1` | 3 RGB + 49D | decoded 53D | EEF/腰/base/navigationを破棄 |
 | `diffusion_chunk_relative_v1` | 3 RGB×2 + 19D | relative 16D | measured腕へ1回だけanchor |
+| `furniture_groot_candidate_v1` | 3 RGB×2 + 49D | decoded 53D→worker 16D | EEF/腰/base/navigationを破棄。未選定候補専用 |
+
+`furniture_groot_candidate_v1`は、複数のresumable checkpointしか持たない過去repoの
+うち、明示的に固定した1候補を比較評価するためのfamilyです。完成済みreleaseの検査を
+緩めるものではありません。現在登録している
+`IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints`は20kだけを固定し、
+`execution_steps=10`、temporal ensembleなしで動かしますが、sim選定済み・release認定済み
+とは表示しません。
 
 ## 環境
 
@@ -190,8 +198,9 @@ pre-motionを必ず実行します。
 3. 腕の横幅を維持したまま前方へ移し、肘が机の内側を横切らないようにする
 4. 肘と手首を少し下げた前方待機姿勢へ移す
 5. 対象モデルで固定した学習開始姿勢へ移す。通常は各episodeの0フレーム目の
-   `action.robot_q_desired`中央値、ACT joint16は学習元deploymentで選ばれた
-   episode 2101 frame 0のmedoidを使用する
+   `action.robot_q_desired`中央値を使用する。pick-leg ACTだけは学習元deploymentで
+   選ばれたepisode 2101 frame 0のmedoidを使い、pre-straddle ACTはcheckpointに
+   記録された227 episodeのframe 0中央値を使う。Dex1も同じ対象集合の初期値へ合わせる
 6. その姿勢を重力補償付きで保持し、空のEnter入力後にだけfresh
    camera/state/predictionを再検査してpolicy実行を開始する
 
@@ -204,6 +213,10 @@ Enter待機中も30 Hzで
 検査するため、watchdogによる意図しないarm_sdk解放は行いません。Ctrl+C、状態異常、
 waypoint未到達、Enter後のmodel安全検査失敗はいずれもpolicyを開始せずcontrolled
 releaseへ進みます。pre-motionとpolicyのどちらも腰・脚・rootのcommand次元は0です。
+ACTはcheckpointの`n_action_steps=30`と一致する30 stepを実行してから再推論し、
+Dex1のnative値`[0,4.5]`はhardware境界で一度だけ`[0,1]`へ変換します。各推論の
+raw 30×16 chunk、入力state16、制限後の腕target、Dex1のphysical値と開き率を
+`events.jsonl`へ別々の単位名で保存します。
 正常終了・Ctrl+C・検査失敗時は、policy最終姿勢からdataset frame-0、前方待機、
 前方退避、横退避、shoulder後退、起動直前に実測した腕姿勢の順で逆走してから、
 arm_sdk weightを段階的に0へ戻します。解放後は`fsm_id=501, fsm_mode=0`への復帰も
@@ -222,8 +235,9 @@ mode 0/1を許可します。これは任意FSMを許可する迂回ではなく
 
 - head-left、head-right、left-wrist、right-wristのMP4
 - 29D実関節位置・速度、Dex1状態、適用済み腕・Dex1 target
-- backendが受け取ったすべての腕・Dex1 command
-- policy runnerの推論、pre-motion、policy action、復帰event
+- policy開始から終了までのbackend腕・Dex1 command（14D+2D）
+- policy開始から終了までのstateと4カメラ映像
+- policy runnerの推論、pre-motion、policy action、復帰event（event log）
 - model/revision、source commit、安全制限、camera cadence、完了判定
 
 W&Bの既定projectは次です。最初の有効runのupload時にW&B側へ
@@ -234,13 +248,20 @@ entity:  ken05-matuo-llm-88_llm_2025_suzuki
 project: iros-2026-ramen-real-policy-evaluation
 ```
 
-共通launcherの起動中は、Desktopに4カメラmonitorも自動表示されます。上段が
+共通launcherと直接 real-policy runner の起動直後から終了まで、Desktopに4カメラ
+monitorも自動表示されます。モデル重みの読込中もread-onlyで最新フレームを更新し、上段が
 head-left/head-right、下段がleft-wrist/right-wristで、左右腕の実測関節角も
 重ねて表示します。表示は別processのlatest-only経路なので、画面描画が遅れても
 推論、実機指令、30 Hz収録を待たせません。ウィンドウ上の`q`/`Esc`または閉じる
 操作はmonitorだけを終了し、ロボット停止操作にはなりません。実機停止には従来どおり
 E-stopまたは起動terminalのCtrl+Cを使用してください。GUIのないSSH sessionなどで
 表示しない場合は共通launcherへ`--no-camera-preview`を付けます。
+
+monitor表示とファイル収録は独立しています。monitorはコマンド起動直後から、モデル読込、
+pre-motion、Enter待機、policy実行、腕の安全復帰まで継続します。一方、MP4、
+`states.jsonl`、`backend_actions.jsonl`へ保存するのは、最後のEnterとRegular Mode
+再確認を通過してからpolicyが終了するまでの単一区間だけです。pre-motionと復帰動作は
+映像で確認できますが、学習・評価用の収録区間には混入しません。
 
 自動uploadは、`--actuate`付き、policy実行10秒以上、runner exit code 0、
 `return_motion_complete`確認、収録drop/error 0、4カメラMP4完成のすべてを

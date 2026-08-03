@@ -23,6 +23,7 @@ from model.subtask_policy_training.gr00t.g1_full_body_mapping import (
 )
 from model.subtask_policy_training.gr00t.n17_contract import (
     BASE_MODEL_REVISION,
+    EXPECTED_TUNING_SCOPE,
     validate_finalized_furniture_checkpoint,
 )
 from model.subtask_policy_training.gr00t.temporal_ensemble import (
@@ -45,6 +46,8 @@ VIDEO_HORIZON = len(VIDEO_DELTA_INDICES)
 DATASET_FPS = 30.0
 MODEL_ACTION_HORIZON = GROOT_N17_NATIVE_ACTION_HORIZON
 DEX1_DATASET_OPEN_VALUE = DEX1_OPEN
+LEGACY_V2_DATASET_REPO_ID = "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
+LEGACY_V2_BASE_MODEL_PATH = "/dev/shm/iros_2026_ramen_groot_n17/groot_overlay"
 
 
 def compose_model_state(
@@ -195,6 +198,146 @@ def validate_checkpoint_metadata(checkpoint: str | Path) -> dict[str, Any]:
         "lower_body_command_dimensions": 0,
         "weights_sha256": model_hash,
         "progress_enabled": bool(config.get("progress_enabled", False)),
+        "release_certified": True,
+    }
+
+
+def validate_legacy_v2_candidate_checkpoint(
+    checkpoint: str | Path,
+    *,
+    expected_model_sha256: str,
+    verify_model_hash: bool = True,
+) -> dict[str, Any]:
+    """Validate the immutable 20k v2 training candidate without promoting it.
+
+    This intentionally does not call the finalized-release validator.  The
+    checkpoint repository contains resumable training snapshots, not the sim
+    selection and release evidence required by :func:`validate_checkpoint_metadata`.
+    Keeping this separate prevents an intermediate candidate from being
+    mistaken for a release-certified policy.
+    """
+
+    root = Path(checkpoint).expanduser().resolve()
+    required = (
+        "config.json",
+        "model.safetensors",
+        "policy_preprocessor.json",
+        "policy_postprocessor.json",
+        "policy_preprocessor_step_3_groot_n1_7_pack_inputs_v1.safetensors",
+        "train_config.json",
+    )
+    missing = [name for name in required if not (root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"incomplete legacy Furniture-GR00T candidate: {missing}")
+    actual_model_sha256 = (
+        _sha256(root / "model.safetensors")
+        if verify_model_hash
+        else expected_model_sha256
+    )
+    if actual_model_sha256 != expected_model_sha256:
+        raise ValueError(
+            "legacy Furniture-GR00T model hash changed: "
+            f"expected={expected_model_sha256}, actual={actual_model_sha256}"
+        )
+
+    config = _read_json(root / "config.json")
+    expected_scalars = {
+        "type": "furniture_groot",
+        "base_model_path": LEGACY_V2_BASE_MODEL_PATH,
+        "base_model_revision": BASE_MODEL_REVISION,
+        "embodiment_tag": REAL_G1_RELATIVE_EEF_EMBODIMENT_TAG,
+        "chunk_size": MODEL_ACTION_HORIZON,
+        "n_action_steps": 10,
+        "max_state_dim": GROOT_N17_PACKED_STATE_DIM,
+        "max_action_dim": GROOT_N17_PACKED_ACTION_DIM,
+        "valid_action_dim": GROOT_N17_VALID_ACTION_DIM,
+        "use_relative_actions": True,
+        "progress_enabled": False,
+        "consistent_gpu_augmentation": True,
+    }
+    mismatch = {
+        key: (config.get(key), expected)
+        for key, expected in expected_scalars.items()
+        if config.get(key) != expected
+    }
+    if mismatch:
+        raise ValueError(f"legacy Furniture-GR00T config changed: {mismatch}")
+    if any(config.get(key) != value for key, value in EXPECTED_TUNING_SCOPE.items()):
+        raise ValueError("legacy Furniture-GR00T tuning scope changed")
+    if set(config.get("relative_exclude_joints") or ()) != {
+        "hand",
+        "waist",
+        "base_height",
+        "navigate",
+    }:
+        raise ValueError("legacy Furniture-GR00T relative exclusions changed")
+    if config.get("action_decode_transform") is not None:
+        raise ValueError("legacy candidate contains a simulator-only action transform")
+    _validate_features(config)
+
+    training = _read_json(root / "train_config.json")
+    dataset = training.get("dataset") or {}
+    episodes = dataset.get("episodes")
+    if (
+        dataset.get("repo_id") != LEGACY_V2_DATASET_REPO_ID
+        or dataset.get("revision") is not None
+        or episodes != list(range(156))
+    ):
+        raise ValueError("legacy candidate training dataset provenance changed")
+
+    pre = _read_json(root / "policy_preprocessor.json")
+    post = _read_json(root / "policy_postprocessor.json")
+    pre_steps = [step.get("registry_name") for step in pre.get("steps", [])]
+    if pre_steps != [
+        "rename_observations_processor",
+        "to_batch_processor",
+        "furniture_groot_temporal_progress_v1",
+        "groot_n1_7_pack_inputs_v1",
+        "furniture_groot_consistent_gpu_augmentation_v1",
+        "groot_n1_7_vlm_encode_v1",
+        "device_processor",
+    ]:
+        raise ValueError("legacy Furniture-GR00T preprocessor pipeline changed")
+    post_steps = [step.get("registry_name") for step in post.get("steps", [])]
+    if post_steps != ["groot_n1_7_action_decode_v1", "device_processor"]:
+        raise ValueError("legacy Furniture-GR00T postprocessor pipeline changed")
+    pack = pre["steps"][3].get("config") or {}
+    if any(
+        pack.get(key) != value
+        for key, value in {
+            "state_horizon": 1,
+            "action_horizon": 40,
+            "valid_action_horizon": 40,
+            "video_horizon": 2,
+            "max_state_dim": 132,
+            "max_action_dim": 132,
+            "embodiment_tag": REAL_G1_RELATIVE_EEF_EMBODIMENT_TAG,
+            "video_modality_keys": list(CAMERA_ROLES),
+        }.items()
+    ):
+        raise ValueError("legacy Furniture-GR00T serialized pack contract changed")
+    decode = post["steps"][0].get("config") or {}
+    if decode.get("env_action_dim") != 53 or decode.get("use_relative_action") is not True:
+        raise ValueError("legacy Furniture-GR00T action decoder changed")
+
+    return {
+        "task": TASK_TEXT,
+        "state_dim": REAL_G1_RELATIVE_EEF_STATE_DIM,
+        "logical_action_dim": REAL_G1_RELATIVE_EEF_ACTION_DIM,
+        "executable_action_dim": PHYSICAL_ACTION_DIM,
+        "action_horizon": MODEL_ACTION_HORIZON,
+        "execution_steps": 10,
+        "temporal_lambda": None,
+        "temporal_lambda_label": "none",
+        "camera_roles": list(CAMERA_ROLES),
+        "video_delta_indices": list(VIDEO_DELTA_INDICES),
+        "lower_body_command_dimensions": 0,
+        "weights_sha256": actual_model_sha256,
+        "progress_enabled": False,
+        "release_certified": False,
+        "candidate_status": "intermediate_unselected_20k",
+        "training_dataset_repo_id": LEGACY_V2_DATASET_REPO_ID,
+        "training_dataset_revision": None,
     }
 
 

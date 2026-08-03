@@ -4,12 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
-from .analysis import analyze, write_decision
-from .audit import audit_source
+from .audit import audit_labels
 from .build import build_dataset
 from .config import DEFAULT_CONFIG_PATH, load_config
 from .publish import publish
-from .review import generate_review
 from .validate import validate_local
 
 
@@ -17,15 +15,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     commands = result.add_subparsers(dest="command", required=True)
-    commands.add_parser("audit-source")
-    commands.add_parser("analyze")
-    commands.add_parser("review")
-    decision = commands.add_parser("decide")
-    decision.add_argument(
-        "--orientation-cluster", type=int, action="append", required=True
-    )
-    decision.add_argument("--trajectory-cluster", type=int, required=True)
-    decision.add_argument("--reviewer", required=True)
+    commands.add_parser("audit-labels")
     build = commands.add_parser("build")
     build.add_argument("--max-episodes", type=int)
     validate = commands.add_parser("validate")
@@ -37,20 +27,8 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     config = load_config(args.config)
-    if args.command == "audit-source":
-        value = audit_source(config, include_video_decode=True)
-    elif args.command == "analyze":
-        value = analyze(config)
-    elif args.command == "review":
-        value = {"review": str(generate_review(config))}
-    elif args.command == "decide":
-        value = write_decision(
-            config,
-            orientation_clusters=args.orientation_cluster,
-            trajectory_cluster=args.trajectory_cluster,
-            reviewer=args.reviewer,
-        )
-        print("[decision] recorded; run analyze again to finalize membership")
+    if args.command == "audit-labels":
+        value = audit_labels(config)
     elif args.command == "build":
         value = {"root": str(build_dataset(config, maximum_episodes=args.max_episodes))}
     elif args.command == "validate":

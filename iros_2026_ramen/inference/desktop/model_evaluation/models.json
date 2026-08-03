@@ -1,6 +1,34 @@
 {
   "schema_version": 1,
   "models": {
+    "pre_straddle_act_augxx_s40k": {
+      "aliases": ["pana_nakatsuka_act_pre_straddle_augxx_s40k_20260803"],
+      "repo_id": "Team-RAMEN/pana_nakatsuka_act_pre_straddle_augxx_s40k_20260803",
+      "revision": "9ce99b27bc8d846891c7851ffc841deb540bd404",
+      "family": "act_absolute_joint16_v1",
+      "task": "pre-straddle table legs",
+      "camera_roles": ["head_left", "head_right", "left_wrist", "right_wrist"],
+      "observation_horizon": 1,
+      "model_state_dim": 16,
+      "model_action_dim": 16,
+      "model_action_horizon": 30,
+      "execution_steps": 30,
+      "state_semantics": "g1_sdk_arms14+dex1_physical2",
+      "action_semantics": "absolute_arms14_rad+dex1_physical2;clamp_to_serialized_training_support",
+      "runner": "inference.desktop.upper_policy.run_pick_leg_act",
+      "worker": "model/subtask_policy_training/deployment/real_act_joint16_worker.py",
+      "expected_model_sha256": "8a0952c7318b27134729e9fd91d0f733437714527d67e4fc0506aa75086d9a6b",
+      "artifact": {
+        "checkpoint_subdir": "",
+        "required_files": ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json", "policy_preprocessor_step_3_normalizer_processor.safetensors", "policy_postprocessor_step_0_unnormalizer_processor.safetensors", "train_config.json"],
+        "allow_patterns": ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json", "policy_preprocessor_step_3_normalizer_processor.safetensors", "policy_postprocessor_step_0_unnormalizer_processor.safetensors", "train_config.json"],
+        "file_sha256": {
+          "model.safetensors": "8a0952c7318b27134729e9fd91d0f733437714527d67e4fc0506aa75086d9a6b",
+          "policy_preprocessor_step_3_normalizer_processor.safetensors": "2f5a0d1942c354bd0ab6d8a1cb02ec938e0f8d6b712db4d3e511cf5236212ee4",
+          "policy_postprocessor_step_0_unnormalizer_processor.safetensors": "2f5a0d1942c354bd0ab6d8a1cb02ec938e0f8d6b712db4d3e511cf5236212ee4"
+        }
+      }
+    },
     "pick_legs_act_joint16_augxx_s40k": {
       "aliases": ["pana_nakatsuka_act_pick_joint16_augxx_s40k_20260730"],
       "repo_id": "Team-RAMEN/pana_nakatsuka_act_pick_joint16_augxx_s40k_20260730",
@@ -12,7 +40,7 @@
       "model_state_dim": 16,
       "model_action_dim": 16,
       "model_action_horizon": 30,
-      "execution_steps": 8,
+      "execution_steps": 30,
       "state_semantics": "g1_sdk_arms14+dex1_physical2",
       "action_semantics": "absolute_arms14_rad+dex1_physical2;clamp_to_serialized_training_support",
       "runner": "inference.desktop.upper_policy.run_pick_leg_act",
@@ -132,6 +160,33 @@
         "allow_patterns": ["README.md", "config.json", "model.safetensors", "normalization.json", "train_config.json", "training_manifest.json", "training_run_record.json", "evaluation_report.json", "policy_preprocessor.json", "policy_postprocessor.json", "_diffusion_config/config.json"],
         "file_sha256": {
           "model.safetensors": "a054158be8cb9c9ffee4c96ae23d56dd562f64218de89b942b9af8086ed4388e"
+        }
+      }
+    },
+    "flip_table_groot_n17_v2_baseline_20k_candidate": {
+      "aliases": ["IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints"],
+      "repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints",
+      "revision": "1a408d87eda8d01f9b79113f1aed97a5d0811bff",
+      "family": "furniture_groot_candidate_v1",
+      "task": "flip table",
+      "camera_roles": ["head_left", "left_wrist", "right_wrist"],
+      "observation_horizon": 2,
+      "model_state_dim": 49,
+      "model_action_dim": 16,
+      "model_action_horizon": 40,
+      "execution_steps": 10,
+      "state_semantics": "eef_xyz_rot6d18+hand7x2+arms14+waist3",
+      "action_semantics": "model_decoded_absolute53;worker_exposes_absolute_arms14+dex1_physical2;discard_eef,waist,base,navigation;intermediate_unselected_candidate",
+      "runner": "inference.desktop.upper_policy.run_flip_table_furniture_groot",
+      "worker": "model/subtask_policy_training/deployment/real_furniture_groot_v2_candidate_worker.py",
+      "expected_model_sha256": "0a8d3c6756b174df54c4ed8fce24455ec934648c1ca120fec5847cd87c88156f",
+      "artifact": {
+        "checkpoint_subdir": "checkpoints/020000/pretrained_model",
+        "required_files": ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json", "policy_preprocessor_step_3_groot_n1_7_pack_inputs_v1.safetensors", "train_config.json"],
+        "allow_patterns": ["checkpoints/020000/pretrained_model/config.json", "checkpoints/020000/pretrained_model/model.safetensors", "checkpoints/020000/pretrained_model/policy_preprocessor.json", "checkpoints/020000/pretrained_model/policy_postprocessor.json", "checkpoints/020000/pretrained_model/policy_preprocessor_step_3_groot_n1_7_pack_inputs_v1.safetensors", "checkpoints/020000/pretrained_model/train_config.json"],
+        "file_sha256": {
+          "model.safetensors": "0a8d3c6756b174df54c4ed8fce24455ec934648c1ca120fec5847cd87c88156f",
+          "policy_preprocessor_step_3_groot_n1_7_pack_inputs_v1.safetensors": "87118aa905a39ebdecfd7937cecaf99458f47b75a07806106f1825a6a3cc7293"
         }
       }
     }

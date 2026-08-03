@@ -1,7 +1,7 @@
 [workspace]
 name = "flip-table-dataset-curation"
 version = "0.1.0"
-description = "Lossless automatic curation for Team RAMEN flip-table LeRobot v3 data"
+description = "Manual-label-driven curation for Team RAMEN flip-table LeRobot v3 data"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
@@ -13,26 +13,14 @@ pyarrow = "==20.0.0"
 pandas = "==2.2.3"
 pyyaml = "==6.0.2"
 huggingface_hub = "==0.33.4"
-scikit-learn = "==1.7.0"
-opencv = "==4.11.0"
-pinocchio = "==3.7.0"
 ffmpeg = "==7.1.1"
 pytest = "==8.4.1"
-
-[pypi-dependencies]
-ultralytics = "==8.3.174"
 
 [activation.env]
 PYTHONPATH = "src"
 
-[tasks.audit-source]
-cmd = "python -m flip_table_curation.cli audit-source"
-
-[tasks.analyze]
-cmd = "python -m flip_table_curation.cli analyze"
-
-[tasks.review]
-cmd = "python -m flip_table_curation.cli review"
+[tasks.audit-labels]
+cmd = "python -m flip_table_curation.cli audit-labels"
 
 [tasks.build]
 cmd = "python -m flip_table_curation.cli build"

@@ -20,6 +20,9 @@ from inference.desktop.upper_policy.groot_pick_leg_contract import (
     compose_model_state as compose_pick_state,
     extract_executable_action as extract_pick_action,
 )
+from inference.desktop.upper_policy.furniture_groot_contract import (
+    compose_model_state as compose_furniture_state,
+)
 from model.subtask_policy_training.gr00t.g1_full_body_mapping import (
     source_euler_xyz_pose_to_xyz_rot6d,
 )
@@ -305,12 +308,64 @@ class DiffusionChunkRelativeAdapter(FamilyAdapter):
         }
 
 
+class FurnitureGrootCandidateAdapter(FamilyAdapter):
+    """Adapter for a reviewed Furniture-GR00T candidate worker's 16-D output."""
+
+    def model_state(self, observation: CanonicalObservation) -> np.ndarray:
+        self.validate_observation(observation)
+        if observation.eef_xyz_euler is None:
+            raise ValueError("Furniture-GR00T requires root-frame EEF XYZ+Euler")
+        return compose_furniture_state(
+            observation.body_joint_position_rad,
+            observation.dex1_opening_fraction,
+            observation.eef_xyz_euler,
+        )
+
+    def canonical_action(
+        self,
+        native_chunk: Sequence[Sequence[float]],
+        observation: CanonicalObservation,
+    ) -> np.ndarray:
+        del observation
+        physical = np.asarray(native_chunk, dtype=np.float64).copy()
+        expected = (self.spec.model_action_horizon, 16)
+        if physical.shape != expected or not np.isfinite(physical).all():
+            raise ValueError(f"Furniture-GR00T worker output must be finite {expected}")
+        physical[:, 14:] /= DEX1_DATASET_OPEN_VALUE
+        return self._finalize(physical)
+
+    def synthetic_native_action(self) -> np.ndarray:
+        native = np.zeros((self.spec.model_action_horizon, 16), dtype=np.float64)
+        native[:, 14:] = [1.125, 3.375]
+        return native
+
+    def offline_request(
+        self,
+        observation: CanonicalObservation,
+        state: np.ndarray,
+    ) -> dict[str, Any]:
+        return {
+            "type": "predict",
+            "request_id": 1,
+            "state": state.tolist(),
+            "camera_history": {
+                f"observation.images.{role}": [
+                    observation.camera_jpeg[role],
+                    observation.camera_jpeg[role],
+                ]
+                for role in ("head_left", "left_wrist", "right_wrist")
+            },
+            "task": self.spec.task,
+        }
+
+
 def adapter_for(spec: ModelSpec) -> FamilyAdapter:
     adapters = {
         "act_absolute_joint16_v1": ActAbsoluteJoint16Adapter,
         "groot_absolute_joint_v1": GrootAbsoluteJointAdapter,
         "groot_relative_eef_v1": GrootRelativeEefAdapter,
         "diffusion_chunk_relative_v1": DiffusionChunkRelativeAdapter,
+        "furniture_groot_candidate_v1": FurnitureGrootCandidateAdapter,
     }
     try:
         return adapters[spec.family](spec)

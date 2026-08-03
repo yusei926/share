@@ -1278,6 +1278,47 @@ right_wrist_camera:
     assert wrist_serials == {"left-d405", "right-d405"}
 
 
+def test_safe_launcher_applies_machine_local_wrist_role_overrides(
+    monkeypatch, tmp_path
+) -> None:
+    from inference.desktop.xr import orin_teleimager_safe_launcher as launcher
+
+    config_path = tmp_path / "cameras.yaml"
+    config_path.write_text(
+        """
+head_camera:
+  serial_number: head-configured
+left_wrist_camera:
+  serial_number: physically-right
+right_wrist_camera:
+  serial_number: physically-left
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(launcher, "find_stereo_head_node", lambda: None)
+    monkeypatch.setattr(
+        launcher,
+        "find_stereo_head_uvc_serial",
+        lambda _node, serial_override=None: str(serial_override),
+    )
+
+    config, _identity, wrist_serials = launcher.prepare_config(
+        config_path,
+        left_wrist_serial_override="left-d405",
+        right_wrist_serial_override="right-d405",
+    )
+
+    assert config["left_wrist_camera"]["serial_number"] == "left-d405"
+    assert config["right_wrist_camera"]["serial_number"] == "right-d405"
+    assert wrist_serials == {"left-d405", "right-d405"}
+
+    with pytest.raises(RuntimeError, match="provided together"):
+        launcher.prepare_config(
+            config_path,
+            left_wrist_serial_override="left-d405",
+        )
+
+
 def test_safe_launcher_reports_expected_serials_on_realsense_enumeration_failure(
     monkeypatch,
 ) -> None:
@@ -3133,6 +3174,30 @@ def test_real_arm_sdk_state_watchdog_detects_stale_g1_or_dex1_feedback() -> None
         now_ns=now_ns,
         maximum_age_s=0.2,
     ) is True
+
+
+@pytest.mark.parametrize(
+    ("tracking", "published", "weight", "expected"),
+    [
+        (False, False, 0.0, False),
+        (True, False, 0.0, True),
+        (False, True, 0.0, True),
+        (False, False, 0.01, True),
+    ],
+)
+def test_real_arm_interlock_latches_only_after_arm_ownership_is_requested(
+    tracking: bool,
+    published: bool,
+    weight: float,
+    expected: bool,
+) -> None:
+    backend = RealDdsBackend.__new__(RealDdsBackend)
+    backend._command_lock = threading.Lock()
+    backend._tracking = tracking
+    backend._published = published
+    backend._arm_sdk_weight = weight
+
+    assert backend._arm_interlock_is_required() is expected
 
 
 def test_real_arm_sdk_uses_official_250hz_blend_clock() -> None:

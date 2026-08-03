@@ -40,7 +40,6 @@ from inference.desktop.upper_policy.act_pick_leg_contract import (  # noqa: E402
     ACTION_MAX,
     ACTION_MIN,
     CAMERA_ROLES,
-    DATASET_INITIAL_DEX1_OPENING_FRACTION,
     DEX1_DATASET_OPEN_VALUE,
     MODEL_ACTION_HORIZON,
     MODEL_REPO_ID,
@@ -48,7 +47,6 @@ from inference.desktop.upper_policy.act_pick_leg_contract import (  # noqa: E402
     MODEL_STATE_DIM,
     TASK_TEXT,
     camera_payloads,
-    clamp_native_action,
     compose_model_state,
 )
 from inference.desktop.upper_policy.gravity_compensation import (  # noqa: E402
@@ -64,8 +62,11 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (  # noqa: E
     PolicyStartPoseHold,
     append_log,
     command_from_action,
+    initialize_policy_worker_with_live_camera,
     run_arm_pre_motion,
     run_blocking_check_with_pose_hold,
+    start_policy_interval_recording,
+    stop_policy_interval_recording,
     return_arms_before_release,
     validate_runtime_backend,
     verify_regular_mode,
@@ -115,7 +116,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actuate", action="store_true")
     parser.add_argument("--max-seconds", type=float, default=5.0)
     parser.add_argument("--preflight-samples", type=int, default=3)
-    parser.add_argument("--action-execution-steps", type=int, default=8)
+    parser.add_argument(
+        "--action-execution-steps",
+        type=int,
+        default=MODEL_ACTION_HORIZON,
+        help=(
+            "Number of decoded ACT steps to execute before replanning. The "
+            "checkpoint was trained with n_action_steps=30, which is the "
+            "fail-safe default; the sealed launcher passes its pinned value."
+        ),
+    )
     parser.add_argument("--initial-delta-limit-rad", type=float, default=0.50)
     parser.add_argument("--step-delta-limit-rad", type=float, default=0.25)
     parser.add_argument("--pre-motion-arm-velocity-rad-s", type=float, default=0.5)
@@ -141,6 +151,8 @@ class PolicyWorker:
     output: Any
     ready: dict[str, Any]
     task: str
+    action_min: np.ndarray
+    action_max: np.ndarray
     request_id: int = 0
 
     @classmethod
@@ -195,7 +207,25 @@ class PolicyWorker:
             }
             if mismatch:
                 raise RuntimeError(f"ACT worker contract mismatch: {mismatch}")
-            return cls(process, process.stdin, process.stdout, ready, task)
+            action_min = np.asarray(contract.get("action_min"), dtype=np.float64)
+            action_max = np.asarray(contract.get("action_max"), dtype=np.float64)
+            if (
+                action_min.shape != (16,)
+                or action_max.shape != (16,)
+                or not np.isfinite(action_min).all()
+                or not np.isfinite(action_max).all()
+                or np.any(action_min > action_max)
+            ):
+                raise RuntimeError("ACT worker returned invalid serialized support")
+            return cls(
+                process,
+                process.stdin,
+                process.stdout,
+                ready,
+                task,
+                action_min,
+                action_max,
+            )
         except Exception:
             process.terminate()
             process.wait(timeout=10)
@@ -221,7 +251,13 @@ class PolicyWorker:
             raise RuntimeError(f"ACT worker failed: {response.get('error')}")
         if response.get("type") != "prediction" or response.get("request_id") != self.request_id:
             raise RuntimeError(f"unexpected ACT response: {response}")
-        return clamp_native_action(response["actions"]), float(response["inference_ms"])
+        values = np.asarray(response["actions"], dtype=np.float64)
+        expected = (MODEL_ACTION_HORIZON, 16)
+        if values.shape != expected or not np.isfinite(values).all():
+            raise RuntimeError(f"ACT worker returned invalid action {values.shape}")
+        return np.clip(values, self.action_min, self.action_max), float(
+            response["inference_ms"]
+        )
 
     def close(self) -> None:
         if self.process.poll() is None:
@@ -245,6 +281,8 @@ def validate_action_chunk(
     initial_delta_limit_rad: float,
     step_delta_limit_rad: float,
     enforce_initial_delta: bool,
+    action_min: np.ndarray = ACTION_MIN,
+    action_max: np.ndarray = ACTION_MAX,
 ) -> dict[str, float]:
     values = np.asarray(actions, dtype=np.float64)
     expected = (MODEL_ACTION_HORIZON, 16)
@@ -274,7 +312,10 @@ def validate_action_chunk(
         "initial_arm_delta_max_rad": initial,
         "chunk_step_delta_max_rad": step,
         "action_clamped_count": int(
-            np.count_nonzero((values <= ACTION_MIN + 1e-7) | (values >= ACTION_MAX - 1e-7))
+            np.count_nonzero(
+                (values <= np.asarray(action_min) + 1e-7)
+                | (values >= np.asarray(action_max) - 1e-7)
+            )
         ),
     }
 
@@ -304,6 +345,8 @@ def evaluate(
                 initial_delta_limit_rad=initial_delta_limit_rad,
                 step_delta_limit_rad=step_delta_limit_rad,
                 enforce_initial_delta=enforce_initial_delta,
+                action_min=worker.action_min,
+                action_max=worker.action_max,
             )
         )
     return predictions[-1], {
@@ -314,6 +357,71 @@ def evaluate(
         "arm_prediction_std_max_rad": float(np.stack(predictions)[:, :, :14].std(axis=0).max()),
         "action_clamped_count": max(v["action_clamped_count"] for v in checks),
     }
+
+
+def build_act_start_motion(
+    start_pose: SubtaskStartPose,
+) -> tuple[tuple[ArmPreMotionWaypoint, ...], dict[str, tuple[float, float]]]:
+    """Build collision-clearance motion ending at this model's frame-zero pose."""
+
+    if start_pose.dex1_opening_fraction is None:
+        raise ValueError(
+            "ACT start pose is missing its dataset frame-zero Dex1 opening"
+        )
+    waypoints = (
+        ArmPreMotionWaypoint(
+            "hands_full_open_before_clearance",
+            (0.0,) * 14,
+            tuple(range(14)),
+        ),
+    ) + build_arm_pre_motion_waypoints(start_pose.arm_position_rad)
+    hand_targets = {waypoint.name: (1.0, 1.0) for waypoint in waypoints}
+    hand_targets["dataset_frame0_pose"] = tuple(
+        start_pose.dex1_opening_fraction
+    )
+    return waypoints, hand_targets
+
+
+def log_prediction_chunk(
+    path: Path,
+    *,
+    actions: np.ndarray,
+    observation: TeleopObservation,
+    diagnostics: dict[str, float],
+    execution_steps: int,
+) -> None:
+    """Persist native physical ACT output before limiting or unit conversion."""
+
+    values = np.asarray(actions, dtype=np.float64)
+    append_log(
+        path,
+        {
+            "event": "prediction_chunk",
+            "action_units": "arms14_rad+dex1_physical_0_to_4.5",
+            "raw_action_chunk": values.tolist(),
+            "raw_action_first": values[0].tolist(),
+            "raw_action_last": values[-1].tolist(),
+            "raw_action_min": values.min(axis=0).tolist(),
+            "raw_action_max": values.max(axis=0).tolist(),
+            "model_state16": compose_model_state(
+                observation.body_joint_position_rad,
+                observation.dex1_opening_fraction,
+            ).tolist(),
+            "execution_steps": int(execution_steps),
+            **diagnostics,
+        },
+    )
+
+
+def limit_native_act_action(
+    limiter: PolicyActionLimiter, desired: np.ndarray
+) -> np.ndarray:
+    """Limit one native ACT target without applying a second Dex1 scaling."""
+
+    values = np.asarray(desired, dtype=np.float64)
+    if values.shape != (16,) or not np.isfinite(values).all():
+        raise ValueError("native ACT target must be finite [16]")
+    return limiter.apply(values)
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -334,6 +442,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    from data.flip_table_data_augmentation.teleop.desktop_preview import (
+        enable_camera_preview_for_policy_runner,
+    )
+
+    enable_camera_preview_for_policy_runner()
     args = parse_args()
     _validate_args(args)
     config = load_teleop_config(args.config)
@@ -348,19 +461,22 @@ def main() -> int:
     start_pose: SubtaskStartPose | None = None
     gravity: OfficialG1ArmGravityCompensator | None = None
     try:
-        worker = PolicyWorker.start(
-            args.worker_python, args.worker_script, args.checkpoint,
-            device=args.device, seed=args.seed,
-            expected_hash=args.expected_checkpoint_sha256,
-            model_repo_id=args.model_repo_id,
-            model_revision=args.model_revision, task=args.task,
+        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
+        worker = initialize_policy_worker_with_live_camera(
+            backend,
+            lambda: PolicyWorker.start(
+                args.worker_python, args.worker_script, args.checkpoint,
+                device=args.device, seed=args.seed,
+                expected_hash=args.expected_checkpoint_sha256,
+                model_repo_id=args.model_repo_id,
+                model_revision=args.model_revision, task=args.task,
+            ),
         )
         print(
             f"[model] ACT joint16 ready revision={args.model_revision[:12]} "
             f"device={worker.ready['device']}",
             flush=True,
         )
-        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
         observation = collect_fresh_observation(backend)
         if not args.actuate:
             _actions, diagnostics = evaluate(
@@ -415,22 +531,7 @@ def main() -> int:
         initial_arm = np.asarray(current.arm_joint_position_rad).copy()
         gravity = OfficialG1ArmGravityCompensator()
         actuation_started = True
-        start_waypoints = (
-            ArmPreMotionWaypoint(
-                "hands_full_open_before_clearance",
-                (0.0,) * 14,
-                tuple(range(14)),
-            ),
-        ) + build_arm_pre_motion_waypoints(start_pose.arm_position_rad)
-        # Keep both hands fully open throughout the collision-clearance path.
-        # Only the final dataset-frame0 stage adopts the exact training start
-        # values (4.43/4.47 on the dataset's 0..4.5 Dex1 scale).
-        startup_hand_targets = {
-            waypoint.name: (1.0, 1.0) for waypoint in start_waypoints
-        }
-        startup_hand_targets["dataset_frame0_pose"] = tuple(
-            DATASET_INITIAL_DEX1_OPENING_FRACTION.tolist()
-        )
+        start_waypoints, startup_hand_targets = build_act_start_motion(start_pose)
         current = run_arm_pre_motion(
             backend,
             config=config,
@@ -457,6 +558,7 @@ def main() -> int:
             lambda: verify_regular_mode(args.interface, arm_sdk_active=True),
             backend=backend, config=config, pose_hold=hold, latest=current,
         )
+        start_policy_interval_recording(backend, args.log)
         previous = _camera_generation(current)
         observation = collect_fresh_observation(
             backend, previous_generation=previous, hold=hold.refresh
@@ -470,6 +572,13 @@ def main() -> int:
             ),
             backend=backend, config=config, pose_hold=hold, latest=observation,
         )
+        log_prediction_chunk(
+            args.log,
+            actions=actions,
+            observation=observation,
+            diagnostics=diagnostics,
+            execution_steps=args.action_execution_steps,
+        )
         limiter = PolicyActionLimiter(
             np.asarray(current.arm_joint_position_rad),
             np.asarray(current.dex1_opening_fraction),
@@ -478,6 +587,8 @@ def main() -> int:
             arm_acceleration_rad_s2=args.policy_arm_acceleration_rad_s2,
             hand_velocity_fraction_s=args.policy_hand_velocity_fraction_s,
             hand_acceleration_fraction_s2=args.policy_hand_acceleration_fraction_s2,
+            arm_position_lower_rad=config.safety.arm_position_lower_rad,
+            arm_position_upper_rad=config.safety.arm_position_upper_rad,
         )
         print(
             "[armed] fresh Regular/state/4-camera ACT prediction verified; "
@@ -494,9 +605,12 @@ def main() -> int:
                 tick = time.monotonic()
                 live = backend.observe(timeout_s=min(0.05, config.safety.command_hold_timeout_s))
                 validate_runtime_backend(live)
-                canonical = desired.copy()
-                canonical[14:] /= DEX1_DATASET_OPEN_VALUE
-                limited = limiter.apply(canonical)
+                # Worker output and limiter input are both in the native
+                # physical contract: arms14 radians + Dex1 [0,4.5].  The
+                # limiter converts Dex1 to fraction internally exactly once;
+                # command_from_action performs the one hardware-boundary
+                # conversion on its physical result.
+                limited = limit_native_act_action(limiter, desired)
                 torque = gravity.torque_nm(limited[:14])
                 command_id = sequence.next()
                 backend.apply(
@@ -510,7 +624,10 @@ def main() -> int:
                         "event": "command",
                         "sequence": command_id,
                         "arm_target_rad": limited[:14].tolist(),
-                        "dex1_target_fraction": limited[14:].tolist(),
+                        "dex1_target_physical": limited[14:].tolist(),
+                        "dex1_target_fraction": (
+                            limited[14:] / DEX1_DATASET_OPEN_VALUE
+                        ).tolist(),
                         "lower_body_command_dimensions": 0,
                     },
                 )
@@ -529,6 +646,13 @@ def main() -> int:
                 step_delta_limit_rad=args.step_delta_limit_rad,
                 enforce_initial_delta=True,
             )
+            log_prediction_chunk(
+                args.log,
+                actions=actions,
+                observation=observation,
+                diagnostics=diagnostics,
+                execution_steps=args.action_execution_steps,
+            )
         print(f"[done] reached --max-seconds={args.max_seconds:.2f}", flush=True)
         return 0
     except KeyboardInterrupt:
@@ -536,6 +660,7 @@ def main() -> int:
         return 130
     finally:
         if backend is not None:
+            stop_policy_interval_recording(backend, args.log)
             if actuation_started:
                 if initial_arm is not None and start_pose is not None and gravity is not None and pre_motion_complete:
                     return_arms_before_release(

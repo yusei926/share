@@ -26,6 +26,8 @@ CAPTURE_ENV = "IROS_REAL_EVAL_CAPTURE_DIR"
 PREVIEW_ENV = "IROS_REAL_EVAL_DESKTOP_PREVIEW"
 CAPTURE_SCHEMA = "team_ramen_real_policy_capture/v1"
 CAMERA_ROLES = ("head_left", "head_right", "left_wrist", "right_wrist")
+STATE_CAPTURE_HZ = 30.0
+STATE_CAPTURE_PERIOD_NS = int(1.0e9 / STATE_CAPTURE_HZ)
 
 
 def _json_line(value: dict[str, Any]) -> str:
@@ -34,7 +36,7 @@ def _json_line(value: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class _ObservationItem:
-    state: dict[str, Any]
+    state: dict[str, Any] | None
     frames: tuple[tuple[str, int, bytes, dict[str, Any]], ...]
 
 
@@ -48,23 +50,35 @@ class RealEvaluationRecorder:
 
     def __init__(
         self,
-        root: Path,
+        root: Path | None,
         *,
         queue_capacity: int = 1024,
         preview: Any | None = None,
+        capture_initially_active: bool = True,
     ) -> None:
         if queue_capacity < 32:
             raise ValueError("evaluation capture queue must hold at least 32 records")
-        self.root = root.expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._frames_root = self.root / "frames"
-        for role in CAMERA_ROLES:
-            (self._frames_root / role).mkdir(parents=True, exist_ok=True)
-        self._queue: queue.Queue[_ObservationItem | _ActionItem | None] = queue.Queue(
-            maxsize=queue_capacity
+        self.root = None if root is None else root.expanduser().resolve()
+        self._capture_enabled = self.root is not None
+        self._frames_root: Path | None = None
+        if self.root is not None:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._frames_root = self.root / "frames"
+            for role in CAMERA_ROLES:
+                (self._frames_root / role).mkdir(parents=True, exist_ok=True)
+        self._queue: queue.Queue[_ObservationItem | _ActionItem | None] | None = (
+            queue.Queue(maxsize=queue_capacity) if self._capture_enabled else None
         )
         self._lock = threading.Lock()
         self._closed = False
+        self._recording_active = bool(
+            self._capture_enabled and capture_initially_active
+        )
+        self._recording_started = self._recording_active
+        self._recording_started_ns = (
+            time.monotonic_ns() if self._recording_active else None
+        )
+        self._recording_stopped_ns: int | None = None
         self._errors: list[str] = []
         self._preview_errors: list[str] = []
         self._preview = preview
@@ -73,22 +87,32 @@ class RealEvaluationRecorder:
         self._action_count = 0
         self._frame_counts = {role: 0 for role in CAMERA_ROLES}
         self._last_generation: dict[str, int] = {}
+        self._last_state_capture_ns: int | None = None
         self._first_frame_ns: dict[str, int] = {}
         self._last_frame_ns: dict[str, int] = {}
-        self._thread = threading.Thread(
-            target=self._writer,
-            name="real-evaluation-recorder",
-            daemon=False,
-        )
-        self._thread.start()
+        self._thread: threading.Thread | None = None
+        if self._capture_enabled:
+            self._thread = threading.Thread(
+                target=self._writer,
+                name="real-evaluation-recorder",
+                daemon=False,
+            )
+            self._thread.start()
 
     @classmethod
     def from_environment(cls) -> RealEvaluationRecorder | None:
-        value = os.environ.get(CAPTURE_ENV)
-        if not value:
+        capture_root = os.environ.get(CAPTURE_ENV)
+        preview_enabled = environment_flag(PREVIEW_ENV, default=False)
+        if not capture_root and not preview_enabled:
             return None
-        preview_enabled = environment_flag(PREVIEW_ENV, default=True)
-        recorder = cls(Path(value))
+        # The launcher creates the monitor/capture adapter as soon as the
+        # command starts.  Preview is live immediately, while the physical
+        # policy runner explicitly opens the single capture interval only
+        # after the final operator gate and safety checks have passed.
+        recorder = cls(
+            None if not capture_root else Path(capture_root),
+            capture_initially_active=False,
+        )
         if preview_enabled:
             try:
                 recorder._preview = DesktopPreviewProcess(
@@ -100,7 +124,48 @@ class RealEvaluationRecorder:
                 recorder._preview_errors.append(f"{type(exc).__name__}: {exc}")
         return recorder
 
-    def record_observation(self, observation: Any) -> None:
+    def start_capture(self) -> bool:
+        """Start the one policy-inference recording interval.
+
+        Returns ``False`` when file capture is disabled (preview-only mode).
+        A recorder deliberately supports one interval: silently appending a
+        later policy attempt to the same run would make state/action/video
+        timing ambiguous.
+        """
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("evaluation recorder is already closed")
+            if not self._capture_enabled:
+                return False
+            if self._recording_active:
+                return False
+            if self._recording_started:
+                raise RuntimeError(
+                    "evaluation capture interval has already been completed"
+                )
+            self._recording_active = True
+            self._recording_started = True
+            self._recording_started_ns = time.monotonic_ns()
+            self._recording_stopped_ns = None
+            return True
+
+    def stop_capture(self) -> bool:
+        """Close the policy-inference interval while keeping preview alive."""
+
+        with self._lock:
+            if not self._recording_active:
+                return False
+            self._recording_active = False
+            self._recording_stopped_ns = time.monotonic_ns()
+            return True
+
+    def record_observation(
+        self,
+        observation: Any,
+        *,
+        preview_status: str = "LIVE CAMERA",
+    ) -> None:
         if self._closed:
             return
         if self._preview is not None:
@@ -115,7 +180,7 @@ class RealEvaluationRecorder:
                 self._preview.submit(
                     camera_jpeg,
                     body_position[15:29],
-                    "MODEL EVALUATION",
+                    preview_status,
                 )
             except Exception as exc:  # noqa: BLE001
                 # The monitor is diagnostic-only.  Never make a GUI issue
@@ -123,28 +188,11 @@ class RealEvaluationRecorder:
                 with self._lock:
                     if not self._preview_errors:
                         self._preview_errors.append(f"{type(exc).__name__}: {exc}")
-        state = {
-            "schema_version": CAPTURE_SCHEMA,
-            "type": "state",
-            "sequence": int(observation.sequence),
-            "capture_monotonic_ns": int(observation.capture_monotonic_ns),
-            "body_joint_position_rad": list(observation.body_joint_position_rad),
-            "body_joint_velocity_rad_s": list(observation.body_joint_velocity_rad_s),
-            "dex1_opening_fraction": list(observation.dex1_opening_fraction),
-            "applied_arm_target_rad": list(observation.applied_arm_target_rad),
-            "applied_dex1_opening_target": list(
-                observation.applied_dex1_opening_target
-            ),
-            "camera_capture_monotonic_ns": dict(
-                observation.camera_capture_monotonic_ns
-            ),
-            "camera_bundle_valid": bool(observation.camera_bundle_valid),
-            "camera_skew_ms": float(observation.camera_skew_ms),
-            "stale_roles": list(observation.stale_roles),
-            "lower_body_command_dimensions": 0,
-        }
+        capture_ns = int(observation.capture_monotonic_ns)
         frames: list[tuple[str, int, bytes, dict[str, Any]]] = []
         with self._lock:
+            if not self._recording_active:
+                return
             for role in CAMERA_ROLES:
                 payload = observation.camera_jpeg.get(role)
                 metadata = dict(observation.camera_stream_metadata.get(role, {}))
@@ -174,7 +222,40 @@ class RealEvaluationRecorder:
                     "source_fps": metadata.get("source_fps"),
                     "transition_hz": metadata.get("transition_hz"),
                 }))
-            self._observation_count += 1
+            record_state = (
+                self._last_state_capture_ns is None
+                or capture_ns - self._last_state_capture_ns
+                >= STATE_CAPTURE_PERIOD_NS
+            )
+            if record_state:
+                self._last_state_capture_ns = capture_ns
+                self._observation_count += 1
+        state = None
+        if record_state:
+            state = {
+                "schema_version": CAPTURE_SCHEMA,
+                "type": "state",
+                "sequence": int(observation.sequence),
+                "capture_monotonic_ns": capture_ns,
+                "body_joint_position_rad": list(observation.body_joint_position_rad),
+                "body_joint_velocity_rad_s": list(
+                    observation.body_joint_velocity_rad_s
+                ),
+                "dex1_opening_fraction": list(observation.dex1_opening_fraction),
+                "applied_arm_target_rad": list(observation.applied_arm_target_rad),
+                "applied_dex1_opening_target": list(
+                    observation.applied_dex1_opening_target
+                ),
+                "camera_capture_monotonic_ns": dict(
+                    observation.camera_capture_monotonic_ns
+                ),
+                "camera_bundle_valid": bool(observation.camera_bundle_valid),
+                "camera_skew_ms": float(observation.camera_skew_ms),
+                "stale_roles": list(observation.stale_roles),
+                "lower_body_command_dimensions": 0,
+            }
+        if state is None and not frames:
+            return
         self._put(_ObservationItem(state=state, frames=tuple(frames)))
 
     def record_action(self, target: Any) -> None:
@@ -184,10 +265,14 @@ class RealEvaluationRecorder:
         value["recorded_monotonic_ns"] = time.monotonic_ns()
         value["lower_body_command_dimensions"] = 0
         with self._lock:
+            if not self._recording_active:
+                return
             self._action_count += 1
         self._put(_ActionItem(value=value))
 
     def _put(self, item: _ObservationItem | _ActionItem) -> None:
+        if self._queue is None:
+            return
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -195,6 +280,8 @@ class RealEvaluationRecorder:
                 self._queue_drops += 1
 
     def _writer(self) -> None:
+        if self.root is None or self._queue is None:
+            return
         try:
             with (
                 (self.root / "states.jsonl").open("a", encoding="utf-8") as states,
@@ -213,7 +300,8 @@ class RealEvaluationRecorder:
                         if isinstance(item, _ActionItem):
                             actions.write(_json_line(item.value))
                             continue
-                        states.write(_json_line(item.state))
+                        if item.state is not None:
+                            states.write(_json_line(item.state))
                         for role, frame_index, payload, metadata in item.frames:
                             relative = Path("frames") / role / f"{frame_index:08d}.jpg"
                             (self.root / relative).write_bytes(payload)
@@ -228,6 +316,7 @@ class RealEvaluationRecorder:
     def close(self) -> dict[str, Any]:
         if self._closed:
             return self.report()
+        self.stop_capture()
         self._closed = True
         if self._preview is not None:
             try:
@@ -235,22 +324,24 @@ class RealEvaluationRecorder:
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self._preview_errors.append(f"{type(exc).__name__}: {exc}")
-        try:
-            self._queue.put(None, timeout=2.0)
-        except queue.Full:
-            with self._lock:
-                self._errors.append("capture queue did not accept shutdown sentinel")
-        self._thread.join(timeout=30.0)
-        if self._thread.is_alive():
-            with self._lock:
-                self._errors.append("capture writer did not stop within 30 seconds")
+        if self._queue is not None and self._thread is not None:
+            try:
+                self._queue.put(None, timeout=2.0)
+            except queue.Full:
+                with self._lock:
+                    self._errors.append("capture queue did not accept shutdown sentinel")
+            self._thread.join(timeout=30.0)
+            if self._thread.is_alive():
+                with self._lock:
+                    self._errors.append("capture writer did not stop within 30 seconds")
         report = self.report()
-        temporary = self.root / "capture_report.json.tmp"
-        temporary.write_text(
-            json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(self.root / "capture_report.json")
+        if self.root is not None:
+            temporary = self.root / "capture_report.json.tmp"
+            temporary.write_text(
+                json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(self.root / "capture_report.json")
         return report
 
     def report(self) -> dict[str, Any]:
@@ -265,6 +356,21 @@ class RealEvaluationRecorder:
                 )
             return {
                 "schema_version": CAPTURE_SCHEMA,
+                "capture_enabled": self._capture_enabled,
+                "recording_active": self._recording_active,
+                "recording_started": self._recording_started,
+                "recording_started_monotonic_ns": self._recording_started_ns,
+                "recording_stopped_monotonic_ns": self._recording_stopped_ns,
+                "recording_duration_s": (
+                    None
+                    if self._recording_started_ns is None
+                    or self._recording_stopped_ns is None
+                    else (
+                        self._recording_stopped_ns
+                        - self._recording_started_ns
+                    )
+                    / 1.0e9
+                ),
                 "observation_count": self._observation_count,
                 "backend_action_count": self._action_count,
                 "camera_frame_count": dict(self._frame_counts),
@@ -273,7 +379,7 @@ class RealEvaluationRecorder:
                 "errors": list(self._errors),
                 "desktop_preview_errors": list(self._preview_errors),
                 "complete": (
-                    not self._thread.is_alive()
+                    (self._thread is None or not self._thread.is_alive())
                     and self._queue_drops == 0
                     and not self._errors
                 ),

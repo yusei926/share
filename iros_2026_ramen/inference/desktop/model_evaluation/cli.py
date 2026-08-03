@@ -385,6 +385,16 @@ def runner_argv(
         argv += ["--device", device]
     if log_path is not None:
         argv += ["--log", str(log_path)]
+    # Chunk execution is part of the sealed model contract, not an operator
+    # tuning knob.  ACT checkpoints here declare n_action_steps=30; forwarding
+    # the registry value prevents the runner from silently replanning after a
+    # legacy 8-step prefix. Other families keep their own reviewed defaults.
+    if spec.family in {
+        "act_absolute_joint16_v1",
+        "groot_absolute_joint_v1",
+        "groot_relative_eef_v1",
+    }:
+        argv += ["--action-execution-steps", str(spec.execution_steps)]
     # Only these model-independent motion limits may cross the sealed common
     # launcher boundary. The upper bounds are the highest reviewed defaults
     # used by any registered real runner; arbitrary runner arguments and

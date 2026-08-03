@@ -131,6 +131,8 @@ def test_h100_runner_has_independent_resumable_backups() -> None:
     assert "GROOT_LOCAL_CHECKPOINT_KEEP:-1" in runner
     assert "HF_XET_HIGH_PERFORMANCE" in runner
     assert "_uncheckpointed_${run_started_utc}" in runner
+    assert 'local wandb_disable_artifact=true' in runner
+    assert 'wandb_disable_artifact=false' not in runner
     assert "WANDB_DISABLE_ARTIFACT=" in runner
     assert "WANDB_DATA_DIR" in runner
     assert "--save_checkpoint_to_hub=" in trainer

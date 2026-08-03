@@ -76,6 +76,18 @@ PICK_LEG_FRAME0 = SubtaskStartPose(
     dataset_repo_id="Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1",
     dataset_revision="4a5aef3bc43470b636f5c9d4f9102a30311b79a5",
     training_episode_count=2114,
+    # Median action.hand_cmd at frame 0 over the same 2,114 episodes used for
+    # the arm statistic above, converted from the dataset's 0..4.5 scalar to
+    # the physical Dex1 opening fraction.  In particular, the left hand is
+    # intentionally only about 46% open at the training start state.
+    dex1_opening_fraction=(
+        2.073647975921631 / 4.5,
+        4.470532655715942 / 4.5,
+    ),
+    statistic=(
+        "median_action_robot_q_desired_frame0_arms14;"
+        "median_action_hand_cmd_frame0_dex1_2"
+    ),
 )
 
 # The ACT deployment source deliberately selected episode 2101 frame 0 as a
@@ -89,9 +101,52 @@ PICK_LEG_ACT_EP2101_FRAME0 = SubtaskStartPose(
     dataset_repo_id="Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1",
     dataset_revision="4a5aef3bc43470b636f5c9d4f9102a30311b79a5",
     training_episode_count=1806,
+    # Exact deployment values recorded with the selected episode-2101
+    # frame-zero pose.  Keeping these on the pose contract (instead of in the
+    # ACT runner) lets every ACT subtask select its own training-start hands.
+    dex1_opening_fraction=(4.43 / 4.5, 4.47 / 4.5),
     statistic=(
-        "deployment_medoid_episode2101_frame0_action_arms14;"
+        "deployment_medoid_episode2101_frame0_action_arms14_and_dex1_2;"
         "source_commit=817e8addd944b43b9ada6d096feaa93f75179d38"
+    ),
+)
+
+# Reconstructed from exactly the 227 episode indices recorded in both
+# pre-straddle ACT checkpoints.  The public dataset contains 256 episodes, so
+# using all episodes here would silently choose a different start distribution
+# from the one actually used for training.
+PRE_STRADDLE_ACT_FRAME0 = SubtaskStartPose(
+    arm_position_rad=(
+        -0.38675957918167114,
+        0.6175763010978699,
+        -0.3497064709663391,
+        0.14622721076011658,
+        -0.01363319531083107,
+        0.228810653090477,
+        -1.060666561126709,
+        -0.14246605336666107,
+        -0.6233853101730347,
+        0.21238403022289276,
+        -0.3058239817619324,
+        0.2979549765586853,
+        0.5277582406997681,
+        0.9015522003173828,
+    ),
+    dataset_repo_id="Team-RAMEN/pana_nakatsuka_ikea_pre_straddle",
+    dataset_revision="dd0059983d7149121793bb13f1718d54007287da",
+    training_episode_count=227,
+    statistic=(
+        "median_action_frame0_arms14_and_dex1_2;"
+        "episode_indices_from_checkpoint_train_config;"
+        "reconstruction_sha256="
+        "a5669a3bd5568d1ce2124139edf6b5713fecf522614729809b1b9c03938ec3b4"
+    ),
+    # The checkpoint names a local path and revision "main".  The supplied HF
+    # dataset reproduces all selected rows, but was not pinned by the trainer.
+    exact_training_revision=False,
+    dex1_opening_fraction=(
+        0.25341740250587463 / 4.5,
+        1.0,
     ),
 )
 
@@ -142,6 +197,35 @@ FLIP_TABLE_V2_FRAME0 = SubtaskStartPose(
     ),
 )
 
+# The baseline Furniture-GR00T candidate used only episode indices 0..155 from
+# flip_table_2, whereas the finalized v2 deployment pose above uses all 171
+# curated episodes.  Keep the candidate statistic separate so physical
+# evaluation cannot silently start from a different training subset.  The
+# checkpoint did not pin a dataset revision; this is a reproducible
+# reconstruction from the currently sealed dataset snapshot, not a claim that
+# the trainer consumed that exact Git revision.
+FLIP_TABLE_GROOT_V2_BASELINE_TRAIN156_FRAME0 = SubtaskStartPose(
+    arm_position_rad=(
+        0.01607997575774789, 0.18264327943325043, 0.26085586845874786,
+        -0.06220103055238724, -0.1442396268248558, 0.08705304563045502,
+        -0.21875989437103271, -0.050612280145287514, -0.2726525217294693,
+        0.0800039991736412, -0.07146013528108597, 0.32281383872032166,
+        0.2702529579401016, 0.6890287697315216,
+    ),
+    dataset_repo_id="Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2",
+    dataset_revision="0dc47877dfb2efbea796a059c81290c649bc773c",
+    training_episode_count=156,
+    dex1_opening_fraction=(0.9225202136569552, 1.0),
+    statistic=(
+        "median_action_robot_q_desired_frame0_arms14;"
+        "median_action_hand_cmd_frame0_dex1_2;"
+        "episode_indices_0_through_155_from_checkpoint_train_config;"
+        "reconstruction_sha256="
+        "df3f888c8d8be373884427532d5b41c04d39aaac0d717d63024c75735844fb8c"
+    ),
+    exact_training_revision=False,
+)
+
 FLIP_TABLE_V1_FRAME0 = SubtaskStartPose(
     arm_position_rad=(
         -0.0154762147, 0.1663854271, 0.2027824968, -0.1144016460,
@@ -157,11 +241,14 @@ FLIP_TABLE_V1_FRAME0 = SubtaskStartPose(
 
 _BY_MODEL_REPO = {
     "Team-RAMEN/pana_nakatsuka_act_pick_joint16_augxx_s40k_20260730": PICK_LEG_ACT_EP2101_FRAME0,
+    "Team-RAMEN/pana_nakatsuka_act_pre_straddle_noaug_s20k_20260803": PRE_STRADDLE_ACT_FRAME0,
+    "Team-RAMEN/pana_nakatsuka_act_pre_straddle_augxx_s40k_20260803": PRE_STRADDLE_ACT_FRAME0,
     "Team-RAMEN/groot-n1.7-pick-legs-ver1": PICK_LEG_FRAME0,
     "Team-RAMEN/groot-n1.7-pick-legs-ver2-lora": PICK_LEG_FRAME0,
     "Team-RAMEN/IROS2026_RAMEN_takada_groot_n17_coarse_insert_100k_dex1_v2": COARSE_INSERT_FRAME0,
     "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_diffusion_chunk_relative_1": FLIP_TABLE_V1_FRAME0,
     "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_diffusion_chunk_relative_2": FLIP_TABLE_V2_FRAME0,
+    "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints": FLIP_TABLE_GROOT_V2_BASELINE_TRAIN156_FRAME0,
 }
 
 

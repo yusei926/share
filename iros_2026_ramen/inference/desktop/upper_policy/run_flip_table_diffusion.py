@@ -32,6 +32,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.flip_table_data_augmentation.teleop.config import (
     DEFAULT_TELEOP_CONFIG_PATH,
+    OFFICIAL_G1_29_ARM_LOWER_RAD,
+    OFFICIAL_G1_29_ARM_UPPER_RAD,
     TeleopConfig,
     load_teleop_config,
 )
@@ -79,6 +81,29 @@ MODEL_DEX1_OPEN_VALUE = 4.5
 # limiter below clamps it to the physical [0, 1] opening contract. Gross model
 # excursions still fail closed before any physical command is enabled.
 DEX1_PREFLIGHT_EXTRAPOLATION_FRACTION = 0.05
+STATE_SUPPORT_MARGIN_FRACTION = 0.10
+STATE_SUPPORT_MINIMUM_MARGIN = 0.05
+POLICY_STATE_NAMES = (
+    "waist_yaw",
+    "waist_roll",
+    "waist_pitch",
+    "left_shoulder_pitch",
+    "left_shoulder_roll",
+    "left_shoulder_yaw",
+    "left_elbow",
+    "left_wrist_roll",
+    "left_wrist_pitch",
+    "left_wrist_yaw",
+    "right_shoulder_pitch",
+    "right_shoulder_roll",
+    "right_shoulder_yaw",
+    "right_elbow",
+    "right_wrist_roll",
+    "right_wrist_pitch",
+    "right_wrist_yaw",
+    "left_dex1",
+    "right_dex1",
+)
 EXPECTED_CHECKPOINT_SHA256 = (
     "1a5786d38b9aad995aaf030b6c38ca8e20d2b15471c644e61f7d1c3a3258fd67"
 )
@@ -393,16 +418,26 @@ def validate_policy_chunk(
         )
     if measured.shape != (14,) or not np.isfinite(measured).all():
         raise ValueError("measured arm must be finite [14]")
-    arms = values[:, :14]
+    raw_arms = values[:, :14]
     grippers_rad = values[:, 14:]
     lower = np.asarray(config.safety.arm_position_lower_rad)
     upper = np.asarray(config.safety.arm_position_upper_rad)
-    if np.any(arms < lower) or np.any(arms > upper):
-        joint, step = np.argwhere((arms < lower) | (arms > upper))[0][::-1]
+    official_lower = np.asarray(OFFICIAL_G1_29_ARM_LOWER_RAD)
+    official_upper = np.asarray(OFFICIAL_G1_29_ARM_UPPER_RAD)
+    outside_official = (raw_arms < official_lower) | (raw_arms > official_upper)
+    if np.any(outside_official):
+        joint, step = np.argwhere(outside_official)[0][::-1]
         raise ValueError(
-            "policy arm target exceeds configured hardware margin "
-            f"(step={step}, joint={joint}, value={arms[step, joint]:.4f})"
+            "policy arm target exceeds the official G1 hardware limit "
+            f"(step={step}, joint={joint}, value={raw_arms[step, joint]:.4f}, "
+            f"allowed=[{official_lower[joint]:.4f},{official_upper[joint]:.4f}])"
         )
+    # The dataset can reach the official URDF joint limits, whereas the live
+    # configuration deliberately keeps a 30 mrad command margin. Values in
+    # that narrow band are safe to saturate at the configured envelope. Gross
+    # excursions outside the official limits still fail closed above.
+    arms = np.clip(raw_arms, lower, upper)
+    arm_clip = np.abs(raw_arms - arms)
     dex1_margin = (
         DEX1_PREFLIGHT_EXTRAPOLATION_FRACTION * MODEL_DEX1_OPEN_VALUE
     )
@@ -452,6 +487,8 @@ def validate_policy_chunk(
         "chunk_step_delta_max_rad": step_delta,
         "full_chunk_step_delta_max_rad": full_step_delta,
         "validated_execution_steps": float(execution_steps),
+        "arm_safety_clip_count": float(np.count_nonzero(arm_clip)),
+        "arm_safety_clip_max_rad": float(np.max(arm_clip, initial=0.0)),
         "arm_min_rad": float(arms.min()),
         "arm_max_rad": float(arms.max()),
         "dex1_min_fraction": float(
@@ -471,8 +508,10 @@ def validate_policy_chunk(
 def validate_state_distribution(
     history: list[TeleopObservation],
     checkpoint: Path,
+    *,
+    preconditioned_dimensions: Sequence[int] = (),
 ) -> dict[str, Any]:
-    """Fail closed when the live 19-D input is outside training support."""
+    """Report the live 19-D relation to training statistics without control."""
 
     states = np.stack(
         [
@@ -494,24 +533,32 @@ def validate_state_distribution(
     std = np.asarray(stats["std"], dtype=np.float64)
     if any(value.shape != (19,) for value in (minimum, maximum, mean, std)):
         raise ValueError("checkpoint observation.state statistics must be 19-D")
-    # Raw train minima/maxima are not physical limits. Regular Mode naturally
-    # moves the waist by a few milliradians even while standing, so retain an
-    # explicit small support margin while still rejecting material OOD input.
-    support_margin = np.maximum(0.05, 0.10 * (maximum - minimum))
+    # Raw train minima/maxima are not physical limits. Keep a wider diagnostic
+    # envelope so ordinary tracking error can be distinguished from a larger
+    # distribution shift without affecting control.
+    support_margin = np.maximum(
+        STATE_SUPPORT_MINIMUM_MARGIN,
+        STATE_SUPPORT_MARGIN_FRACTION * (maximum - minimum),
+    )
     outside_training_range = (states < minimum) | (states > maximum)
     outside_supported_range = (states < minimum - support_margin) | (
         states > maximum + support_margin
     )
     z_score = np.abs((states - mean) / np.maximum(std, 1.0e-6))
     outside_supported_range |= z_score > 6.0
-    if np.any(outside_supported_range):
-        sample, dimension = np.argwhere(outside_supported_range)[0]
-        raise ValueError(
-            "live state is materially outside checkpoint support "
-            f"(sample={sample}, dimension={dimension}, value={states[sample, dimension]:.5f}, "
-            f"train_range=[{minimum[dimension]:.5f},{maximum[dimension]:.5f}], "
-            f"margin={support_margin[dimension]:.5f}, z={z_score[sample, dimension]:.2f})"
-        )
+    preconditioned = tuple(sorted(set(int(v) for v in preconditioned_dimensions)))
+    if any(value < 0 or value >= 19 for value in preconditioned):
+        raise ValueError("preconditioned state dimensions must be in [0,18]")
+    preconditioned_ood = np.zeros_like(outside_supported_range)
+    if preconditioned:
+        preconditioned_ood[:, preconditioned] = outside_supported_range[
+            :, preconditioned
+        ]
+        # These dimensions are deterministically moved to the pinned dataset
+        # start pose before policy tracking. This exemption is used only by
+        # the non-actuating startup smoke prediction. The fresh gate after
+        # pre-motion records every dimension without changing control.
+        outside_supported_range[:, preconditioned] = False
     lower_excursion = np.maximum(minimum - states, 0.0)
     upper_excursion = np.maximum(states - maximum, 0.0)
     return {
@@ -521,8 +568,131 @@ def validate_state_distribution(
         "state_training_range_excursion_max": float(
             np.maximum(lower_excursion, upper_excursion).max()
         ),
+        "state_outside_support_dimensions": sorted(
+            {int(index) for _, index in np.argwhere(outside_supported_range)}
+        ),
+        "state_outside_support_names": sorted(
+            {
+                POLICY_STATE_NAMES[index]
+                for _, index in np.argwhere(outside_supported_range)
+            }
+        ),
+        "state_preconditioned_ood_dimensions": sorted(
+            {int(index) for _, index in np.argwhere(preconditioned_ood)}
+        ),
+        "state_preconditioned_ood_value_count": int(
+            np.count_nonzero(preconditioned_ood)
+        ),
+        "state_distribution_diagnostic_only": True,
+        "training_distribution_action_modified": False,
         "camera_payload_skew_ms": current_camera_skew_ms(history[-1]),
     }
+
+
+class PolicyStateSupportMonitor:
+    """Report empirical training support without modifying robot commands.
+
+    Training minima/maxima and z-scores are model diagnostics, not physical
+    safety limits.  They must never clamp a VLA action or stop an otherwise
+    physically valid trajectory.  Official/configured joint limits and rate
+    limits remain independently enforced downstream.
+    """
+
+    def __init__(self, checkpoint: Path) -> None:
+        stats = json.loads(
+            (checkpoint / "normalization.json").read_text(encoding="utf-8")
+        )["observation.state"]
+        self.minimum = np.asarray(stats["min"], dtype=np.float64)
+        self.maximum = np.asarray(stats["max"], dtype=np.float64)
+        self.mean = np.asarray(stats["mean"], dtype=np.float64)
+        self.std = np.asarray(stats["std"], dtype=np.float64)
+        if any(
+            value.shape != (19,)
+            for value in (self.minimum, self.maximum, self.mean, self.std)
+        ):
+            raise ValueError("checkpoint observation.state statistics must be 19-D")
+        if not all(
+            np.isfinite(value).all()
+            for value in (self.minimum, self.maximum, self.mean, self.std)
+        ):
+            raise ValueError("checkpoint observation.state statistics must be finite")
+        if np.any(self.minimum >= self.maximum):
+            raise ValueError("checkpoint observation.state ranges must be ordered")
+
+        margin = np.maximum(
+            STATE_SUPPORT_MINIMUM_MARGIN,
+            STATE_SUPPORT_MARGIN_FRACTION * (self.maximum - self.minimum),
+        )
+        self.support_lower = self.minimum - margin
+        self.support_upper = self.maximum + margin
+
+    @staticmethod
+    def state(observation: TeleopObservation) -> np.ndarray:
+        values = state_19d(
+            observation.body_joint_position_rad,
+            observation.dex1_opening_fraction,
+        )
+        if values.shape != (19,) or not np.isfinite(values).all():
+            raise ValueError("live policy state must be finite [19]")
+        return values
+
+    def diagnose_history(
+        self, history: Sequence[TeleopObservation]
+    ) -> dict[str, Any]:
+        states = np.stack([self.state(observation) for observation in history])
+        z_score = np.abs((states - self.mean) / np.maximum(self.std, 1.0e-6))
+        outside_training = (states < self.minimum) | (states > self.maximum)
+        lower_excursion = np.maximum(self.minimum - states, 0.0)
+        upper_excursion = np.maximum(states - self.maximum, 0.0)
+        outside_support = (states < self.support_lower) | (
+            states > self.support_upper
+        )
+        return {
+            "state_19d_latest": states[-1].tolist(),
+            "state_max_abs_z": float(z_score.max()),
+            "state_outside_training_value_count": int(outside_training.sum()),
+            "state_training_range_excursion_max": float(
+                np.maximum(lower_excursion, upper_excursion).max()
+            ),
+            "state_outside_support_dimensions": sorted(
+                {int(index) for _, index in np.argwhere(outside_support)}
+            ),
+            "state_outside_support_names": sorted(
+                {POLICY_STATE_NAMES[index] for _, index in np.argwhere(outside_support)}
+            ),
+            "state_preconditioned_ood_dimensions": [],
+            "state_preconditioned_ood_value_count": 0,
+            "state_distribution_diagnostic_only": True,
+            "training_distribution_action_modified": False,
+            "camera_payload_skew_ms": current_camera_skew_ms(history[-1]),
+        }
+
+    def observe(self, observation: TeleopObservation) -> dict[str, Any]:
+        state = self.state(observation)
+        z_score = np.abs((state - self.mean) / np.maximum(self.std, 1.0e-6))
+        outside_training = (state < self.minimum) | (state > self.maximum)
+        outside_support = (state < self.support_lower) | (
+            state > self.support_upper
+        ) | (z_score > 6.0)
+        return {
+            "state_support_warning_dimensions": np.flatnonzero(
+                outside_training
+            ).astype(int).tolist(),
+            "state_support_warning_names": [
+                POLICY_STATE_NAMES[index]
+                for index in np.flatnonzero(outside_training)
+            ],
+            "state_support_severe_dimensions": np.flatnonzero(
+                outside_support
+            ).astype(int).tolist(),
+            "state_support_severe_names": [
+                POLICY_STATE_NAMES[index]
+                for index in np.flatnonzero(outside_support)
+            ],
+            "state_support_max_abs_z": float(z_score.max()),
+            "state_distribution_diagnostic_only": True,
+            "training_distribution_action_modified": False,
+        }
 
 
 def validate_runtime_backend(observation: TeleopObservation) -> None:
@@ -567,6 +737,8 @@ class PolicyActionLimiter:
         arm_acceleration_rad_s2: float,
         hand_velocity_fraction_s: float,
         hand_acceleration_fraction_s2: float,
+        arm_position_lower_rad: Sequence[float] = OFFICIAL_G1_29_ARM_LOWER_RAD,
+        arm_position_upper_rad: Sequence[float] = OFFICIAL_G1_29_ARM_UPPER_RAD,
     ) -> None:
         if not math.isfinite(command_hz) or command_hz <= 0.0:
             raise ValueError("command_hz must be finite and positive")
@@ -586,6 +758,20 @@ class PolicyActionLimiter:
         self.arm_acceleration_limit = float(arm_acceleration_rad_s2)
         self.hand_velocity_limit = float(hand_velocity_fraction_s)
         self.hand_acceleration_limit = float(hand_acceleration_fraction_s2)
+        self.arm_position_lower = np.asarray(
+            arm_position_lower_rad, dtype=np.float64
+        )
+        self.arm_position_upper = np.asarray(
+            arm_position_upper_rad, dtype=np.float64
+        )
+        if (
+            self.arm_position_lower.shape != (14,)
+            or self.arm_position_upper.shape != (14,)
+            or not np.isfinite(self.arm_position_lower).all()
+            or not np.isfinite(self.arm_position_upper).all()
+            or np.any(self.arm_position_lower >= self.arm_position_upper)
+        ):
+            raise ValueError("arm position limits must be finite ordered [14]")
         for value, label in (
             (self.arm_velocity_limit, "arm velocity"),
             (self.arm_acceleration_limit, "arm acceleration"),
@@ -648,14 +834,18 @@ class PolicyActionLimiter:
         desired = np.asarray(desired_action, dtype=np.float64)
         if desired.shape != (16,) or not np.isfinite(desired).all():
             raise ValueError("desired policy action must be finite [16]")
+        desired_arm = np.clip(
+            desired[:14], self.arm_position_lower, self.arm_position_upper
+        )
         arm, arm_velocity = self._rate_limit(
-            desired[:14],
+            desired_arm,
             self.arm,
             self.arm_velocity,
             velocity_limit=self.arm_velocity_limit,
             acceleration_limit=self.arm_acceleration_limit,
             dt=self.dt,
         )
+        arm = np.clip(arm, self.arm_position_lower, self.arm_position_upper)
         desired_hand = np.clip(
             desired[14:] / MODEL_DEX1_OPEN_VALUE, 0.0, 1.0
         )
@@ -777,6 +967,7 @@ def run_arm_pre_motion(
     hand_tolerance_fraction: float = 0.05,
     hand_velocity_fraction_s: float = 1.0,
     hand_acceleration_fraction_s2: float = 4.0,
+    waypoint_tolerance_overrides: Mapping[str, float] | None = None,
 ) -> TeleopObservation:
     """Run the arm-only clearance sequence and verify measured convergence.
 
@@ -812,6 +1003,20 @@ def run_arm_pre_motion(
         waypoints,
     )
     targets = dict(hand_targets_by_waypoint or {})
+    tolerance_overrides = dict(waypoint_tolerance_overrides or {})
+    unknown_tolerances = set(tolerance_overrides) - {
+        waypoint.name for waypoint in waypoints
+    }
+    if unknown_tolerances:
+        raise ValueError(
+            "tolerance overrides reference unknown waypoints: "
+            f"{sorted(unknown_tolerances)}"
+        )
+    for name, value in tolerance_overrides.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"waypoint tolerance override for {name!r} must be positive"
+            )
     unknown_targets = set(targets) - {waypoint.name for waypoint in waypoints}
     if unknown_targets:
         raise ValueError(
@@ -842,10 +1047,15 @@ def run_arm_pre_motion(
         arm_acceleration_rad_s2=arm_acceleration_rad_s2,
         hand_velocity_fraction_s=hand_velocity_fraction_s,
         hand_acceleration_fraction_s2=hand_acceleration_fraction_s2,
+        arm_position_lower_rad=config.safety.arm_position_lower_rad,
+        arm_position_upper_rad=config.safety.arm_position_upper_rad,
     )
     command_period_s = 1.0 / config.rates.command_hz
     display_phase = "pre-motion" if phase == "pre_motion" else "return"
     for waypoint_index, waypoint in enumerate(waypoints, start=1):
+        stage_tolerance_rad = tolerance_overrides.get(
+            waypoint.name, waypoint_tolerance_rad
+        )
         target_arm = waypoint.resolve(initial_arm)
         lower = np.asarray(config.safety.arm_position_lower_rad, dtype=np.float64)
         upper = np.asarray(config.safety.arm_position_upper_rad, dtype=np.float64)
@@ -879,6 +1089,7 @@ def run_arm_pre_motion(
                 "preserved_initial_joint_indices": list(
                     waypoint.preserve_initial_joint_indices
                 ),
+                "position_tolerance_rad": stage_tolerance_rad,
                 "lower_body_command_dimensions": 0,
             },
         )
@@ -897,6 +1108,7 @@ def run_arm_pre_motion(
                     f"pre-motion stage {waypoint.name!r} did not converge "
                     f"within {stage_timeout_s:.2f}s "
                     f"(max_arm_error={error:.4f}rad, "
+                    f"tolerance={stage_tolerance_rad:.4f}rad, "
                     f"max_dex1_error={hand_error:.4f})"
                 )
             latest = backend.observe(
@@ -911,7 +1123,7 @@ def run_arm_pre_motion(
             hand_error = float(np.max(np.abs(target_hand - measured_hand)))
             stable_samples = (
                 stable_samples + 1
-                if error <= waypoint_tolerance_rad
+                if error <= stage_tolerance_rad
                 and hand_error <= hand_tolerance_fraction
                 else 0
             )
@@ -1035,6 +1247,18 @@ def return_arms_before_release(
             waypoints=waypoints,
             phase="return_motion",
             hand_targets_by_waypoint=hand_targets,
+            # On the reverse outward-clearance leg, collision safety depends
+            # on shoulder/elbow clearance rather than an exact neutral wrist.
+            # The real log showed both shoulders already safely outside while
+            # passive wrist-roll offset (0.1907 rad) alone prevented the old
+            # all-joint 0.05 rad criterion from completing.  Keep commanding
+            # the full target, but permit that measured benign offset before
+            # continuing farther rearward.
+            waypoint_tolerance_overrides={
+                "return_forward_outward_clearance": max(
+                    waypoint_tolerance_rad, 0.20
+                )
+            },
         )
     except Exception as exc:  # noqa: BLE001
         append_log(
@@ -1148,6 +1372,48 @@ def append_log(path: Path, payload: dict[str, Any]) -> None:
         )
 
 
+def start_policy_interval_recording(backend: Any, log_path: Path) -> bool:
+    """Open capture after the final operator/safety gate.
+
+    Older test doubles and preview-disabled backends intentionally have no
+    recorder.  In those cases this is a no-op.  Camera preview is independent
+    and has already been running since backend construction.
+    """
+
+    start = getattr(backend, "start_evaluation_recording", None)
+    started = bool(start()) if callable(start) else False
+    append_log(
+        log_path,
+        {
+            "event": "policy_recording_started",
+            "capture_enabled": started,
+        },
+    )
+    if started:
+        print(
+            "[recording] camera/state/action capture started at policy interval",
+            flush=True,
+        )
+    return started
+
+
+def stop_policy_interval_recording(backend: Any, log_path: Path) -> bool:
+    """Close capture before reverse pre-motion and arm_sdk release."""
+
+    stop = getattr(backend, "stop_evaluation_recording", None)
+    stopped = bool(stop()) if callable(stop) else False
+    if stopped:
+        append_log(
+            log_path,
+            {"event": "policy_recording_stopped"},
+        )
+        print(
+            "[recording] camera/state/action capture stopped before arm return",
+            flush=True,
+        )
+    return stopped
+
+
 def verify_regular_mode(
     interface: str, *, arm_sdk_active: bool = False
 ) -> None:
@@ -1219,7 +1485,40 @@ def verify_regular_mode_after_release(
     ) from last_error
 
 
+def initialize_policy_worker_with_live_camera(
+    backend: Any,
+    create_worker: Callable[[], Any],
+) -> Any:
+    """Load a policy while continuously rendering read-only live cameras.
+
+    The physical backend has not received an arm command at this point.  It is
+    therefore safe to poll the latest camera bundle while GPU weights load,
+    and it avoids a blank Desktop monitor during the longest part of startup.
+    """
+
+    backend.set_preview_status("CAMERAS: LOADING POLICY")
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="policy-loader",
+    ) as executor:
+        pending = executor.submit(create_worker)
+        while True:
+            # ``observe`` only reads DDS/image-server state. The backend's
+            # latest-only monitor receives this observation asynchronously.
+            backend.observe(timeout_s=0.25)
+            if pending.done():
+                worker = pending.result()
+                break
+    backend.set_preview_status("CAMERAS: PREFLIGHT")
+    return worker
+
+
 def main() -> int:
+    from data.flip_table_data_augmentation.teleop.desktop_preview import (
+        enable_camera_preview_for_policy_runner,
+    )
+
+    enable_camera_preview_for_policy_runner()
     args = parse_args()
     if args.max_seconds <= 0.0:
         raise ValueError("--max-seconds must be positive")
@@ -1270,17 +1569,23 @@ def main() -> int:
     initial_arm_position: np.ndarray | None = None
     start_pose: SubtaskStartPose | None = None
     gravity_compensator: OfficialG1ArmGravityCompensator | None = None
+    support_monitor: PolicyStateSupportMonitor | None = None
+    last_support_warning_names: tuple[str, ...] = ()
     try:
-        worker = PolicyWorker(
-            args.worker_python,
-            args.worker_script,
-            args.checkpoint,
-            device=args.device,
-            seed=args.seed,
-            expected_checkpoint_sha256=args.expected_checkpoint_sha256,
-            model_repo_id=args.model_repo_id,
-            model_revision=args.model_revision,
-            task=args.task,
+        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
+        worker = initialize_policy_worker_with_live_camera(
+            backend,
+            lambda: PolicyWorker(
+                args.worker_python,
+                args.worker_script,
+                args.checkpoint,
+                device=args.device,
+                seed=args.seed,
+                expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+                model_repo_id=args.model_repo_id,
+                model_revision=args.model_revision,
+                task=args.task,
+            ),
         )
         print(
             "[model] ready "
@@ -1288,9 +1593,27 @@ def main() -> int:
             f"device={worker.ready['device']}",
             flush=True,
         )
-        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
+        support_monitor = PolicyStateSupportMonitor(args.checkpoint)
         history = collect_policy_history(backend)
-        state_diagnostics = validate_state_distribution(history, args.checkpoint)
+        # Dex1 can still hold the preceding subtask's grasp at process start.
+        # The collision-aware pre-motion opens both hands and then applies the
+        # pinned dataset-frame0 widths. Permit only those two soon-to-be-
+        # corrected inputs during this non-actuating smoke prediction. The
+        # fresh post-pre-motion gate records all 19 dimensions; physical action
+        # and actuator checks remain independently strict.
+        state_diagnostics = validate_state_distribution(
+            history,
+            args.checkpoint,
+            preconditioned_dimensions=(17, 18),
+        )
+        if state_diagnostics["state_preconditioned_ood_dimensions"]:
+            print(
+                "[preflight] current Dex1 state is outside checkpoint support; "
+                "pre-motion will open and move both hands to the pinned "
+                "dataset start width before the strict policy gate "
+                f"(dimensions={state_diagnostics['state_preconditioned_ood_dimensions']})",
+                flush=True,
+            )
         measured = np.asarray(history[-1].arm_joint_position_rad)
         preflight_actions: list[np.ndarray] = []
         preflight_inference_ms: list[float] = []
@@ -1490,6 +1813,7 @@ def main() -> int:
             pose_hold=pose_hold,
             latest=latest,
         )
+        start_policy_interval_recording(backend, args.log)
         history = collect_policy_history(backend, hold=pose_hold.refresh)
         state_diagnostics = validate_state_distribution(history, args.checkpoint)
         (actions, inference_ms), latest = run_blocking_check_with_pose_hold(
@@ -1535,6 +1859,8 @@ def main() -> int:
             hand_acceleration_fraction_s2=(
                 args.policy_hand_acceleration_fraction_s2
             ),
+            arm_position_lower_rad=config.safety.arm_position_lower_rad,
+            arm_position_upper_rad=config.safety.arm_position_upper_rad,
         )
         while time.monotonic() < deadline:
             for action in actions[:8]:
@@ -1545,8 +1871,29 @@ def main() -> int:
                     timeout_s=min(0.05, config.safety.command_hold_timeout_s)
                 )
                 validate_runtime_backend(runtime_observation)
+                if support_monitor is None:
+                    raise RuntimeError("policy state support monitor is unavailable")
+                support_status = support_monitor.observe(runtime_observation)
+                warning_names = tuple(support_status["state_support_warning_names"])
+                if warning_names != last_support_warning_names:
+                    if warning_names:
+                        print(
+                            "[support] live state left the empirical training "
+                            "range; diagnostic only, model action is unchanged "
+                            f"(dimensions={list(warning_names)})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[support] live state returned to the empirical "
+                            "training range",
+                            flush=True,
+                        )
+                    last_support_warning_names = warning_names
                 sequence = command_sequence.next()
                 limited_action = limiter.apply(action)
+                physical_limiter_delta = np.abs(limited_action - action)
                 gravity_torque = gravity_compensator.torque_nm(
                     limited_action[:14]
                 )
@@ -1570,6 +1917,14 @@ def main() -> int:
                         "arm_velocity_rad_s": limiter.arm_velocity.tolist(),
                         "dex1_velocity_fraction_s": limiter.hand_velocity.tolist(),
                         "arm_feedforward_torque_nm": gravity_torque.tolist(),
+                        "training_distribution_action_modified": False,
+                        "physical_limiter_active": bool(
+                            np.any(physical_limiter_delta > 1.0e-12)
+                        ),
+                        "physical_limiter_delta_max": float(
+                            physical_limiter_delta.max(initial=0.0)
+                        ),
+                        **support_status,
                     },
                 )
                 time.sleep(max(0.0, command_period_s - (time.monotonic() - tick)))
@@ -1582,7 +1937,9 @@ def main() -> int:
                 backend,
                 timeout_s=config.safety.command_hold_timeout_s * 0.75,
             )
-            state_diagnostics = validate_state_distribution(history, args.checkpoint)
+            if support_monitor is None:
+                raise RuntimeError("policy state support monitor is unavailable")
+            state_diagnostics = support_monitor.diagnose_history(history)
             actions, inference_ms = worker.predict(history)
             diagnostics = validate_policy_chunk(
                 actions,
@@ -1607,6 +1964,7 @@ def main() -> int:
         return 130
     finally:
         if backend is not None:
+            stop_policy_interval_recording(backend, args.log)
             if actuation_started:
                 if (
                     initial_arm_position is not None

@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from data.flip_table_data_augmentation.teleop.config import load_teleop_config
+from data.flip_table_data_augmentation.teleop.config import (
+    OFFICIAL_G1_29_ARM_UPPER_RAD,
+    load_teleop_config,
+)
 from data.flip_table_data_augmentation.teleop.shared.policy_contract import (
     action_16d,
     state_19d,
@@ -19,8 +22,10 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (
     MODEL_DEX1_OPEN_VALUE,
     PolicyActionLimiter,
     PolicyStartPoseHold,
+    PolicyStateSupportMonitor,
     command_from_action,
     current_camera_skew_ms,
+    initialize_policy_worker_with_live_camera,
     is_fresh_policy_observation,
     run_blocking_check_with_pose_hold,
     run_arm_pre_motion,
@@ -31,9 +36,6 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (
     verify_regular_mode,
     verify_regular_mode_after_release,
     wait_for_policy_start_with_hold,
-)
-from inference.desktop.upper_policy.act_pick_leg_contract import (
-    DATASET_INITIAL_DEX1_OPENING_FRACTION,
 )
 from inference.desktop.upper_policy.pre_motion import (
     ARM_PRE_MOTION_WAYPOINTS,
@@ -52,8 +54,10 @@ from inference.desktop.upper_policy.subtask_start_pose import (
     COARSE_INSERT_FRAME0,
     FLIP_TABLE_V1_FRAME0,
     FLIP_TABLE_V2_FRAME0,
+    FLIP_TABLE_GROOT_V2_BASELINE_TRAIN156_FRAME0,
     PICK_LEG_FRAME0,
     PICK_LEG_ACT_EP2101_FRAME0,
+    PRE_STRADDLE_ACT_FRAME0,
     subtask_start_pose_for_model,
 )
 from inference.desktop.upper_policy.worker_protocol import (
@@ -70,6 +74,32 @@ def test_worker_protocol_round_trip() -> None:
     restored = receive_message(stream)
     assert restored["images"] == [b"jpeg"]
     assert restored["state"] == list(range(19))
+
+
+def test_policy_loader_keeps_camera_preview_live_until_worker_is_ready() -> None:
+    class Backend:
+        def __init__(self) -> None:
+            self.statuses: list[str] = []
+            self.observation_count = 0
+
+        def set_preview_status(self, status: str) -> None:
+            self.statuses.append(status)
+
+        def observe(self, *, timeout_s: float) -> object:
+            assert timeout_s == 0.25
+            self.observation_count += 1
+            time.sleep(0.005)
+            return object()
+
+    backend = Backend()
+
+    def create_worker() -> str:
+        time.sleep(0.02)
+        return "ready"
+
+    assert initialize_policy_worker_with_live_camera(backend, create_worker) == "ready"
+    assert backend.observation_count >= 1
+    assert backend.statuses == ["CAMERAS: LOADING POLICY", "CAMERAS: PREFLIGHT"]
 
 
 def test_policy_chunk_is_arms_and_absolute_dex1_only() -> None:
@@ -272,10 +302,10 @@ def test_live_state_guard_allows_tiny_regular_waist_motion_only(
     checkpoint.mkdir()
     stats = {
         "observation.state": {
-            "min": [0.0] * 19,
+            "min": [0.0] * 17 + [0.5, 0.5],
             "max": [1.0] * 19,
-            "mean": [0.5] * 19,
-            "std": [0.2] * 19,
+            "mean": [0.5] * 17 + [0.75, 0.75],
+            "std": [0.2] * 17 + [0.1, 0.1],
         }
     }
     (checkpoint / "normalization.json").write_text(json.dumps(stats))
@@ -298,10 +328,127 @@ def test_live_state_guard_allows_tiny_regular_waist_motion_only(
     )
     assert report["state_outside_training_value_count"] == 2
     assert report["state_training_range_excursion_max"] == pytest.approx(0.01)
-    with pytest.raises(ValueError, match="materially outside"):
-        validate_state_distribution(
-            [observation(-1.0), observation(-1.0)], checkpoint
+    material = validate_state_distribution(
+        [observation(-1.0), observation(-1.0)], checkpoint
+    )
+    assert material["state_outside_support_names"] == ["waist_yaw"]
+
+    hand_ood = observation(0.5)
+    hand_ood.dex1_opening_fraction = (0.0, 0.0)
+    hand_report = validate_state_distribution([hand_ood, hand_ood], checkpoint)
+    assert hand_report["state_outside_support_names"] == [
+        "left_dex1",
+        "right_dex1",
+    ]
+    deferred = validate_state_distribution(
+        [hand_ood, hand_ood],
+        checkpoint,
+        preconditioned_dimensions=(17, 18),
+    )
+    assert deferred["state_preconditioned_ood_dimensions"] == [17, 18]
+    assert deferred["state_preconditioned_ood_value_count"] == 4
+
+    arm_ood = observation(0.5)
+    arm_ood.body_joint_position_rad[15] = -1.0
+    arm_report = validate_state_distribution(
+        [arm_ood, arm_ood],
+        checkpoint,
+        preconditioned_dimensions=(17, 18),
+    )
+    assert arm_report["state_outside_support_names"] == [
+        "left_shoulder_pitch"
+    ]
+
+
+def test_runtime_support_monitor_is_diagnostic_only_for_empirical_excursions(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    minimum = [0.0] * 19
+    maximum = [1.0] * 19
+    mean = [0.5] * 19
+    std = [0.5] * 19
+    minimum[16] = -0.33149564266204834
+    maximum[16] = 1.342580795288086
+    mean[16] = 0.40603017807006836
+    std[16] = 0.27968430519104004
+    (checkpoint / "normalization.json").write_text(
+        json.dumps(
+            {
+                "observation.state": {
+                    "min": minimum,
+                    "max": maximum,
+                    "mean": mean,
+                    "std": std,
+                }
+            }
         )
+    )
+    monitor = PolicyStateSupportMonitor(checkpoint)
+
+    def observation(right_wrist_yaw: float, *, waist_yaw: float = 0.5) -> SimpleNamespace:
+        body = np.full(29, 0.5)
+        body[12] = waist_yaw
+        body[28] = right_wrist_yaw
+        return SimpleNamespace(
+            body_joint_position_rad=body,
+            dex1_opening_fraction=(0.5 / 4.5, 0.5 / 4.5),
+            camera_capture_monotonic_ns={
+                "head_left": 1_000_000_000,
+                "left_wrist": 1_001_000_000,
+                "right_wrist": 1_002_000_000,
+            },
+        )
+
+    # This is the exact magnitude from the physical run. Empirical support is
+    # diagnostic only: repeated observations must neither stop execution nor
+    # create an action-transform interface.
+    tiny_excursion = observation(-0.50075)
+    validate_state_distribution(
+        [tiny_excursion, tiny_excursion], checkpoint
+    )
+    for _ in range(10):
+        status = monitor.observe(tiny_excursion)
+    assert "right_wrist_yaw" in status["state_support_warning_names"]
+    assert "right_wrist_yaw" in status["state_support_severe_names"]
+    assert not hasattr(monitor, "govern")
+
+    # Waist remains observation-only and owned by Regular Mode. Its empirical
+    # OOD status is still useful telemetry but cannot affect arm commands.
+    for _ in range(5):
+        waist_status = monitor.observe(observation(0.5, waist_yaw=10.0))
+    assert "waist_yaw" in waist_status["state_support_severe_names"]
+
+
+def test_runtime_support_monitor_reports_large_arm_excursion_without_raising(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "normalization.json").write_text(
+        json.dumps(
+            {
+                "observation.state": {
+                    "min": [0.0] * 19,
+                    "max": [1.0] * 19,
+                    "mean": [0.5] * 19,
+                    "std": [0.5] * 19,
+                }
+            }
+        )
+    )
+    monitor = PolicyStateSupportMonitor(checkpoint)
+    body = np.full(29, 0.5)
+    body[15] = -0.2  # support lower=-0.1, hard lower=-0.11
+    observation = SimpleNamespace(
+        body_joint_position_rad=body,
+        dex1_opening_fraction=(0.5 / 4.5, 0.5 / 4.5),
+    )
+
+    for _ in range(10):
+        status = monitor.observe(observation)
+    assert status["state_support_severe_names"] == ["left_shoulder_pitch"]
 
 
 def test_runtime_backend_guard_is_fail_closed() -> None:
@@ -470,7 +617,7 @@ def test_read_only_chunk_validation_reports_step_delta_without_enabling_it() -> 
     assert report["chunk_step_delta_max_rad"] == pytest.approx(0.21)
 
 
-def test_policy_chunk_rejects_invalid_gripper_or_joint_limit() -> None:
+def test_policy_chunk_rejects_invalid_gripper_or_official_joint_limit() -> None:
     config = load_teleop_config()
     measured = np.zeros(14)
     actions = np.zeros((16, 16))
@@ -485,14 +632,51 @@ def test_policy_chunk_rejects_invalid_gripper_or_joint_limit() -> None:
         )
     actions = np.zeros((16, 16))
     actions[:, 0] = config.safety.arm_position_upper_rad[0] + 0.01
-    with pytest.raises(ValueError, match="hardware margin"):
+    report = validate_policy_chunk(
+        actions,
+        measured_arm=np.clip(
+            actions[0, :14],
+            config.safety.arm_position_lower_rad,
+            config.safety.arm_position_upper_rad,
+        ),
+        config=config,
+        initial_delta_limit_rad=0.2,
+        step_delta_limit_rad=0.2,
+    )
+    assert report["arm_safety_clip_count"] == pytest.approx(16)
+    assert report["arm_safety_clip_max_rad"] == pytest.approx(0.01)
+
+    actions[:, 0] = OFFICIAL_G1_29_ARM_UPPER_RAD[0] + 0.001
+    with pytest.raises(ValueError, match="official G1 hardware limit"):
         validate_policy_chunk(
             actions,
-            measured_arm=actions[0, :14],
+            measured_arm=np.zeros(14),
             config=config,
-            initial_delta_limit_rad=0.2,
+            initial_delta_limit_rad=10.0,
             step_delta_limit_rad=0.2,
         )
+
+
+def test_policy_limiter_saturates_at_configured_position_margin() -> None:
+    config = load_teleop_config()
+    upper = np.asarray(config.safety.arm_position_upper_rad)
+    lower = np.asarray(config.safety.arm_position_lower_rad)
+    initial = np.clip(np.zeros(14), lower, upper)
+    limiter = PolicyActionLimiter(
+        initial,
+        np.zeros(2),
+        command_hz=30.0,
+        arm_velocity_rad_s=100.0,
+        arm_acceleration_rad_s2=10000.0,
+        hand_velocity_fraction_s=1.0,
+        hand_acceleration_fraction_s2=4.0,
+        arm_position_lower_rad=lower,
+        arm_position_upper_rad=upper,
+    )
+    desired = np.concatenate((upper + 0.02, np.zeros(2)))
+    for _ in range(10):
+        emitted = limiter.apply(desired)
+    np.testing.assert_allclose(emitted[:14], upper)
 
 
 def test_policy_chunk_allows_and_reports_small_zscore_gripper_extrapolation() -> None:
@@ -715,6 +899,7 @@ def test_all_registered_dataset_frame0_poses_fit_hardware_margins() -> None:
         COARSE_INSERT_FRAME0,
         FLIP_TABLE_V1_FRAME0,
         FLIP_TABLE_V2_FRAME0,
+        FLIP_TABLE_GROOT_V2_BASELINE_TRAIN156_FRAME0,
     ):
         validate_arm_pre_motion_waypoints(
             config.safety.arm_position_lower_rad,
@@ -737,6 +922,62 @@ def test_flip_table_v2_start_pose_pins_dataset_frame0_hands() -> None:
     assert pose is FLIP_TABLE_V2_FRAME0
     assert pose.dex1_opening_fraction == pytest.approx(
         (4.167656421661377 / MODEL_DEX1_OPEN_VALUE, 1.0)
+    )
+
+
+def test_groot_pick_leg_start_pose_pins_same_frame0_arm_and_hand_population() -> None:
+    for repo_id in (
+        "Team-RAMEN/groot-n1.7-pick-legs-ver1",
+        "Team-RAMEN/groot-n1.7-pick-legs-ver2-lora",
+    ):
+        pose = subtask_start_pose_for_model(repo_id)
+        assert pose is PICK_LEG_FRAME0
+        assert pose.training_episode_count == 2114
+        assert pose.exact_training_revision is True
+        assert pose.dex1_opening_fraction == pytest.approx(
+            (2.073647975921631 / 4.5, 4.470532655715942 / 4.5)
+        )
+        assert "median_action_hand_cmd_frame0_dex1_2" in pose.statistic
+
+
+def test_groot_pick_leg_start_motion_opens_then_adopts_dataset_hands() -> None:
+    from inference.desktop.upper_policy.run_pick_leg_groot import (
+        build_pick_leg_start_motion,
+    )
+
+    waypoints, targets = build_pick_leg_start_motion(PICK_LEG_FRAME0)
+    assert waypoints[0].name == "hands_full_open_before_clearance"
+    assert waypoints[-1].name == "dataset_frame0_pose"
+    assert all(targets[waypoint.name] == (1.0, 1.0) for waypoint in waypoints[:-1])
+    assert targets["dataset_frame0_pose"] == pytest.approx(
+        PICK_LEG_FRAME0.dex1_opening_fraction
+    )
+
+
+def test_pre_straddle_start_pose_uses_checkpoint_episode_subset() -> None:
+    pose = subtask_start_pose_for_model(
+        "Team-RAMEN/pana_nakatsuka_act_pre_straddle_augxx_s40k_20260803"
+    )
+    assert pose is PRE_STRADDLE_ACT_FRAME0
+    assert pose.dataset_repo_id == "Team-RAMEN/pana_nakatsuka_ikea_pre_straddle"
+    assert pose.dataset_revision == "dd0059983d7149121793bb13f1718d54007287da"
+    assert pose.training_episode_count == 227
+    assert pose.exact_training_revision is False
+    assert pose.dex1_opening_fraction == pytest.approx(
+        (0.25341740250587463 / 4.5, 1.0)
+    )
+    assert "episode_indices_from_checkpoint_train_config" in pose.statistic
+
+
+def test_furniture_groot_candidate_uses_exact_training_episode_subset_pose() -> None:
+    pose = subtask_start_pose_for_model(
+        "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints"
+    )
+    assert pose is FLIP_TABLE_GROOT_V2_BASELINE_TRAIN156_FRAME0
+    assert pose.training_episode_count == 156
+    assert pose.exact_training_revision is False
+    assert pose.dex1_opening_fraction == pytest.approx(
+        (0.9225202136569552, 1.0)
     )
 
 
@@ -770,6 +1011,51 @@ def test_reverse_return_sends_arm_only_and_restores_initial_pose(
     assert all(not hasattr(command, "waist_position_rad") for command in backend.commands)
 
 
+def test_reverse_return_allows_logged_benign_wrist_offset_at_outward_clearance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inference.desktop.upper_policy import run_flip_table_diffusion as runner
+
+    class _OffsetBackend(_FollowingPreMotionBackend):
+        def apply(self, command: object) -> None:
+            super().apply(command)
+            target = np.asarray(command.arm_position_rad, dtype=np.float64)
+            if target[0] < -0.50 and target[1] > 1.40:
+                # Reproduce the measured return offset from the physical run.
+                self.arm[4] = -0.1907
+
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    backend = _OffsetBackend()
+    initial = np.linspace(-0.2, 0.2, 14)
+    backend.arm = np.asarray(FLIP_TABLE_V2_FRAME0.arm_position_rad)
+    ok = return_arms_before_release(
+        backend,
+        config=load_teleop_config(),
+        log_path=tmp_path / "return_offset.jsonl",
+        command_sequence=CommandSequence(100),
+        gravity_compensator=_FakeGravityCompensator(),
+        initial_arm_position_rad=initial,
+        dataset_frame0_arm_rad=FLIP_TABLE_V2_FRAME0.arm_position_rad,
+        arm_velocity_rad_s=1.0,
+        arm_acceleration_rad_s2=4.0,
+        waypoint_tolerance_rad=0.05,
+        stage_timeout_s=2.0,
+    )
+    assert ok
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "return_offset.jsonl").read_text().splitlines()
+    ]
+    started = next(
+        row
+        for row in rows
+        if row.get("event") == "return_motion_stage_started"
+        and row.get("stage") == "return_forward_outward_clearance"
+    )
+    assert started["position_tolerance_rad"] == pytest.approx(0.20)
+
+
 def test_act_pre_motion_opens_hands_then_sets_dataset_start_and_returns_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -779,19 +1065,11 @@ def test_act_pre_motion_opens_hands_then_sets_dataset_start_and_returns_open(
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
     backend = _FollowingPreMotionBackend()
     initial_arm = backend.arm.copy()
-    waypoints = (
-        ArmPreMotionWaypoint(
-            "hands_full_open_before_clearance",
-            (0.0,) * 14,
-            tuple(range(14)),
-        ),
-    ) + build_arm_pre_motion_waypoints(
-        PICK_LEG_ACT_EP2101_FRAME0.arm_position_rad
+    from inference.desktop.upper_policy.run_pick_leg_act import (
+        build_act_start_motion,
     )
-    targets = {waypoint.name: (1.0, 1.0) for waypoint in waypoints}
-    targets["dataset_frame0_pose"] = tuple(
-        DATASET_INITIAL_DEX1_OPENING_FRACTION.tolist()
-    )
+
+    waypoints, targets = build_act_start_motion(PICK_LEG_ACT_EP2101_FRAME0)
     sequence = CommandSequence()
     run_arm_pre_motion(
         backend,
@@ -807,7 +1085,7 @@ def test_act_pre_motion_opens_hands_then_sets_dataset_start_and_returns_open(
         hand_targets_by_waypoint=targets,
     )
     np.testing.assert_allclose(
-        backend.hand, DATASET_INITIAL_DEX1_OPENING_FRACTION, atol=0.05
+        backend.hand, PICK_LEG_ACT_EP2101_FRAME0.dex1_opening_fraction, atol=0.05
     )
     assert any(
         np.min(command.dex1_opening_fraction) >= 0.95
@@ -829,6 +1107,41 @@ def test_act_pre_motion_opens_hands_then_sets_dataset_start_and_returns_open(
         dex1_return_opening_fraction=(1.0, 1.0),
     )
     np.testing.assert_allclose(backend.hand, (1.0, 1.0), atol=0.05)
+
+
+def test_act_native_dex1_is_converted_exactly_once() -> None:
+    from inference.desktop.upper_policy.run_pick_leg_act import (
+        limit_native_act_action,
+    )
+
+    limiter = PolicyActionLimiter(
+        np.zeros(14),
+        np.zeros(2),
+        command_hz=1.0,
+        arm_velocity_rad_s=100.0,
+        arm_acceleration_rad_s2=10000.0,
+        hand_velocity_fraction_s=100.0,
+        hand_acceleration_fraction_s2=10000.0,
+    )
+    native = np.concatenate((np.zeros(14), np.asarray([0.45, 3.60])))
+    limited = limit_native_act_action(limiter, native)
+    np.testing.assert_allclose(limited[14:], [0.45, 3.60], atol=2.0e-4)
+    command = command_from_action(1, limited)
+    np.testing.assert_allclose(
+        command.dex1_opening_fraction, limited[14:] / 4.5
+    )
+
+
+def test_pre_straddle_act_start_motion_uses_its_own_dataset_hands() -> None:
+    from inference.desktop.upper_policy.run_pick_leg_act import (
+        build_act_start_motion,
+    )
+
+    waypoints, targets = build_act_start_motion(PRE_STRADDLE_ACT_FRAME0)
+    assert all(targets[waypoint.name] == (1.0, 1.0) for waypoint in waypoints[:-1])
+    assert targets["dataset_frame0_pose"] == pytest.approx(
+        PRE_STRADDLE_ACT_FRAME0.dex1_opening_fraction
+    )
 
 
 def test_policy_start_gate_refreshes_hold_until_empty_enter(

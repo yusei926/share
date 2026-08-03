@@ -38,10 +38,10 @@ class SourceSnapshot:
         return int(self.info["fps"])
 
     def video_path(self, row: dict[str, Any], key: str) -> Path:
-        chunk = int(row[f"videos/{key}/chunk_index"])
-        file_index = int(row[f"videos/{key}/file_index"])
         relative = str(self.info["video_path"]).format(
-            video_key=key, chunk_index=chunk, file_index=file_index
+            video_key=key,
+            chunk_index=int(row[f"videos/{key}/chunk_index"]),
+            file_index=int(row[f"videos/{key}/file_index"]),
         )
         path = self.root / relative
         if not path.is_file():
@@ -55,19 +55,17 @@ class SourceSnapshot:
 def download_source(
     config: CurationConfig,
     *,
+    include_data: bool,
     include_videos: bool,
-    rgb_only: bool = False,
+    video_episode_indices: Iterable[int] | None = None,
 ) -> SourceSnapshot:
-    patterns = ["README.md", "meta/**", "data/**"]
-    if include_videos:
-        keys = RGB_KEYS if rgb_only else VIDEO_KEYS
-        patterns.extend(f"videos/{key}/**" for key in keys)
+    metadata_patterns = ["README.md", "meta/**"]
     root = Path(
         snapshot_download(
             repo_id=config.source_repo_id,
             repo_type="dataset",
             revision=config.source_revision,
-            allow_patterns=patterns,
+            allow_patterns=metadata_patterns,
             cache_dir=config.workspace / "hf_cache",
         )
     )
@@ -76,6 +74,39 @@ def download_source(
     for path in sorted((root / "meta" / "episodes").glob("chunk-*/*.parquet")):
         rows.extend(pq.read_table(path).to_pylist())
     rows.sort(key=lambda row: int(row["episode_index"]))
+
+    patterns = list(metadata_patterns)
+    if include_data:
+        patterns.append("data/**")
+    if include_videos:
+        if video_episode_indices is None:
+            patterns.extend(f"videos/{key}/**" for key in VIDEO_KEYS)
+        else:
+            requested = {int(value) for value in video_episode_indices}
+            by_episode = {int(row["episode_index"]): row for row in rows}
+            unknown = sorted(requested - set(by_episode))
+            if unknown:
+                raise ValueError(f"requested videos for unknown source episodes: {unknown[:10]}")
+            for key in VIDEO_KEYS:
+                for episode_index in sorted(requested):
+                    row = by_episode[episode_index]
+                    patterns.append(
+                        str(info["video_path"]).format(
+                            video_key=key,
+                            chunk_index=int(row[f"videos/{key}/chunk_index"]),
+                            file_index=int(row[f"videos/{key}/file_index"]),
+                        )
+                    )
+    if patterns != metadata_patterns:
+        root = Path(
+            snapshot_download(
+                repo_id=config.source_repo_id,
+                repo_type="dataset",
+                revision=config.source_revision,
+                allow_patterns=patterns,
+                cache_dir=config.workspace / "hf_cache",
+            )
+        )
     return SourceSnapshot(root=root, info=info, episodes=tuple(rows))
 
 
@@ -86,13 +117,6 @@ def read_numeric_table(snapshot: SourceSnapshot) -> pa.Table:
     return pa.concat_tables([pq.read_table(path) for path in paths])
 
 
-def fixed_list_numpy(column: Any, width: int) -> np.ndarray:
-    values = np.asarray(column.to_pylist(), dtype=np.float64)
-    if values.shape != (len(column), width):
-        raise ValueError(f"column must have shape ({len(column)}, {width}), got {values.shape}")
-    return values
-
-
 def episode_slice(table: pa.Table, row: dict[str, Any]) -> pa.Table:
     start = int(row["dataset_from_index"])
     end = int(row["dataset_to_index"])
@@ -100,25 +124,11 @@ def episode_slice(table: pa.Table, row: dict[str, Any]) -> pa.Table:
     if end - start != length:
         raise ValueError(f"episode {row['episode_index']} metadata range is invalid")
     result = table.slice(start, length)
-    episodes = np.asarray(result["episode_index"].to_numpy(), dtype=np.int64)
-    if len(result) != length or not np.all(episodes == int(row["episode_index"])):
+    episode_indices = np.asarray(result["episode_index"].to_numpy(), dtype=np.int64)
+    if len(result) != length or not np.all(episode_indices == int(row["episode_index"])):
         raise ValueError(f"episode {row['episode_index']} numeric rows are not contiguous")
     return result
 
 
-def source_inventory(snapshot: SourceSnapshot) -> dict[str, Any]:
-    features = snapshot.info.get("features", {})
-    missing_videos = sorted(set(VIDEO_KEYS) - set(features))
-    missing_numeric = sorted(set(NUMERIC_WIDTHS) - set(features))
-    return {
-        "root": str(snapshot.root),
-        "fps": snapshot.info.get("fps"),
-        "episodes": len(snapshot.episodes),
-        "frames": sum(int(row["length"]) for row in snapshot.episodes),
-        "missing_video_features": missing_videos,
-        "missing_numeric_features": missing_numeric,
-        "unique_source_episode_names": len(
-            {str(row.get("source_episode_name", "")) for row in snapshot.episodes}
-        ),
-    }
-
+def source_episode_name(episode_index: int) -> str:
+    return f"source_episode_{episode_index:04d}"

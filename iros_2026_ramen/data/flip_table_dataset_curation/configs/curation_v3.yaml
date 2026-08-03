@@ -1,0 +1,35 @@
+schema_version: team_ramen_manual_flip_table_curation_config/v1
+seed: 42
+manual_exclusions:
+  - source_episode_index: 0
+    source_frame_start: 23625
+    source_frame_end: 24493
+    reason: user_requested_low_quality_segment
+source:
+  repo_id: BitRobot/G1_WBT_Dex1_Building-Children-Table
+  revision: 4b5961c6f8b97ececa75ee73041b30bcbf463ae2
+  expected_episodes: 533
+  expected_frames: 6276443
+  fps: 30
+labels:
+  repo_id: Team-RAMEN/IROS2026_RAMEN_HARA_curation
+  revision: 7c0a3f8bb7ac8dc6672d1204a32c6531737d7a14
+  schema_version: 4
+  task_index: 2
+target:
+  repo_id: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_3
+  private: true
+  minimum_episodes: 366
+  expected_episodes: 366
+  expected_frames: 192972
+  allow_replace_existing_main: true
+video:
+  codec: libx264
+  crf: 18
+  preset: fast
+  pixel_format: yuv420p
+  gop: 30
+  max_file_size_mb: 500
+  planning_frames_per_file: 6000
+  encode_workers: 3
+  ffmpeg_threads: 4

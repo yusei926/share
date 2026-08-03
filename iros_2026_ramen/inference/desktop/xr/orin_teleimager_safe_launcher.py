@@ -232,6 +232,8 @@ def prepare_config(
     config_path: Path,
     *,
     head_serial_override: str | None = None,
+    left_wrist_serial_override: str | None = None,
+    right_wrist_serial_override: str | None = None,
 ) -> tuple[dict, str, set[str]]:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
@@ -242,6 +244,20 @@ def prepare_config(
     right = config.get("right_wrist_camera")
     if not all(isinstance(item, dict) for item in (head, left, right)):
         raise RuntimeError("config must define head_camera, left_wrist_camera, and right_wrist_camera")
+
+    wrist_overrides = (
+        left_wrist_serial_override,
+        right_wrist_serial_override,
+    )
+    if any(wrist_overrides) and not all(wrist_overrides):
+        raise RuntimeError(
+            "left and right wrist serial overrides must be provided together"
+        )
+    if all(wrist_overrides):
+        if left_wrist_serial_override == right_wrist_serial_override:
+            raise RuntimeError("left and right wrist serials must be distinct")
+        left["serial_number"] = str(left_wrist_serial_override)
+        right["serial_number"] = str(right_wrist_serial_override)
 
     serials = {str(left.get("serial_number", "")), str(right.get("serial_number", ""))}
     serials.discard("")
@@ -283,6 +299,8 @@ def run(
     *,
     check_only: bool = False,
     head_serial_override: str | None = None,
+    left_wrist_serial_override: str | None = None,
+    right_wrist_serial_override: str | None = None,
     recording_root: Path = DEFAULT_RECORDING_ROOT,
     recorder_port: int = 60010,
 ) -> None:
@@ -295,7 +313,10 @@ def run(
     )
 
     config, head_node, expected_serials = prepare_config(
-        config_path, head_serial_override=head_serial_override
+        config_path,
+        head_serial_override=head_serial_override,
+        left_wrist_serial_override=left_wrist_serial_override,
+        right_wrist_serial_override=right_wrist_serial_override,
     )
     observed = wait_for_realsense(expected_serials, d405_timeout_s)
     write_config_atomically(config_path, config)
@@ -686,6 +707,16 @@ def main() -> int:
         default=os.environ.get("HEAD_CAMERA_SERIAL"),
         help="explicit UVC serial when multiple non-RealSense cameras exist",
     )
+    parser.add_argument(
+        "--left-wrist-serial",
+        default=os.environ.get("WRIST_LEFT_SERIAL"),
+        help="machine-local serial physically mounted on the left wrist",
+    )
+    parser.add_argument(
+        "--right-wrist-serial",
+        default=os.environ.get("WRIST_RIGHT_SERIAL"),
+        help="machine-local serial physically mounted on the right wrist",
+    )
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     if not args.config.is_file():
@@ -696,6 +727,8 @@ def main() -> int:
             args.d405_timeout,
             check_only=args.check_only,
             head_serial_override=args.head_serial,
+            left_wrist_serial_override=args.left_wrist_serial,
+            right_wrist_serial_override=args.right_wrist_serial,
             recording_root=args.recording_root,
             recorder_port=args.recorder_port,
         )

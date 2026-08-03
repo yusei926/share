@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the finalized Furniture-GR00T flip-table policy on a physical G1."""
+"""Run a sealed Furniture-GR00T flip-table policy on a physical G1."""
 
 from __future__ import annotations
 
@@ -55,8 +55,11 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (  # noqa: E
     camera_generation,
     command_from_action,
     is_fresh_policy_observation,
+    initialize_policy_worker_with_live_camera,
     run_blocking_check_with_pose_hold,
     run_arm_pre_motion,
+    start_policy_interval_recording,
+    stop_policy_interval_recording,
     return_arms_before_release,
     validate_policy_chunk,
     validate_runtime_backend,
@@ -67,6 +70,7 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (  # noqa: E
 from inference.desktop.upper_policy.pre_motion import build_arm_pre_motion_waypoints
 from inference.desktop.upper_policy.subtask_start_pose import (
     FLIP_TABLE_V2_FRAME0,
+    subtask_start_pose_for_model,
 )
 from inference.desktop.upper_policy.worker_protocol import (  # noqa: E402
     receive_message,
@@ -126,7 +130,7 @@ class InferenceRequestContext:
 def release_execution_schedule(
     contract: dict[str, Any],
 ) -> tuple[int, float | None, str]:
-    """Read the only execution schedule that passed the release evaluation."""
+    """Read a sealed release schedule or the one pinned legacy candidate schedule."""
 
     execution_steps = int(contract.get("execution_steps", -1))
     label = str(contract.get("temporal_lambda_label"))
@@ -146,6 +150,12 @@ def release_execution_schedule(
         raise ValueError(
             "temporal lambda numeric value differs from its release label"
         )
+    if contract.get("release_certified") is False and (
+        contract.get("candidate_status") != "intermediate_unselected_20k"
+        or execution_steps != 10
+        or label != "none"
+    ):
+        raise ValueError("unselected candidate execution schedule changed")
     return execution_steps, actual_decay, label
 
 
@@ -154,6 +164,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interface", required=True)
     parser.add_argument("--image-server-ip", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--task", default=TASK_TEXT)
+    parser.add_argument("--model-repo-id")
+    parser.add_argument("--model-revision")
+    parser.add_argument("--expected-checkpoint-sha256")
     parser.add_argument(
         "--worker-python",
         type=Path,
@@ -205,19 +219,38 @@ class PolicyWorker:
         *,
         device: str,
         seed: int,
+        model_repo_id: str | None = None,
+        model_revision: str | None = None,
+        task: str = TASK_TEXT,
+        expected_model_sha256: str | None = None,
     ) -> None:
         self._request_id = 0
+        worker_argv = [
+            str(python),
+            str(script),
+            "--checkpoint",
+            str(checkpoint),
+            "--device",
+            device,
+            "--seed",
+            str(seed),
+        ]
+        identity = (model_repo_id, model_revision, expected_model_sha256)
+        if any(value is not None for value in identity):
+            if not all(value is not None for value in identity):
+                raise ValueError("sealed worker identity arguments must be complete")
+            worker_argv += [
+                "--model-repo-id",
+                str(model_repo_id),
+                "--model-revision",
+                str(model_revision),
+                "--task",
+                task,
+                "--expected-model-sha256",
+                str(expected_model_sha256),
+            ]
         self._process = subprocess.Popen(
-            [
-                str(python),
-                str(script),
-                "--checkpoint",
-                str(checkpoint),
-                "--device",
-                device,
-                "--seed",
-                str(seed),
-            ],
+            worker_argv,
             cwd=REPO_ROOT,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -232,8 +265,21 @@ class PolicyWorker:
             if ready.get("type") != "ready":
                 raise RuntimeError(f"policy worker did not become ready: {ready}")
             contract = ready.get("contract") or {}
+            identity_mismatch = {}
+            if model_repo_id is not None:
+                expected_identity = {
+                    "model_repo_id": model_repo_id,
+                    "model_revision": model_revision,
+                    "task": task,
+                    "weights_sha256": expected_model_sha256,
+                }
+                identity_mismatch = {
+                    key: (contract.get(key), expected)
+                    for key, expected in expected_identity.items()
+                    if contract.get(key) != expected
+                }
             if (
-                contract.get("task") != TASK_TEXT
+                contract.get("task") != task
                 or contract.get("state_dim") != 49
                 or contract.get("logical_action_dim") != 53
                 or contract.get("executable_action_dim") != 16
@@ -242,6 +288,7 @@ class PolicyWorker:
                 != ["head_left", "left_wrist", "right_wrist"]
                 or contract.get("video_delta_indices") != list(VIDEO_DELTA_INDICES)
                 or contract.get("lower_body_command_dimensions") != 0
+                or identity_mismatch
             ):
                 raise RuntimeError(f"unexpected policy worker contract: {contract}")
             release_execution_schedule(contract)
@@ -415,8 +462,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{label} must be finite and positive")
 def main() -> int:
+    from data.flip_table_data_augmentation.teleop.desktop_preview import (
+        enable_camera_preview_for_policy_runner,
+    )
+
+    enable_camera_preview_for_policy_runner()
     args = parse_args()
     _validate_args(args)
+    start_pose = (
+        subtask_start_pose_for_model(args.model_repo_id)
+        if args.model_repo_id is not None
+        else FLIP_TABLE_V2_FRAME0
+    )
     config = load_teleop_config(args.config)
     from data.flip_table_data_augmentation.teleop.real.backend import RealDdsBackend
 
@@ -430,18 +487,32 @@ def main() -> int:
     initial_arm_position: np.ndarray | None = None
     gravity: OfficialG1ArmGravityCompensator | None = None
     try:
-        worker = PolicyWorker(
-            args.worker_python,
-            args.worker_script,
-            args.checkpoint,
-            device=args.device,
-            seed=args.seed,
+        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
+        worker = initialize_policy_worker_with_live_camera(
+            backend,
+            lambda: PolicyWorker(
+                args.worker_python,
+                args.worker_script,
+                args.checkpoint,
+                device=args.device,
+                seed=args.seed,
+                model_repo_id=args.model_repo_id,
+                model_revision=args.model_revision,
+                task=args.task,
+                expected_model_sha256=args.expected_checkpoint_sha256,
+            ),
         )
         execution_steps, temporal_lambda, temporal_lambda_label = (
             release_execution_schedule(worker.ready["contract"])
         )
+        if worker.ready["contract"].get("release_certified") is False:
+            print(
+                "[candidate] sealed 20k intermediate checkpoint; not sim-selected "
+                "or release-certified. Evaluation results must not be reported as "
+                "a released policy.",
+                flush=True,
+            )
         fk = G1EefForwardKinematics(args.urdf)
-        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
         buffer = TemporalObservationBuffer()
         history = collect_temporal_history(backend, buffer, timeout_s=3.0)
         state = state_for_observation(history[-1], fk=fk)
@@ -473,6 +544,14 @@ def main() -> int:
             ),
             "chunk_step_delta_max_rad": max(
                 value["chunk_step_delta_max_rad"]
+                for value in preflight_diagnostics
+            ),
+            "arm_safety_clip_count_max": max(
+                value["arm_safety_clip_count"]
+                for value in preflight_diagnostics
+            ),
+            "arm_safety_clip_max_rad": max(
+                value["arm_safety_clip_max_rad"]
                 for value in preflight_diagnostics
             ),
             "arm_prediction_std_max_rad": float(
@@ -523,19 +602,19 @@ def main() -> int:
             latest.arm_joint_position_rad, dtype=np.float64
         ).copy()
         start_waypoints = build_arm_pre_motion_waypoints(
-            FLIP_TABLE_V2_FRAME0.arm_position_rad
+            start_pose.arm_position_rad
         )
         append_log(
             args.log,
             {
                 "event": "dataset_frame0_pose_selected",
-                "dataset_repo_id": FLIP_TABLE_V2_FRAME0.dataset_repo_id,
-                "dataset_revision": FLIP_TABLE_V2_FRAME0.dataset_revision,
-                "training_episode_count": FLIP_TABLE_V2_FRAME0.training_episode_count,
-                "statistic": FLIP_TABLE_V2_FRAME0.statistic,
-                "exact_training_revision": FLIP_TABLE_V2_FRAME0.exact_training_revision,
-                "pose_sha256": FLIP_TABLE_V2_FRAME0.sha256,
-                "arm_position_rad": list(FLIP_TABLE_V2_FRAME0.arm_position_rad),
+                "dataset_repo_id": start_pose.dataset_repo_id,
+                "dataset_revision": start_pose.dataset_revision,
+                "training_episode_count": start_pose.training_episode_count,
+                "statistic": start_pose.statistic,
+                "exact_training_revision": start_pose.exact_training_revision,
+                "pose_sha256": start_pose.sha256,
+                "arm_position_rad": list(start_pose.arm_position_rad),
                 "lower_body_command_dimensions": 0,
             },
         )
@@ -577,6 +656,7 @@ def main() -> int:
             pose_hold=pose_hold,
             latest=latest,
         )
+        start_policy_interval_recording(backend, args.log)
 
         buffer = TemporalObservationBuffer()
         history = collect_temporal_history(
@@ -612,7 +692,7 @@ def main() -> int:
                 )
         actions, inference_ms = pending.result()
         pending = None
-        validate_policy_chunk(
+        armed_diagnostics = validate_policy_chunk(
             actions,
             measured_arm=initial_context.measured_arm_rad,
             config=config,
@@ -620,6 +700,17 @@ def main() -> int:
             step_delta_limit_rad=args.step_delta_limit_rad,
             expected_horizon=40,
         )
+        margin_clip_warning_printed = False
+        if armed_diagnostics["arm_safety_clip_count"]:
+            print(
+                "[safety] model targets entered the official-limit margin; "
+                "outgoing commands will saturate at the configured 30 mrad "
+                "envelope "
+                f"(count={int(armed_diagnostics['arm_safety_clip_count'])}, "
+                f"max={armed_diagnostics['arm_safety_clip_max_rad']:.4f}rad)",
+                flush=True,
+            )
+            margin_clip_warning_printed = True
 
         ensemble = PhysicalTargetTemporalEnsembler(
             decay_lambda=temporal_lambda
@@ -633,6 +724,8 @@ def main() -> int:
             arm_acceleration_rad_s2=args.policy_arm_acceleration_rad_s2,
             hand_velocity_fraction_s=args.policy_hand_velocity_fraction_s,
             hand_acceleration_fraction_s2=args.policy_hand_acceleration_fraction_s2,
+            arm_position_lower_rad=config.safety.arm_position_lower_rad,
+            arm_position_upper_rad=config.safety.arm_position_upper_rad,
         )
         append_log(
             args.log,
@@ -640,6 +733,7 @@ def main() -> int:
                 "event": "armed_prediction",
                 "origin_step": 0,
                 "inference_ms": inference_ms,
+                **armed_diagnostics,
             },
         )
 
@@ -669,7 +763,7 @@ def main() -> int:
             if pending is not None and pending.done():
                 new_actions, latency_ms = pending.result()
                 assert pending_context is not None
-                validate_policy_chunk(
+                chunk_diagnostics = validate_policy_chunk(
                     new_actions,
                     measured_arm=pending_context.measured_arm_rad,
                     config=config,
@@ -677,6 +771,19 @@ def main() -> int:
                     step_delta_limit_rad=args.step_delta_limit_rad,
                     expected_horizon=40,
                 )
+                if (
+                    chunk_diagnostics["arm_safety_clip_count"]
+                    and not margin_clip_warning_printed
+                ):
+                    print(
+                        "[safety] model targets entered the official-limit "
+                        "margin; outgoing commands are saturating at the "
+                        "configured 30 mrad envelope "
+                        f"(count={int(chunk_diagnostics['arm_safety_clip_count'])}, "
+                        f"max={chunk_diagnostics['arm_safety_clip_max_rad']:.4f}rad)",
+                        flush=True,
+                    )
+                    margin_clip_warning_printed = True
                 usable = pending_context.has_remaining_target(step)
                 if usable:
                     ensemble.add_chunk(
@@ -690,6 +797,7 @@ def main() -> int:
                         "origin_step": pending_context.origin_step,
                         "received_step": step,
                         "inference_ms": latency_ms,
+                        **chunk_diagnostics,
                     },
                 )
                 pending = None
@@ -763,6 +871,7 @@ def main() -> int:
         return 130
     finally:
         if backend is not None:
+            stop_policy_interval_recording(backend, args.log)
             if actuation_started:
                 if (
                     initial_arm_position is not None
@@ -777,7 +886,7 @@ def main() -> int:
                         gravity_compensator=gravity,
                         initial_arm_position_rad=initial_arm_position,
                         dataset_frame0_arm_rad=(
-                            FLIP_TABLE_V2_FRAME0.arm_position_rad
+                            start_pose.arm_position_rad
                         ),
                         arm_velocity_rad_s=args.pre_motion_arm_velocity_rad_s,
                         arm_acceleration_rad_s2=(

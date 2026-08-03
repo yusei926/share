@@ -330,9 +330,10 @@ run_training() {
   local checkpoint_repo_id="$final_repo_id"
   local remote_step=0
   local -a resume_args=()
+  # W&B is used only for metrics and run metadata. Checkpoints are stored in
+  # the private Hugging Face repository selected below.
   local wandb_disable_artifact=true
   if [[ "$durable_backup" == "true" ]]; then
-    wandb_disable_artifact=false
     if [[ "$name" == "baseline" ]]; then
       checkpoint_repo_id="$baseline_backup_repo_id"
     elif [[ "$name" == "auxiliary_progress" ]]; then

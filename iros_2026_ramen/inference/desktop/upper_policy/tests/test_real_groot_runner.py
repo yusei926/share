@@ -284,28 +284,31 @@ def test_context_only_lower_body_tail_inside_raw_support_is_diagnostic(
     assert report["state_context_max_abs_z"] == pytest.approx(7.5)
 
 
-def test_context_only_lower_body_outside_raw_support_is_rejected(
+def test_context_only_lower_body_outside_raw_support_is_diagnostic(
     tmp_path: Path,
 ) -> None:
     _write_metadata(tmp_path)
     body = np.zeros(29)
     body[1] = -2.0
-    with pytest.raises(ValueError, match="observed raw training support"):
-        validate_state_distribution(_state_observation(body), tmp_path)
+    report = validate_state_distribution(_state_observation(body), tmp_path)
+    assert 8 in report["state_distribution_warning_indices"]
+    assert report["training_distribution_action_modified"] is False
 
 
-def test_executable_arm_keeps_robust_check_but_can_be_deferred_before_staging(
+def test_executable_arm_support_is_diagnostic_and_can_be_deferred_before_staging(
     tmp_path: Path,
 ) -> None:
     _write_metadata(tmp_path)
     # Model-state dimension 22 is robot_q/body index 15: left shoulder pitch.
     _narrow_stat_dimension(tmp_path, 22)
     observation = _state_observation(np.zeros(29))
-    with pytest.raises(ValueError, match="q01-q99 robust support"):
-        validate_state_distribution(observation, tmp_path)
+    report = validate_state_distribution(observation, tmp_path)
+    assert 22 in report["state_distribution_warning_indices"]
+    assert report["training_distribution_action_modified"] is False
     report = validate_state_distribution(
         observation,
         tmp_path,
         validate_executable_state=False,
     )
     assert report["state_executable_validation_enabled"] is False
+    assert 22 not in report["state_distribution_warning_indices"]

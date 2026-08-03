@@ -31,9 +31,9 @@
     },
     "flip_table": {
       "task": "flip table",
-      "dataset_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2",
-      "dataset_revision": "0dc47877dfb2efbea796a059c81290c649bc773c",
-      "groot_policy_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2"
+      "dataset_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_3",
+      "dataset_revision": "c06d69f319e9c3a0738f2144a647b848eb01cd28",
+      "groot_policy_repo_id": "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_3"
     }
   },
   "cameras": [

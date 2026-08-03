@@ -48,6 +48,8 @@ sudo systemctl enable "$UNIT_NAME"
 
 echo "Installed and enabled $UNIT_NAME for user $SERVICE_USER."
 echo "No running camera process was changed."
+echo "Set the visually verified WRIST_LEFT_SERIAL and WRIST_RIGHT_SERIAL in"
+echo "/etc/default/iros-ramen-avp-teleimager before starting the service."
 if [[ "$RESTART" == 1 ]]; then
   echo "Restarting the camera-only service; no Unitree DDS publisher is involved."
   sudo systemctl restart "$UNIT_NAME"

@@ -64,20 +64,50 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (
     PolicyStartPoseHold,
     append_log,
     command_from_action,
+    initialize_policy_worker_with_live_camera,
     run_blocking_check_with_pose_hold,
     run_arm_pre_motion,
+    start_policy_interval_recording,
+    stop_policy_interval_recording,
     return_arms_before_release,
     validate_runtime_backend,
     verify_regular_mode,
     verify_regular_mode_after_release,
     wait_for_policy_start_with_hold,
 )
-from inference.desktop.upper_policy.pre_motion import build_arm_pre_motion_waypoints
+from inference.desktop.upper_policy.pre_motion import (
+    ArmPreMotionWaypoint,
+    build_arm_pre_motion_waypoints,
+)
 from inference.desktop.upper_policy.subtask_start_pose import (
     SubtaskStartPose,
     subtask_start_pose_for_model,
 )
 from inference.desktop.upper_policy.worker_protocol import receive_message, send_message
+
+
+def build_pick_leg_start_motion(
+    start_pose: SubtaskStartPose,
+) -> tuple[tuple[ArmPreMotionWaypoint, ...], dict[str, tuple[float, float]]]:
+    """Build the collision-clearance path and its explicit Dex1 targets."""
+
+    if start_pose.dex1_opening_fraction is None:
+        raise ValueError(
+            "physical GR00T evaluation requires a pinned dataset frame-zero "
+            "Dex1 opening"
+        )
+    waypoints = (
+        ArmPreMotionWaypoint(
+            "hands_full_open_before_clearance",
+            (0.0,) * 14,
+            tuple(range(14)),
+        ),
+    ) + build_arm_pre_motion_waypoints(start_pose.arm_position_rad)
+    hand_targets = {waypoint.name: (1.0, 1.0) for waypoint in waypoints}
+    hand_targets["dataset_frame0_pose"] = tuple(
+        start_pose.dex1_opening_fraction
+    )
+    return waypoints, hand_targets
 
 
 def parse_args() -> argparse.Namespace:
@@ -384,11 +414,12 @@ def validate_state_distribution(
     robust_outside[:7] = False
     raw_outside[:7] = False
 
-    # Root/legs/waist are inputs only. Their predicted targets are discarded
-    # and Unitree Regular Mode remains their sole controller. A value in the
-    # observed training min/max support is therefore reported as a distribution
-    # tail, not treated as an arm-actuation fault. Executable arm/Dex1 state
-    # keeps the stricter robust q01-q99 check.
+    # Training statistics are model diagnostics, not robot safety limits.
+    # Root/legs/waist are inputs only and Unitree Regular Mode remains their
+    # sole controller. Arm/Dex1 excursions are reported too, but must not
+    # silently alter or reject a physically valid model action. Physical
+    # limits are enforced independently by validate_action_chunk and the
+    # actuator-side limiter.
     context_indices = np.arange(7, MODEL_ARM_SLICE.start)
     executable_indices = np.concatenate(
         (
@@ -396,25 +427,14 @@ def validate_state_distribution(
             np.arange(MODEL_HAND_SLICE.start, MODEL_HAND_SLICE.stop),
         )
     )
-    hard_outside = np.zeros(MODEL_STATE_DIM, dtype=bool)
-    hard_outside[context_indices] = raw_outside[context_indices]
+    diagnostic_outside = np.zeros(MODEL_STATE_DIM, dtype=bool)
+    diagnostic_outside[context_indices] = raw_outside[context_indices]
     if validate_executable_state:
-        hard_outside[executable_indices] = robust_outside[executable_indices]
-    if np.any(hard_outside):
-        index = int(np.flatnonzero(hard_outside)[0])
-        support = (
-            "q01-q99 robust support"
-            if index in executable_indices
-            else "observed raw training support"
-        )
-        raise ValueError(
-            "live GR00T state is materially outside training support "
-            f"(dimension={index}, value={state[index]:.5f}, "
-            f"q01={q01[index]:.5f}, q99={q99[index]:.5f}, "
-            f"min={raw_minimum[index]:.5f}, max={raw_maximum[index]:.5f}, "
-            f"z={z[index]:.2f}, required={support})"
-        )
+        diagnostic_outside[executable_indices] = robust_outside[
+            executable_indices
+        ]
     context_tail = context_indices[robust_outside[context_indices]]
+    outside_indices = np.flatnonzero(diagnostic_outside)
     return {
         "model_state_38d": state.tolist(),
         "state_max_abs_z_non_root": float(z[7:].max()),
@@ -422,6 +442,9 @@ def validate_state_distribution(
         "state_context_tail_count": int(context_tail.size),
         "state_context_max_abs_z": float(z[context_indices].max()),
         "state_executable_validation_enabled": validate_executable_state,
+        "state_distribution_warning_indices": outside_indices.astype(int).tolist(),
+        "state_distribution_warning_count": int(outside_indices.size),
+        "training_distribution_action_modified": False,
         "root_pose_proxy_xyz_wxyz": state[:7].tolist(),
         "camera_payload_skew_ms": _camera_skew_ms(observation),
     }
@@ -561,6 +584,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    from data.flip_table_data_augmentation.teleop.desktop_preview import (
+        enable_camera_preview_for_policy_runner,
+    )
+
+    enable_camera_preview_for_policy_runner()
     args = parse_args()
     _validate_args(args)
     config = load_teleop_config(args.config)
@@ -575,22 +603,25 @@ def main() -> int:
     start_pose: SubtaskStartPose | None = None
     gravity: OfficialG1ArmGravityCompensator | None = None
     try:
-        worker = PolicyWorker.start(
-            args.worker_python,
-            args.worker_script,
-            args.checkpoint,
-            device=args.device,
-            seed=args.seed,
-            model_repo_id=args.model_repo_id,
-            model_revision=args.model_revision,
-            task=args.task,
+        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
+        worker = initialize_policy_worker_with_live_camera(
+            backend,
+            lambda: PolicyWorker.start(
+                args.worker_python,
+                args.worker_script,
+                args.checkpoint,
+                device=args.device,
+                seed=args.seed,
+                model_repo_id=args.model_repo_id,
+                model_revision=args.model_revision,
+                task=args.task,
+            ),
         )
         print(
             "[model] GR00T N1.7 ready "
             f"revision={args.model_revision[:12]} device={worker.ready['device']}",
             flush=True,
         )
-        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
         observation = collect_fresh_observation(backend)
         if not args.actuate:
             (
@@ -702,8 +733,12 @@ def main() -> int:
         initial_arm_position = np.asarray(
             observation.arm_joint_position_rad, dtype=np.float64
         ).copy()
-        start_waypoints = build_arm_pre_motion_waypoints(
-            start_pose.arm_position_rad
+        # Open both hands before moving either arm so a previously closed hand
+        # cannot catch on the table during the collision-clearance path.  Keep
+        # them fully open through all clearance waypoints, then transition to
+        # the exact dataset frame-zero median only at the final arm pose.
+        start_waypoints, startup_hand_targets = build_pick_leg_start_motion(
+            start_pose
         )
         append_log(
             args.log,
@@ -717,6 +752,9 @@ def main() -> int:
                 "exact_training_revision": start_pose.exact_training_revision,
                 "pose_sha256": start_pose.sha256,
                 "arm_position_rad": list(start_pose.arm_position_rad),
+                "dex1_opening_fraction": list(
+                    start_pose.dex1_opening_fraction
+                ),
                 "lower_body_command_dimensions": 0,
             },
         )
@@ -741,6 +779,7 @@ def main() -> int:
             waypoint_tolerance_rad=args.pre_motion_waypoint_tolerance_rad,
             stage_timeout_s=args.pre_motion_stage_timeout_s,
             waypoints=start_waypoints,
+            hand_targets_by_waypoint=startup_hand_targets,
         )
         pre_motion_complete = True
         observation = wait_for_policy_start_with_hold(
@@ -764,6 +803,7 @@ def main() -> int:
             pose_hold=pose_hold,
             latest=observation,
         )
+        start_policy_interval_recording(backend, args.log)
         previous_generation = _camera_generation(observation)
         observation = collect_fresh_observation(
             backend,
@@ -801,6 +841,8 @@ def main() -> int:
             arm_acceleration_rad_s2=args.policy_arm_acceleration_rad_s2,
             hand_velocity_fraction_s=args.policy_hand_velocity_fraction_s,
             hand_acceleration_fraction_s2=args.policy_hand_acceleration_fraction_s2,
+            arm_position_lower_rad=config.safety.arm_position_lower_rad,
+            arm_position_upper_rad=config.safety.arm_position_upper_rad,
         )
         preview_limiter = PolicyActionLimiter(
             np.asarray(latest.arm_joint_position_rad),
@@ -810,6 +852,8 @@ def main() -> int:
             arm_acceleration_rad_s2=args.policy_arm_acceleration_rad_s2,
             hand_velocity_fraction_s=args.policy_hand_velocity_fraction_s,
             hand_acceleration_fraction_s2=args.policy_hand_acceleration_fraction_s2,
+            arm_position_lower_rad=config.safety.arm_position_lower_rad,
+            arm_position_upper_rad=config.safety.arm_position_upper_rad,
         )
         first_limited = preview_limiter.apply(actions[0])
         action_diagnostics["first_transmitted_arm_delta_max_rad"] = float(
@@ -907,6 +951,7 @@ def main() -> int:
         return 130
     finally:
         if backend is not None:
+            stop_policy_interval_recording(backend, args.log)
             if actuation_started:
                 if (
                     initial_arm_position is not None
@@ -930,6 +975,7 @@ def main() -> int:
                             args.pre_motion_waypoint_tolerance_rad
                         ),
                         stage_timeout_s=args.pre_motion_stage_timeout_s,
+                        dex1_return_opening_fraction=(1.0, 1.0),
                     )
                 try:
                     latest = backend.observe(timeout_s=1.0)

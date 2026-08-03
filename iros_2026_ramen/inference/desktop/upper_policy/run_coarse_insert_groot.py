@@ -58,8 +58,11 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (  # noqa: E
     append_log,
     command_from_action,
     current_camera_skew_ms,
+    initialize_policy_worker_with_live_camera,
     run_blocking_check_with_pose_hold,
     run_arm_pre_motion,
+    start_policy_interval_recording,
+    stop_policy_interval_recording,
     return_arms_before_release,
     validate_policy_chunk,
     validate_runtime_backend,
@@ -388,6 +391,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    from data.flip_table_data_augmentation.teleop.desktop_preview import (
+        enable_camera_preview_for_policy_runner,
+    )
+
+    enable_camera_preview_for_policy_runner()
     args = parse_args()
     _validate_args(args)
     config = load_teleop_config(args.config)
@@ -402,19 +410,22 @@ def main() -> int:
     start_pose: SubtaskStartPose | None = None
     gravity: OfficialG1ArmGravityCompensator | None = None
     try:
-        worker = PolicyWorker(
-            args.worker_python,
-            args.worker_script,
-            args.checkpoint,
-            device=args.device,
-            seed=args.seed,
-            model_repo_id=args.model_repo_id,
-            model_revision=args.model_revision,
-            task=args.task,
-            expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
+        worker = initialize_policy_worker_with_live_camera(
+            backend,
+            lambda: PolicyWorker(
+                args.worker_python,
+                args.worker_script,
+                args.checkpoint,
+                device=args.device,
+                seed=args.seed,
+                model_repo_id=args.model_repo_id,
+                model_revision=args.model_revision,
+                task=args.task,
+                expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+            ),
         )
         fk = G1EefForwardKinematics(args.urdf)
-        backend = RealDdsBackend(args.interface, args.image_server_ip, config)
         observation = collect_observation(backend)
         if not args.actuate:
             actions, latency, diagnostics = evaluate_policy_preflight(
@@ -623,6 +634,7 @@ def main() -> int:
             pose_hold=pose_hold,
             latest=observation,
         )
+        start_policy_interval_recording(backend, args.log)
         observation = collect_observation(
             backend,
             previous_generation=_generation(observation),
@@ -655,6 +667,8 @@ def main() -> int:
             arm_acceleration_rad_s2=args.policy_arm_acceleration_rad_s2,
             hand_velocity_fraction_s=args.policy_hand_velocity_fraction_s,
             hand_acceleration_fraction_s2=args.policy_hand_acceleration_fraction_s2,
+            arm_position_lower_rad=config.safety.arm_position_lower_rad,
+            arm_position_upper_rad=config.safety.arm_position_upper_rad,
         )
         append_log(
             args.log,
@@ -712,6 +726,7 @@ def main() -> int:
         return 130
     finally:
         if backend is not None:
+            stop_policy_interval_recording(backend, args.log)
             if actuation_started:
                 if (
                     initial_arm_position is not None

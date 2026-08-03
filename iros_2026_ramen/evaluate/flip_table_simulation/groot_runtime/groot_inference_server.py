@@ -14,7 +14,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -81,7 +81,11 @@ def _feature_dim(config: dict[str, Any], group: str, key: str) -> int | None:
     return int(shape[-1])
 
 
-def validate_checkpoint(checkpoint: Path) -> dict[str, Any]:
+def validate_checkpoint(
+    checkpoint: Path,
+    *,
+    furniture_release_validator: Callable[[Path], Any] | None = None,
+) -> dict[str, Any]:
     required = (
         "config.json",
         "model.safetensors",
@@ -150,7 +154,12 @@ def validate_checkpoint(checkpoint: Path) -> dict[str, Any]:
             raise ValueError(
                 "Furniture-GR00T base_model_revision must be the pinned N1.7 revision"
             )
-        validate_finalized_furniture_checkpoint(checkpoint)
+        validator = (
+            validate_finalized_furniture_checkpoint
+            if furniture_release_validator is None
+            else furniture_release_validator
+        )
+        validator(checkpoint)
     return config
 
 
@@ -315,11 +324,15 @@ class GrootRuntime:
         device: str,
         n_action_steps: int,
         seed: int,
+        furniture_release_validator: Callable[[Path], Any] | None = None,
     ) -> None:
         version = importlib.metadata.version("lerobot")
         if version != LEROBOT_VERSION:
             raise RuntimeError(f"expected lerobot=={LEROBOT_VERSION}, found {version}")
-        checkpoint_config = validate_checkpoint(checkpoint)
+        checkpoint_config = validate_checkpoint(
+            checkpoint,
+            furniture_release_validator=furniture_release_validator,
+        )
 
         import torch
         from lerobot.policies.groot.modeling_groot import GrootPolicy

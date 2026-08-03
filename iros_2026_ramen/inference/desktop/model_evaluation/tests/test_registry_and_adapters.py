@@ -76,10 +76,16 @@ def test_registry_covers_requested_models_and_has_one_safe_output() -> None:
         "pick_legs_groot_v2_lora",
         "coarse_insert_groot_n17_v2",
         "flip_table_diffusion_chunk_relative_v2",
+        "flip_table_groot_n17_v2_baseline_20k_candidate",
     } <= set(registry)
     assert {spec.canonical_output for spec in registry.values()} == {CANONICAL_OUTPUT}
     assert {spec.lower_body_command_dimensions for spec in registry.values()} == {0}
     assert all(spec.artifact.file_sha256 for spec in registry.values())
+    assert {
+        spec.execution_steps
+        for spec in registry.values()
+        if spec.family == "act_absolute_joint16_v1"
+    } == {30}
 
 
 def test_full_hf_path_and_url_resolve_for_registered_model_without_network() -> None:
@@ -170,6 +176,27 @@ def test_diffusion_relative_arm_is_anchored_exactly_once() -> None:
     np.testing.assert_allclose(result[:, 14:], [[0.25, 0.75]] * 16)
 
 
+def test_furniture_candidate_adapter_exposes_only_arms_and_dex1() -> None:
+    spec = get_model_spec("flip_table_groot_n17_v2_baseline_20k_candidate")
+    observation = _observation(spec.model_id)
+    state = adapter_for(spec).model_state(observation)
+    assert state.shape == (49,)
+    native = np.zeros((40, 16), dtype=np.float64)
+    native[:, :14] = np.arange(14, dtype=np.float64)
+    native[:, 14:] = [1.125, 3.375]
+    result = adapter_for(spec).canonical_action(native, observation)
+    np.testing.assert_allclose(result[:, :14], np.tile(np.arange(14), (40, 1)))
+    np.testing.assert_allclose(result[:, 14:], [[0.25, 0.75]] * 40)
+    request = adapter_for(spec).offline_request(observation, state)
+    assert set(request["camera_history"]) == {
+        "observation.images.head_left",
+        "observation.images.left_wrist",
+        "observation.images.right_wrist",
+    }
+    assert all(len(history) == 2 for history in request["camera_history"].values())
+    assert request["task"] == "flip table"
+
+
 def test_download_plan_is_commit_pinned_and_excludes_training_state() -> None:
     spec = get_model_spec("pick_legs_groot_v1")
     plan = download_plan(spec, Path("/tmp/model"))
@@ -256,6 +283,17 @@ def test_runner_command_has_sealed_identity_and_no_passthrough() -> None:
                 "/tmp/unsealed",
             ]
         )
+
+
+def test_act_runner_receives_checkpoint_n_action_steps() -> None:
+    spec = get_model_spec("pre_straddle_act_augxx_s40k")
+    argv = runner_argv(
+        spec,
+        Path("/tmp/act"),
+        interface="test-nic",
+        image_server_ip="192.0.2.10",
+    )
+    assert argv[argv.index("--action-execution-steps") + 1] == "30"
 
 
 def test_common_launcher_forwards_only_bounded_motion_limits() -> None:
