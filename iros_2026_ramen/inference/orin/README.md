@@ -84,6 +84,36 @@ docker compose run --rm ramen_inference \
 
 device path の上書きだけなら image rebuild は不要。対応解像度やpixel formatも異なる機種へ交換した場合は、camera parameterも実機仕様に合わせる。
 
+#### ヘッドカメラの手動フォーカス調整
+
+交換・取付変更後の手動フォーカスは、Desktop上のread-only GUIで調整する。テーブルに
+限定せず、人が左右映像上で任意の対象物をバウンディングボックス選択し、その内側だけを
+評価する汎用ツールである。文字や細い輪郭を含む固定ターゲットを希望する合焦距離へ置き、
+Orinのcamera-only TeleImagerを起動した状態で次を実行する。このツールはUnitree SDKを
+importせず、G1へ関節指令を送らない。
+
+```bash
+cd /home/ubuntu/GitHub/iros_2026_ramen
+G1_IMAGE_SERVER_IP=<OrinのIPv4> \
+bash inference/desktop/xr/run_head_camera_focus_assistant.sh
+```
+
+起動直後は評価領域を持たない。左右画像で同じ対象物をそれぞれ左ドラッグしてbboxを作る。
+bbox確定後、その内側だけから鮮明度を計算し、外側の背景はスコアへ一切入れない。片方の
+レンズずつフォーカスリングを端からゆっくり回し、手を離して表示が`PEAK ZONE`になり、
+`LIVE`が`BEST`付近で最大になる位置へ戻して固定する。左右は独立に判定する。
+
+- 画像上を左ドラッグ: その眼の評価bboxを作成・置換
+- 画像上を右クリック: その眼のbboxを解除
+- `c`: 左右両方のbboxを解除
+- `r`: それまでのピークを消して再計測
+- `[` / `]`: ROIを縮小 / 拡大
+- `s`: 注釈画像とスコアJSONを`~/Downloads/head_camera_focus/`へ保存
+- `q` / `Esc`: 終了
+
+手や動く物体をbboxへ入れない。`LOW CONTRAST`なら文字・細線のあるターゲットを置き、
+`EXPOSURE CLIPPED`なら照明を調整する。手ブレ中の値はピークとして採用されない。
+
 ### 実機 deploy (real bridge、Issue #65)
 
 G1 body 電源 ON + EtherCAT 接続後に real bridge で lowstate を購読する。

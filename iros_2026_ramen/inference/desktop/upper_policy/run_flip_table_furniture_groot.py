@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -43,6 +42,11 @@ from inference.desktop.upper_policy.furniture_groot_contract import (  # noqa: E
     VIDEO_DELTA_INDICES,
     camera_payload_history,
     compose_model_state,
+)
+from inference.desktop.upper_policy.async_replanning import (  # noqa: E402
+    AsyncPredictionTask,
+    advance_periodic_deadline,
+    run_cleanup_steps,
 )
 from inference.desktop.upper_policy.gravity_compensation import (  # noqa: E402
     OfficialG1ArmGravityCompensator,
@@ -98,6 +102,13 @@ HISTORY_TOLERANCE_SECONDS = 1.5 / DATASET_FPS
 VALID_EXECUTION_STEPS = frozenset({5, 10, 20})
 VALID_TEMPORAL_LAMBDA_LABELS = frozenset({"none", "-0.25", "-0.1", "0"})
 MAX_INFERENCE_AGE_SECONDS = MODEL_ACTION_HORIZON / COMMAND_HZ
+# The immutable 20k candidate occasionally extrapolates a decoded absolute
+# arm target a few milliradians beyond the official URDF limit.  The outgoing
+# command is still saturated at teleop_v1's envelope, which is 30 mrad *inside*
+# the official limit.  Permit only this small raw-model extrapolation for the
+# unselected legacy candidate; finalized policies remain fail-closed at the
+# official boundary.
+LEGACY_CANDIDATE_RAW_LIMIT_EXTRAPOLATION_RAD = 0.03
 
 
 @dataclass(frozen=True)
@@ -330,14 +341,12 @@ class PolicyWorker:
         if self._process.poll() is None:
             try:
                 send_message(self._input, {"type": "close"})
-                receive_message(self._output)
             except (BrokenPipeError, EOFError):
                 pass
             try:
                 self._process.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
-                self._process.terminate()
-                self._process.wait(timeout=3.0)
+                self.terminate()
 
     def terminate(self) -> None:
         """Stop an in-flight worker without waiting for an inference response."""
@@ -479,8 +488,7 @@ def main() -> int:
 
     worker: PolicyWorker | None = None
     backend: RealDdsBackend | None = None
-    executor: ThreadPoolExecutor | None = None
-    pending: Future[tuple[np.ndarray, float]] | None = None
+    pending: AsyncPredictionTask[tuple[np.ndarray, float]] | None = None
     command_sequence = CommandSequence()
     actuation_started = False
     pre_motion_complete = False
@@ -505,7 +513,15 @@ def main() -> int:
         execution_steps, temporal_lambda, temporal_lambda_label = (
             release_execution_schedule(worker.ready["contract"])
         )
-        if worker.ready["contract"].get("release_certified") is False:
+        is_legacy_candidate = (
+            worker.ready["contract"].get("release_certified") is False
+        )
+        raw_limit_extrapolation_tolerance_rad = (
+            LEGACY_CANDIDATE_RAW_LIMIT_EXTRAPOLATION_RAD
+            if is_legacy_candidate
+            else 0.0
+        )
+        if is_legacy_candidate:
             print(
                 "[candidate] sealed 20k intermediate checkpoint; not sim-selected "
                 "or release-certified. Evaluation results must not be reported as "
@@ -532,6 +548,10 @@ def main() -> int:
                     initial_delta_limit_rad=args.initial_delta_limit_rad,
                     step_delta_limit_rad=args.step_delta_limit_rad,
                     expected_horizon=40,
+                    execution_steps=execution_steps,
+                    official_limit_extrapolation_tolerance_rad=(
+                        raw_limit_extrapolation_tolerance_rad
+                    ),
                 )
             )
         stacked = np.stack(preflight_actions)
@@ -552,6 +572,14 @@ def main() -> int:
             ),
             "arm_safety_clip_max_rad": max(
                 value["arm_safety_clip_max_rad"]
+                for value in preflight_diagnostics
+            ),
+            "arm_official_extrapolation_count_max": max(
+                value["arm_official_extrapolation_count"]
+                for value in preflight_diagnostics
+            ),
+            "arm_official_extrapolation_max_rad": max(
+                value["arm_official_extrapolation_max_rad"]
                 for value in preflight_diagnostics
             ),
             "arm_prediction_std_max_rad": float(
@@ -666,7 +694,6 @@ def main() -> int:
             hold=pose_hold.refresh,
         )
         state = state_for_observation(history[-1], fk=fk)
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="groot-inference")
         initial_context = InferenceRequestContext(
             origin_step=0,
             measured_arm_rad=np.asarray(
@@ -675,7 +702,10 @@ def main() -> int:
             ),
             submitted_monotonic_s=time.monotonic(),
         )
-        pending = executor.submit(worker.predict, history, state)
+        pending = AsyncPredictionTask(
+            lambda: worker.predict(history, state),
+            thread_name="furniture-groot-initial",
+        )
         while not pending.done():
             observation = backend.observe(
                 timeout_s=min(0.05, config.safety.command_hold_timeout_s)
@@ -699,8 +729,13 @@ def main() -> int:
             initial_delta_limit_rad=args.initial_delta_limit_rad,
             step_delta_limit_rad=args.step_delta_limit_rad,
             expected_horizon=40,
+            execution_steps=execution_steps,
+            official_limit_extrapolation_tolerance_rad=(
+                raw_limit_extrapolation_tolerance_rad
+            ),
         )
         margin_clip_warning_printed = False
+        official_extrapolation_warning_printed = False
         if armed_diagnostics["arm_safety_clip_count"]:
             print(
                 "[safety] model targets entered the official-limit margin; "
@@ -710,6 +745,17 @@ def main() -> int:
                 f"max={armed_diagnostics['arm_safety_clip_max_rad']:.4f}rad)",
                 flush=True,
             )
+            if armed_diagnostics["arm_official_extrapolation_count"]:
+                print(
+                    "[safety] raw candidate targets crossed the official limit "
+                    "within the bounded 30 mrad extrapolation tolerance; "
+                    "physical commands remain saturated 30 mrad inside the "
+                    "official limit "
+                    f"(count={int(armed_diagnostics['arm_official_extrapolation_count'])}, "
+                    f"max={armed_diagnostics['arm_official_extrapolation_max_rad']:.4f}rad)",
+                    flush=True,
+                )
+                official_extrapolation_warning_printed = True
             margin_clip_warning_printed = True
 
         ensemble = PhysicalTargetTemporalEnsembler(
@@ -752,8 +798,13 @@ def main() -> int:
         step = 0
         deadline = time.monotonic() + args.max_seconds
         period = 1.0 / COMMAND_HZ
+        next_tick = time.monotonic()
         while time.monotonic() < deadline:
-            tick = time.monotonic()
+            sleep_s = next_tick - time.monotonic()
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            if time.monotonic() >= deadline:
+                break
             observation = backend.observe(
                 timeout_s=min(0.05, config.safety.command_hold_timeout_s)
             )
@@ -770,6 +821,10 @@ def main() -> int:
                     initial_delta_limit_rad=args.initial_delta_limit_rad,
                     step_delta_limit_rad=args.step_delta_limit_rad,
                     expected_horizon=40,
+                    execution_steps=execution_steps,
+                    official_limit_extrapolation_tolerance_rad=(
+                        raw_limit_extrapolation_tolerance_rad
+                    ),
                 )
                 if (
                     chunk_diagnostics["arm_safety_clip_count"]
@@ -784,6 +839,20 @@ def main() -> int:
                         flush=True,
                     )
                     margin_clip_warning_printed = True
+                if (
+                    chunk_diagnostics["arm_official_extrapolation_count"]
+                    and not official_extrapolation_warning_printed
+                ):
+                    print(
+                        "[safety] raw candidate targets crossed the official "
+                        "limit within the bounded 30 mrad extrapolation "
+                        "tolerance; physical commands remain saturated 30 "
+                        "mrad inside the official limit "
+                        f"(count={int(chunk_diagnostics['arm_official_extrapolation_count'])}, "
+                        f"max={chunk_diagnostics['arm_official_extrapolation_max_rad']:.4f}rad)",
+                        flush=True,
+                    )
+                    official_extrapolation_warning_printed = True
                 usable = pending_context.has_remaining_target(step)
                 if usable:
                     ensemble.add_chunk(
@@ -823,10 +892,11 @@ def main() -> int:
                     ),
                     submitted_monotonic_s=time.monotonic(),
                 )
-                pending = executor.submit(
-                    worker.predict,
-                    replan_history,
-                    replan_state,
+                pending = AsyncPredictionTask(
+                    lambda history=replan_history, state=replan_state: worker.predict(
+                        history, state
+                    ),
+                    thread_name="furniture-groot-replan",
                 )
                 next_replan = step + execution_steps
 
@@ -863,41 +933,66 @@ def main() -> int:
                 },
             )
             step += 1
-            time.sleep(max(0.0, period - (time.monotonic() - tick)))
+            next_tick += period
+            finished = time.monotonic()
+            if next_tick < finished:
+                append_log(
+                    args.log,
+                    {
+                        "event": "command_tick_overrun",
+                        "overrun_ms": (finished - next_tick) * 1000.0,
+                    },
+                )
+                next_tick = advance_periodic_deadline(
+                    next_tick, finished, period
+                )
         print(f"[done] executed {step} upper-body steps at {COMMAND_HZ:.0f} Hz", flush=True)
         return 0
     except KeyboardInterrupt:
         print("[interrupt] controlled arm_sdk release", flush=True)
         return 130
     finally:
+        primary_exception = sys.exc_info()[1]
+        cleanup_steps = []
         if backend is not None:
-            stop_policy_interval_recording(backend, args.log)
+            cleanup_steps.append(
+                (
+                    "stop policy recording",
+                    lambda: stop_policy_interval_recording(backend, args.log),
+                )
+            )
             if actuation_started:
                 if (
                     initial_arm_position is not None
                     and gravity is not None
                     and pre_motion_complete
                 ):
-                    return_arms_before_release(
-                        backend,
-                        config=config,
-                        log_path=args.log,
-                        command_sequence=command_sequence,
-                        gravity_compensator=gravity,
-                        initial_arm_position_rad=initial_arm_position,
-                        dataset_frame0_arm_rad=(
-                            start_pose.arm_position_rad
-                        ),
-                        arm_velocity_rad_s=args.pre_motion_arm_velocity_rad_s,
-                        arm_acceleration_rad_s2=(
-                            args.pre_motion_arm_acceleration_rad_s2
-                        ),
-                        waypoint_tolerance_rad=(
-                            args.pre_motion_waypoint_tolerance_rad
-                        ),
-                        stage_timeout_s=args.pre_motion_stage_timeout_s,
+                    cleanup_steps.append(
+                        (
+                            "reverse arm path",
+                            lambda: return_arms_before_release(
+                                backend,
+                                config=config,
+                                log_path=args.log,
+                                command_sequence=command_sequence,
+                                gravity_compensator=gravity,
+                                initial_arm_position_rad=initial_arm_position,
+                                dataset_frame0_arm_rad=start_pose.arm_position_rad,
+                                arm_velocity_rad_s=(
+                                    args.pre_motion_arm_velocity_rad_s
+                                ),
+                                arm_acceleration_rad_s2=(
+                                    args.pre_motion_arm_acceleration_rad_s2
+                                ),
+                                waypoint_tolerance_rad=(
+                                    args.pre_motion_waypoint_tolerance_rad
+                                ),
+                                stage_timeout_s=args.pre_motion_stage_timeout_s,
+                            ),
+                        )
                     )
-                try:
+
+                def request_idle() -> None:
                     latest = backend.observe(timeout_s=1.0)
                     backend.apply(
                         ArmHandTarget(
@@ -909,19 +1004,28 @@ def main() -> int:
                             dex1_opening_fraction=latest.dex1_opening_fraction,
                         )
                     )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[shutdown] IDLE request failed: {exc}", file=sys.stderr)
-            try:
-                backend.close()
-            finally:
-                if actuation_started:
-                    verify_regular_mode_after_release(args.interface)
-        if worker is not None and pending is not None and not pending.done():
-            worker.terminate()
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+
+                cleanup_steps.append(("IDLE request", request_idle))
+            cleanup_steps.append(("real backend close", backend.close))
+            if actuation_started:
+                cleanup_steps.append(
+                    (
+                        "Regular Mode handoff verification",
+                        lambda: verify_regular_mode_after_release(args.interface),
+                    )
+                )
+        if pending is not None:
+            cleanup_steps.append(
+                (
+                    "asynchronous prediction close",
+                    lambda: pending.close(
+                        abort_pending=(None if worker is None else worker.terminate)
+                    ),
+                )
+            )
         if worker is not None:
-            worker.close()
+            cleanup_steps.append(("policy worker close", worker.close))
+        run_cleanup_steps(cleanup_steps, primary_exception=primary_exception)
 
 
 if __name__ == "__main__":

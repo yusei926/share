@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 import importlib.metadata
+import inspect
 from pathlib import Path
 import sys
 import time
@@ -39,6 +40,9 @@ from inference.desktop.upper_policy.worker_protocol import (  # noqa: E402
     receive_message,
     send_message,
 )
+from model.subtask_policy_training.gr00t.g1_full_body_mapping import (  # noqa: E402
+    absolute_eef_xyz_rot6d_to_relative,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +66,59 @@ def _decode_rgb(jpeg: bytes, role: str) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1)))
 
 
+def _validate_relative_eef_processor_runtime() -> str:
+    """Prove that the inference-critical training transform is active.
+
+    The training overlay's V2/V3 additions concern public processor assets and
+    the training loss mask. Inference still critically depends on the V1
+    SE(3) relative-EEF helper. Check behavior, not merely a source marker, so a
+    different or partially patched LeRobot install fails before model loading.
+    """
+
+    from lerobot.policies.groot import processor_groot
+
+    helper = getattr(
+        processor_groot,
+        "_absolute_eef_xyz_rot6d_to_relative_torch",
+        None,
+    )
+    if not callable(helper):
+        raise RuntimeError(
+            "LeRobot is missing the Team-RAMEN relative-EEF inference transform"
+        )
+    reference = np.asarray(
+        [0.2, -0.1, 0.4, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0],
+        dtype=np.float32,
+    )
+    targets = np.asarray(
+        [
+            [0.3, 0.2, 0.1, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [-0.1, 0.0, 0.8, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    expected = np.asarray(
+        [
+            absolute_eef_xyz_rot6d_to_relative(reference.tolist(), row.tolist())
+            for row in targets
+        ],
+        dtype=np.float32,
+    )
+    actual = helper(
+        torch.from_numpy(targets)[None, ...],
+        torch.from_numpy(reference)[None, ...],
+    )[0].detach().cpu().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-6, atol=2.0e-6)
+    source = inspect.getsource(processor_groot)
+    if "TEAM_RAMEN_GR00T_RELATIVE_EEF_TRAINING_V3" in source:
+        return "v3"
+    if "TEAM_RAMEN_GR00T_RELATIVE_EEF_TRAINING_V2" in source:
+        return "v2"
+    if "TEAM_RAMEN_GR00T_RELATIVE_EEF_TRAINING_V1" in source:
+        return "v1-inference-compatible"
+    return "behavior-verified"
+
+
 class Runtime:
     def __init__(
         self,
@@ -76,6 +133,7 @@ class Runtime:
     ) -> None:
         if importlib.metadata.version("lerobot") != LEROBOT_VERSION:
             raise RuntimeError(f"coarse-insert requires lerobot=={LEROBOT_VERSION}")
+        relative_eef_patch = _validate_relative_eef_processor_runtime()
         self.contract = validate_checkpoint_metadata(
             checkpoint,
             model_repo_id=model_repo_id,
@@ -83,6 +141,7 @@ class Runtime:
             task=task,
             expected_model_sha256=expected_model_sha256,
         )
+        self.contract["relative_eef_processor_runtime"] = relative_eef_patch
         self.task = task
         from lerobot.policies.groot.modeling_groot import GrootPolicy
         from lerobot.policies.groot.processor_groot import (

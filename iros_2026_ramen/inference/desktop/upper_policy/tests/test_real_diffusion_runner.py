@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace
 
@@ -36,6 +37,12 @@ from inference.desktop.upper_policy.run_flip_table_diffusion import (
     verify_regular_mode,
     verify_regular_mode_after_release,
     wait_for_policy_start_with_hold,
+)
+from inference.desktop.upper_policy.motion_limits import (
+    FLIP_TABLE_ARM_ACCELERATION_RAD_S2,
+    FLIP_TABLE_ARM_VELOCITY_RAD_S,
+    FLIP_TABLE_HAND_ACCELERATION_FRACTION_S2,
+    FLIP_TABLE_HAND_VELOCITY_FRACTION_S,
 )
 from inference.desktop.upper_policy.pre_motion import (
     ARM_PRE_MOTION_WAYPOINTS,
@@ -74,6 +81,36 @@ def test_worker_protocol_round_trip() -> None:
     restored = receive_message(stream)
     assert restored["images"] == [b"jpeg"]
     assert restored["state"] == list(range(19))
+
+
+def test_diffusion_cli_uses_dataset_compatible_motion_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inference.desktop.upper_policy.run_flip_table_diffusion import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_flip_table_diffusion.py",
+            "--interface",
+            "test-nic",
+            "--image-server-ip",
+            "192.0.2.10",
+            "--checkpoint",
+            "/tmp/checkpoint",
+        ],
+    )
+    args = parse_args()
+    assert args.policy_arm_velocity_rad_s == FLIP_TABLE_ARM_VELOCITY_RAD_S
+    assert args.policy_arm_acceleration_rad_s2 == FLIP_TABLE_ARM_ACCELERATION_RAD_S2
+    assert (
+        args.policy_hand_velocity_fraction_s
+        == FLIP_TABLE_HAND_VELOCITY_FRACTION_S
+    )
+    assert (
+        args.policy_hand_acceleration_fraction_s2
+        == FLIP_TABLE_HAND_ACCELERATION_FRACTION_S2
+    )
 
 
 def test_policy_loader_keeps_camera_preview_live_until_worker_is_ready() -> None:
@@ -655,6 +692,85 @@ def test_policy_chunk_rejects_invalid_gripper_or_official_joint_limit() -> None:
             initial_delta_limit_rad=10.0,
             step_delta_limit_rad=0.2,
         )
+
+
+def test_policy_chunk_can_bound_raw_model_extrapolation_without_expanding_commands() -> None:
+    config = load_teleop_config()
+    actions = np.zeros((16, 16), dtype=np.float64)
+    actions[:, 10] = OFFICIAL_G1_29_ARM_UPPER_RAD[10] + 0.0123
+
+    report = validate_policy_chunk(
+        actions,
+        measured_arm=np.clip(
+            actions[0, :14],
+            config.safety.arm_position_lower_rad,
+            config.safety.arm_position_upper_rad,
+        ),
+        config=config,
+        initial_delta_limit_rad=0.2,
+        step_delta_limit_rad=0.2,
+        official_limit_extrapolation_tolerance_rad=0.03,
+    )
+
+    assert report["arm_official_extrapolation_count"] == pytest.approx(16)
+    assert report["arm_official_extrapolation_max_rad"] == pytest.approx(0.0123)
+    assert report["arm_max_rad"] <= max(config.safety.arm_position_upper_rad)
+    assert report["arm_safety_clip_max_rad"] == pytest.approx(0.0423)
+
+    limiter = PolicyActionLimiter(
+        np.clip(
+            np.zeros(14),
+            config.safety.arm_position_lower_rad,
+            config.safety.arm_position_upper_rad,
+        ),
+        np.zeros(2),
+        command_hz=30.0,
+        arm_velocity_rad_s=100.0,
+        arm_acceleration_rad_s2=10000.0,
+        hand_velocity_fraction_s=1.0,
+        hand_acceleration_fraction_s2=4.0,
+        arm_position_lower_rad=config.safety.arm_position_lower_rad,
+        arm_position_upper_rad=config.safety.arm_position_upper_rad,
+    )
+    for _ in range(30):
+        emitted = limiter.apply(actions[0])
+    assert emitted[10] == pytest.approx(config.safety.arm_position_upper_rad[10])
+    assert emitted[10] < OFFICIAL_G1_29_ARM_UPPER_RAD[10]
+
+    actions[:, 10] = OFFICIAL_G1_29_ARM_UPPER_RAD[10] + 0.0301
+    with pytest.raises(ValueError, match="bounded extrapolation guard"):
+        validate_policy_chunk(
+            actions,
+            measured_arm=np.zeros(14),
+            config=config,
+            initial_delta_limit_rad=10.0,
+            step_delta_limit_rad=0.2,
+            official_limit_extrapolation_tolerance_rad=0.03,
+        )
+
+
+def test_policy_chunk_does_not_reject_official_limit_extrapolation_in_unused_tail() -> None:
+    config = load_teleop_config()
+    actions = np.zeros((16, 16), dtype=np.float64)
+    actions[10:, 10] = OFFICIAL_G1_29_ARM_UPPER_RAD[10] + 0.2
+
+    report = validate_policy_chunk(
+        actions,
+        measured_arm=np.zeros(14),
+        config=config,
+        initial_delta_limit_rad=0.2,
+        step_delta_limit_rad=0.2,
+        execution_steps=8,
+    )
+
+    assert report["arm_official_extrapolation_count"] == 0.0
+    assert report["arm_safety_clip_count"] == 0.0
+    assert report["full_chunk_arm_official_extrapolation_count"] == pytest.approx(
+        6
+    )
+    assert report["full_chunk_arm_official_extrapolation_max_rad"] == pytest.approx(
+        0.2
+    )
 
 
 def test_policy_limiter_saturates_at_configured_position_margin() -> None:
@@ -1297,6 +1413,37 @@ def test_blocking_policy_start_check_keeps_watchdog_fresh() -> None:
     assert len(backend.commands) >= 2
     assert command_sequence.value == 30 + len(backend.commands)
     assert all(command.mode.value == "track" for command in backend.commands)
+
+
+def test_blocking_policy_start_check_times_out_and_aborts_worker() -> None:
+    backend = _FollowingPreMotionBackend()
+    config = load_teleop_config()
+    latest = backend.observe(0.1)
+    pose_hold = PolicyStartPoseHold(
+        backend,
+        command_sequence=CommandSequence(),
+        gravity_compensator=_FakeGravityCompensator(),
+        latest=latest,
+    )
+    release = threading.Event()
+
+    def stuck_check() -> None:
+        release.wait()
+        raise EOFError("worker terminated")
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="policy-start check exceeded"):
+        run_blocking_check_with_pose_hold(
+            stuck_check,
+            backend=backend,
+            config=config,
+            pose_hold=pose_hold,
+            latest=latest,
+            timeout_s=0.04,
+            abort_pending=release.set,
+        )
+    assert time.monotonic() - started < 0.3
+    assert backend.commands
 
 
 def test_pre_motion_fails_closed_if_measured_arm_does_not_follow(

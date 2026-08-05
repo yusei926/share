@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import math
 import os
@@ -40,6 +41,12 @@ from data.flip_table_data_augmentation.teleop.contracts import (
     ControlEvent,
     ControlMode,
     TeleopObservation,
+)
+from inference.desktop.upper_policy.async_replanning import (
+    AsyncActionChunkPipeline,
+    FAMILY_REPLANNING_PROFILES,
+    advance_periodic_deadline,
+    run_cleanup_steps,
 )
 from inference.desktop.upper_policy.gravity_compensation import (
     OfficialG1ArmGravityCompensator,
@@ -84,6 +91,11 @@ from inference.desktop.upper_policy.subtask_start_pose import (
     subtask_start_pose_for_model,
 )
 from inference.desktop.upper_policy.worker_protocol import receive_message, send_message
+
+
+_REPLAN_PROFILE = FAMILY_REPLANNING_PROFILES["groot_absolute_joint_v1"]
+DEFAULT_REPLAN_LEAD_STEPS = _REPLAN_PROFILE.lead_steps
+MAX_REPLAN_AGE_S = _REPLAN_PROFILE.max_prediction_age_s
 
 
 def build_pick_leg_start_motion(
@@ -142,6 +154,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=MODEL_ACTION_HORIZON,
         help="Decoded absolute targets executed before replanning (official checkpoint horizon: 16).",
+    )
+    parser.add_argument(
+        "--replan-after-steps",
+        type=int,
+        default=None,
+        help=(
+            "Submit the next absolute-joint GR00T prediction after this many "
+            "executed steps. Default: four periods before the boundary."
+        ),
     )
     parser.add_argument(
         "--initial-delta-limit-rad",
@@ -279,14 +300,22 @@ class PolicyWorker:
         if self.process.poll() is None:
             try:
                 send_message(self.input, {"type": "close"})
-                receive_message(self.output)
             except (BrokenPipeError, EOFError):
                 pass
             try:
                 self.process.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                self.process.terminate()
-                self.process.wait(timeout=5.0)
+                self.terminate()
+
+    def terminate(self) -> None:
+        if self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=3.0)
 
 
 def _camera_generation(observation: TeleopObservation) -> tuple[int, ...]:
@@ -338,16 +367,10 @@ def collect_fresh_observation(
     raise TimeoutError("fresh synchronized four-camera observation was not available")
 
 
-def validate_state_distribution(
-    observation: TeleopObservation,
+@lru_cache(maxsize=8)
+def _cached_state_statistics(
     checkpoint: Path,
-    *,
-    validate_executable_state: bool = True,
-) -> dict[str, Any]:
-    state = compose_model_state(
-        observation.body_joint_position_rad,
-        observation.dex1_opening_fraction,
-    ).astype(np.float64)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     stats = json.loads((checkpoint / "statistics.json").read_text(encoding="utf-8"))[
         "new_embodiment"
     ]["state"]
@@ -392,6 +415,24 @@ def validate_state_distribution(
         for value in (q01, q99, mean, std, raw_minimum, raw_maximum)
     ):
         raise ValueError("GR00T state statistics must flatten to 38 dimensions")
+    for value in (q01, q99, mean, std, raw_minimum, raw_maximum):
+        value.setflags(write=False)
+    return q01, q99, mean, std, raw_minimum, raw_maximum
+
+
+def validate_state_distribution(
+    observation: TeleopObservation,
+    checkpoint: Path,
+    *,
+    validate_executable_state: bool = True,
+) -> dict[str, Any]:
+    state = compose_model_state(
+        observation.body_joint_position_rad,
+        observation.dex1_opening_fraction,
+    ).astype(np.float64)
+    q01, q99, mean, std, raw_minimum, raw_maximum = _cached_state_statistics(
+        checkpoint.expanduser().resolve()
+    )
     robust_margin = np.maximum(0.05, 0.15 * (q99 - q01))
     # A 0.05-rad absolute allowance covers small Regular-Mode balance offsets
     # and encoder/pose differences while remaining far below a meaningful G1
@@ -552,11 +593,60 @@ def evaluate_policy_preflight(
     return predictions[-1], inference_times[-1], state_diagnostics, diagnostics
 
 
+def predict_validated_action_chunk(
+    worker: PolicyWorker,
+    observation: TeleopObservation,
+    *,
+    checkpoint: Path,
+    config: Any,
+    initial_delta_limit_rad: float,
+    step_delta_limit_rad: float,
+) -> tuple[np.ndarray, float, dict[str, Any]]:
+    """Absolute-joint GR00T adapter for the shared asynchronous scheduler."""
+
+    actions, inference_ms, state_diagnostics, action_diagnostics = (
+        evaluate_policy_preflight(
+            worker,
+            observation,
+            checkpoint=checkpoint,
+            config=config,
+            samples=1,
+            initial_delta_limit_rad=initial_delta_limit_rad,
+            step_delta_limit_rad=step_delta_limit_rad,
+        )
+    )
+    return actions, inference_ms, {**state_diagnostics, **action_diagnostics}
+
+
+def _prediction_camera_ready(
+    observation: TeleopObservation,
+    previous_generation: tuple[int, ...],
+) -> bool:
+    """Model adapter: require one new synchronized four-camera observation."""
+
+    if set(observation.camera_jpeg) != set(CAMERA_ROLES):
+        return False
+    generation = _camera_generation(observation)
+    return all(
+        current > previous
+        for current, previous in zip(generation, previous_generation, strict=True)
+    ) and _camera_skew_ms(observation) <= 1000.0 / 30.0
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.preflight_samples < 1:
         raise ValueError("--preflight-samples must be positive")
     if not 1 <= args.action_execution_steps <= MODEL_ACTION_HORIZON:
         raise ValueError("--action-execution-steps must be in [1,16]")
+    if args.replan_after_steps is None:
+        args.replan_after_steps = max(
+            0, args.action_execution_steps - DEFAULT_REPLAN_LEAD_STEPS
+        )
+    if not 0 <= args.replan_after_steps < args.action_execution_steps:
+        raise ValueError(
+            "--replan-after-steps must be non-negative and smaller than "
+            "--action-execution-steps"
+        )
     for value, label in (
         (args.max_seconds, "--max-seconds"),
         (args.initial_delta_limit_rad, "--initial-delta-limit-rad"),
@@ -602,6 +692,7 @@ def main() -> int:
     initial_arm_position: np.ndarray | None = None
     start_pose: SubtaskStartPose | None = None
     gravity: OfficialG1ArmGravityCompensator | None = None
+    action_pipeline: AsyncActionChunkPipeline | None = None
     try:
         backend = RealDdsBackend(args.interface, args.image_server_ip, config)
         worker = initialize_policy_worker_with_live_camera(
@@ -832,6 +923,7 @@ def main() -> int:
             config=config,
             pose_hold=pose_hold,
             latest=observation,
+            abort_pending=worker.terminate,
         )
         limiter = PolicyActionLimiter(
             np.asarray(latest.arm_joint_position_rad),
@@ -869,6 +961,11 @@ def main() -> int:
             {
                 "event": "armed_prediction",
                 "inference_ms": inference_ms,
+                "replanning": "asynchronous_double_buffer",
+                "action_execution_steps": args.action_execution_steps,
+                "replan_after_steps": args.replan_after_steps,
+                "max_replan_age_ms": MAX_REPLAN_AGE_S * 1000.0,
+                "target_command_hz": config.rates.command_hz,
                 **state_diagnostics,
                 **action_diagnostics,
             },
@@ -882,76 +979,173 @@ def main() -> int:
             f"{action_diagnostics['first_transmitted_arm_delta_max_rad']:.4f}rad)",
             flush=True,
         )
+        action_pipeline = AsyncActionChunkPipeline(
+            actions,
+            execution_steps=args.action_execution_steps,
+            replan_after_steps=args.replan_after_steps,
+            max_prediction_age_s=MAX_REPLAN_AGE_S,
+            thread_name_prefix="absolute-groot-replan",
+        )
+        last_prediction_generation = _camera_generation(observation)
         deadline = time.monotonic() + args.max_seconds
         command_period_s = 1.0 / config.rates.command_hz
+        next_tick = time.monotonic()
+        last_command_ns: int | None = None
+        reported_deadline_misses = 0
+        reported_stale_discards = 0
         while time.monotonic() < deadline:
-            for desired in actions[: args.action_execution_steps]:
-                if time.monotonic() >= deadline:
-                    break
-                tick = time.monotonic()
-                live = backend.observe(
-                    timeout_s=min(0.05, config.safety.command_hold_timeout_s)
+            sleep_s = next_tick - time.monotonic()
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            if time.monotonic() >= deadline:
+                break
+            tick_started = time.monotonic()
+            live = backend.observe(
+                timeout_s=min(0.05, config.safety.command_hold_timeout_s)
+            )
+            validate_runtime_backend(live)
+
+            if action_pipeline.wants_prediction and _prediction_camera_ready(
+                live, last_prediction_generation
+            ):
+                anchor_generation = _camera_generation(live)
+                action_pipeline.submit(
+                    lambda anchor=live: predict_validated_action_chunk(
+                        worker,
+                        anchor,
+                        checkpoint=args.checkpoint,
+                        config=config,
+                        initial_delta_limit_rad=args.initial_delta_limit_rad,
+                        step_delta_limit_rad=args.step_delta_limit_rad,
+                    ),
+                    anchor_generation=anchor_generation,
                 )
-                validate_runtime_backend(live)
-                limited = limiter.apply(desired)
-                torque = gravity.torque_nm(limited[:14])
-                sequence = command_sequence.next()
-                backend.apply(
-                    command_from_action(
-                        sequence,
-                        limited,
-                        arm_feedforward_torque_nm=torque,
-                    )
-                )
+                last_prediction_generation = anchor_generation
                 append_log(
                     args.log,
                     {
-                        "event": "command",
-                        "sequence": sequence,
-                        "desired_arm_target_rad": desired[:14].tolist(),
-                        "arm_target_rad": limited[:14].tolist(),
-                        "dex1_target_fraction": (
-                            limited[14:] / DEX1_DATASET_OPEN_VALUE
-                        ).tolist(),
-                        "arm_feedforward_torque_nm": torque.tolist(),
-                        "lower_body_command_dimensions": 0,
+                        "event": "asynchronous_replan_submitted",
+                        "policy_family": "groot_absolute_joint_v1",
+                        "camera_generation": list(anchor_generation),
+                        "camera_skew_ms": _camera_skew_ms(live),
+                        "chunk_action_index": action_pipeline.action_index,
                     },
                 )
-                time.sleep(max(0.0, command_period_s - (time.monotonic() - tick)))
-            if time.monotonic() >= deadline:
-                break
-            previous_generation = _camera_generation(observation)
-            observation = collect_fresh_observation(
-                backend,
-                previous_generation=previous_generation,
-                timeout_s=config.safety.command_hold_timeout_s * 0.75,
+
+            completed = action_pipeline.promote_if_ready()
+            if completed is not None:
+                append_log(
+                    args.log,
+                    {
+                        "event": "asynchronous_replan_promoted",
+                        "policy_family": "groot_absolute_joint_v1",
+                        "inference_ms": completed.inference_ms,
+                        "pipeline_latency_ms": (
+                            completed.completed_monotonic_ns
+                            - completed.submitted_monotonic_ns
+                        )
+                        / 1.0e6,
+                        "camera_generation": list(completed.anchor_generation),
+                        "completed_chunks": action_pipeline.completed_chunks,
+                        **completed.diagnostics,
+                    },
+                )
+            if action_pipeline.stale_discard_count > reported_stale_discards:
+                reported_stale_discards = action_pipeline.stale_discard_count
+                append_log(
+                    args.log,
+                    {
+                        "event": "stale_prediction_discarded",
+                        "policy_family": "groot_absolute_joint_v1",
+                        "observation_age_ms": (
+                            action_pipeline.last_stale_discard_age_ms
+                        ),
+                        "max_prediction_age_ms": MAX_REPLAN_AGE_S * 1000.0,
+                    },
+                )
+            if action_pipeline.deadline_miss_ticks > reported_deadline_misses:
+                reported_deadline_misses = action_pipeline.deadline_miss_ticks
+                if reported_deadline_misses == 1 or reported_deadline_misses % 30 == 0:
+                    append_log(
+                        args.log,
+                        {
+                            "event": "prediction_deadline_miss_hold",
+                            "policy_family": "groot_absolute_joint_v1",
+                            "hold_ticks": reported_deadline_misses,
+                            "prediction_pending": action_pipeline.prediction_pending,
+                        },
+                    )
+
+            desired, model_action_step = action_pipeline.next_action()
+            limited = limiter.apply(desired)
+            torque = gravity.torque_nm(limited[:14])
+            sequence = command_sequence.next()
+            backend.apply(
+                command_from_action(
+                    sequence,
+                    limited,
+                    arm_feedforward_torque_nm=torque,
+                )
             )
-            state_diagnostics = validate_state_distribution(observation, args.checkpoint)
-            actions, inference_ms = worker.predict(observation)
-            action_diagnostics = validate_action_chunk(
-                actions,
-                measured_arm=np.asarray(observation.arm_joint_position_rad),
-                config=config,
-                initial_delta_limit_rad=args.initial_delta_limit_rad,
-                step_delta_limit_rad=args.step_delta_limit_rad,
-            )
+            command_ns = time.monotonic_ns()
             append_log(
                 args.log,
                 {
-                    "event": "chunk",
-                    "inference_ms": inference_ms,
-                    **state_diagnostics,
-                    **action_diagnostics,
+                    "event": "command",
+                    "sequence": sequence,
+                    "action_source": (
+                        "policy_chunk"
+                        if model_action_step is not None
+                        else "hold_waiting_for_replan"
+                    ),
+                    "model_action_step": model_action_step,
+                    "command_interval_ms": (
+                        None
+                        if last_command_ns is None
+                        else (command_ns - last_command_ns) / 1.0e6
+                    ),
+                    "desired_arm_target_rad": desired[:14].tolist(),
+                    "arm_target_rad": limited[:14].tolist(),
+                    "dex1_target_fraction": (
+                        limited[14:] / DEX1_DATASET_OPEN_VALUE
+                    ).tolist(),
+                    "arm_feedforward_torque_nm": torque.tolist(),
+                    "lower_body_command_dimensions": 0,
                 },
             )
+            last_command_ns = command_ns
+            next_tick += command_period_s
+            finished = time.monotonic()
+            if next_tick < finished:
+                append_log(
+                    args.log,
+                    {
+                        "event": "command_tick_overrun",
+                        "overrun_ms": (finished - next_tick) * 1000.0,
+                        "tick_start_lateness_ms": max(
+                            0.0,
+                            (tick_started - next_tick + command_period_s) * 1000.0,
+                        ),
+                    },
+                )
+                next_tick = advance_periodic_deadline(
+                    next_tick, finished, command_period_s
+                )
         print(f"[done] reached --max-seconds={args.max_seconds:.2f}", flush=True)
         return 0
     except KeyboardInterrupt:
         print("[interrupt] Ctrl+C received; controlled arm_sdk release", flush=True)
         return 130
     finally:
+        primary_exception = sys.exc_info()[1]
+        cleanup_steps = []
         if backend is not None:
-            stop_policy_interval_recording(backend, args.log)
+            cleanup_steps.append(
+                (
+                    "stop policy recording",
+                    lambda: stop_policy_interval_recording(backend, args.log),
+                )
+            )
             if actuation_started:
                 if (
                     initial_arm_position is not None
@@ -959,25 +1153,31 @@ def main() -> int:
                     and gravity is not None
                     and pre_motion_complete
                 ):
-                    return_arms_before_release(
-                        backend,
-                        config=config,
-                        log_path=args.log,
-                        command_sequence=command_sequence,
-                        gravity_compensator=gravity,
-                        initial_arm_position_rad=initial_arm_position,
-                        dataset_frame0_arm_rad=start_pose.arm_position_rad,
-                        arm_velocity_rad_s=args.pre_motion_arm_velocity_rad_s,
-                        arm_acceleration_rad_s2=(
-                            args.pre_motion_arm_acceleration_rad_s2
-                        ),
-                        waypoint_tolerance_rad=(
-                            args.pre_motion_waypoint_tolerance_rad
-                        ),
-                        stage_timeout_s=args.pre_motion_stage_timeout_s,
-                        dex1_return_opening_fraction=(1.0, 1.0),
+                    cleanup_steps.append(
+                        (
+                            "reverse arm path",
+                            lambda: return_arms_before_release(
+                                backend,
+                                config=config,
+                                log_path=args.log,
+                                command_sequence=command_sequence,
+                                gravity_compensator=gravity,
+                                initial_arm_position_rad=initial_arm_position,
+                                dataset_frame0_arm_rad=start_pose.arm_position_rad,
+                                arm_velocity_rad_s=args.pre_motion_arm_velocity_rad_s,
+                                arm_acceleration_rad_s2=(
+                                    args.pre_motion_arm_acceleration_rad_s2
+                                ),
+                                waypoint_tolerance_rad=(
+                                    args.pre_motion_waypoint_tolerance_rad
+                                ),
+                                stage_timeout_s=args.pre_motion_stage_timeout_s,
+                                dex1_return_opening_fraction=(1.0, 1.0),
+                            ),
+                        )
                     )
-                try:
+
+                def request_idle() -> None:
                     latest = backend.observe(timeout_s=1.0)
                     backend.apply(
                         ArmHandTarget(
@@ -989,15 +1189,30 @@ def main() -> int:
                             dex1_opening_fraction=latest.dex1_opening_fraction,
                         )
                     )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[shutdown] IDLE request failed: {exc}", file=sys.stderr)
-            try:
-                backend.close()
-            finally:
-                if actuation_started:
-                    verify_regular_mode_after_release(args.interface)
+                cleanup_steps.append(("arm_sdk IDLE request", request_idle))
+            cleanup_steps.append(("backend close", backend.close))
+            if actuation_started:
+                cleanup_steps.append(
+                    (
+                        "Regular Mode handoff verification",
+                        lambda: verify_regular_mode_after_release(args.interface),
+                    )
+                )
+        if action_pipeline is not None:
+            cleanup_steps.append(
+                (
+                    "asynchronous pipeline close",
+                    lambda: action_pipeline.close(
+                        abort_pending=(None if worker is None else worker.terminate)
+                    ),
+                )
+            )
         if worker is not None:
-            worker.close()
+            cleanup_steps.append(("policy worker close", worker.close))
+        run_cleanup_steps(
+            cleanup_steps,
+            primary_exception=primary_exception,
+        )
 
 
 if __name__ == "__main__":

@@ -152,29 +152,32 @@ PRE_STRADDLE_ACT_FRAME0 = SubtaskStartPose(
 
 COARSE_INSERT_FRAME0 = SubtaskStartPose(
     arm_position_rad=(
-        -0.5638502836227417, 0.4385502338409424, -0.35575076937675476,
-        0.39411237835884094, -0.052953992038965225, 0.19772784411907196,
-        -1.057064414024353, -0.34810954332351685, -0.2936753034591675,
-        0.021565500646829605, -0.011338683776557446, 0.3509312570095062,
-        0.49885404109954834, 0.5943645238876343,
+        -0.5591480135917664, 0.4370526969432831, -0.35026293992996216,
+        0.3723258972167969, -0.05962152034044266, 0.20113125443458557,
+        -1.0550432205200195, -0.338015079498291, -0.2881007790565491,
+        0.018755313009023666, 0.0006471482338383794, 0.3515812158584595,
+        0.500892698764801, 0.5877543687820435,
     ),
     dataset_repo_id="Team-RAMEN/IROS2026_RAMEN_suzuki_coarse_insert_1",
     dataset_revision="338c3db7f106e5108f29df5bb564a983897c0eca",
-    training_episode_count=1907,
-    # Median frame-zero action.hand_cmd over the exact 1,907 episode indices
-    # embedded in this checkpoint's train_config, converted from 0..4.5.
+    training_episode_count=1697,
+    # The model conditions on measured state, not desired action. Reconstruct
+    # the start target from frame-zero observation rows in the exact 1,697
+    # episode training split so the final pre-motion state matches the model's
+    # input distribution. Physical Dex1 values are converted from 0..4.5.
     dex1_opening_fraction=(
-        0.29191909896002877,
-        0.4211886458926731,
+        1.4682344198226929 / 4.5,
+        2.2439992427825928 / 4.5,
     ),
     statistic=(
-        "median_action_robot_q_desired_frame0_arms14;"
-        "median_action_hand_cmd_frame0_dex1_2;"
-        "episode_indices_from_checkpoint_train_config"
+        "median_observation_robot_q_current_frame0_arms14;"
+        "median_observation_hand_state_frame0_dex1_2;"
+        "checkpoint_training_split_1697;split_seed=42"
     ),
-    # The checkpoint's train_config did not pin the dataset revision. This is
-    # the current dataset revision and must not be represented as exact.
-    exact_training_revision=False,
+    # The authoritative issue/94 Slurm launcher pins this exact dataset
+    # revision even though the serialized train_config only records the local
+    # materialized view.
+    exact_training_revision=True,
 )
 
 FLIP_TABLE_V2_FRAME0 = SubtaskStartPose(

@@ -213,10 +213,26 @@ Enter待機中も30 Hzで
 検査するため、watchdogによる意図しないarm_sdk解放は行いません。Ctrl+C、状態異常、
 waypoint未到達、Enter後のmodel安全検査失敗はいずれもpolicyを開始せずcontrolled
 releaseへ進みます。pre-motionとpolicyのどちらも腰・脚・rootのcommand次元は0です。
-ACTはcheckpointの`n_action_steps=30`と一致する30 stepを実行してから再推論し、
+ACTはcheckpointの`n_action_steps=30`と一致する30 stepをchunk境界まで実行し、
 Dex1のnative値`[0,4.5]`はhardware境界で一度だけ`[0,1]`へ変換します。各推論の
 raw 30×16 chunk、入力state16、制限後の腕target、Dex1のphysical値と開き率を
 `events.jsonl`へ別々の単位名で保存します。
+
+ACT、absolute-joint GR00T、relative-EEF GR00T、Diffusionは共通の非同期replanning
+基盤を使います。command loopは30 Hzを維持したまま、各family adapterが新しい
+カメラ/stateから次chunkを別threadで生成・検証します。実測推論時間に基づき、ACTは
+境界4 step前、absolute/relative GR00Tは4 step前、Diffusionは2 step前からreplanします。
+chunk境界までに推論が完了すればそこで切り替え、遅れた場合は最終targetを保持します。
+観測から適用までのfamily別期限を超えた完了chunkは破棄し、新しい観測で再推論します。
+期限内に推論自体が完了しない場合は、その場HOLDからcontrolled releaseへfail-closedします。
+画像履歴、state次元、action decode、正規化、物理単位は共通層へ移さず、各family
+adapterが引き続き所有します。
+推論例外・shape変更・非有限値は次chunkとして採用せず、評価全体を不合格にします。
+終了時の推論待ちは有界で、応答しないisolated workerは終了させてから全resourceを
+例外安全に解放します。
+`furniture_groot_candidate_v1`は固有のtemporal ensembleとsealed execution scheduleを
+維持しますが、推論taskの有界停止、30 Hz周期維持、例外安全な解放は同じ共通基盤を
+使用します。
 正常終了・Ctrl+C・検査失敗時は、policy最終姿勢からdataset frame-0、前方待機、
 前方退避、横退避、shoulder後退、起動直前に実測した腕姿勢の順で逆走してから、
 arm_sdk weightを段階的に0へ戻します。解放後は`fsm_id=501, fsm_mode=0`への復帰も

@@ -49,6 +49,12 @@ from inference.desktop.model_evaluation.resolver import (
     parse_hf_reference,
     resolve_model,
 )
+from inference.desktop.upper_policy.motion_limits import (
+    FLIP_TABLE_ARM_ACCELERATION_RAD_S2,
+    FLIP_TABLE_ARM_VELOCITY_RAD_S,
+    FLIP_TABLE_HAND_ACCELERATION_FRACTION_S2,
+    FLIP_TABLE_HAND_VELOCITY_FRACTION_S,
+)
 
 
 def _observation(spec_name: str) -> CanonicalObservation:
@@ -294,6 +300,29 @@ def test_act_runner_receives_checkpoint_n_action_steps() -> None:
         image_server_ip="192.0.2.10",
     )
     assert argv[argv.index("--action-execution-steps") + 1] == "30"
+    assert argv[argv.index("--replan-after-steps") + 1] == "26"
+
+
+@pytest.mark.parametrize(
+    ("model", "expected", "expected_replan"),
+    [
+        ("pick_legs_groot_v1", "8", "4"),
+        ("coarse_insert_groot_n17_v2", "8", "4"),
+        ("flip_table_diffusion_chunk_relative_v2", "8", "6"),
+    ],
+)
+def test_async_runner_receives_sealed_execution_prefix(
+    model: str, expected: str, expected_replan: str
+) -> None:
+    spec = get_model_spec(model)
+    argv = runner_argv(
+        spec,
+        Path("/tmp/model"),
+        interface="test-nic",
+        image_server_ip="192.0.2.10",
+    )
+    assert argv[argv.index("--action-execution-steps") + 1] == expected
+    assert argv[argv.index("--replan-after-steps") + 1] == expected_replan
 
 
 def test_common_launcher_forwards_only_bounded_motion_limits() -> None:
@@ -303,10 +332,12 @@ def test_common_launcher_forwards_only_bounded_motion_limits() -> None:
         "pre_motion_arm_acceleration_rad_s2": 1.0,
         "pre_motion_waypoint_tolerance_rad": 0.10,
         "pre_motion_stage_timeout_s": 15.0,
-        "policy_arm_velocity_rad_s": 0.5,
-        "policy_arm_acceleration_rad_s2": 2.0,
-        "policy_hand_velocity_fraction_s": 0.5,
-        "policy_hand_acceleration_fraction_s2": 2.0,
+        "policy_arm_velocity_rad_s": FLIP_TABLE_ARM_VELOCITY_RAD_S,
+        "policy_arm_acceleration_rad_s2": FLIP_TABLE_ARM_ACCELERATION_RAD_S2,
+        "policy_hand_velocity_fraction_s": FLIP_TABLE_HAND_VELOCITY_FRACTION_S,
+        "policy_hand_acceleration_fraction_s2": (
+            FLIP_TABLE_HAND_ACCELERATION_FRACTION_S2
+        ),
     }
     argv = runner_argv(
         spec,
@@ -333,6 +364,16 @@ def test_common_launcher_forwards_only_bounded_motion_limits() -> None:
         runner_argv(
             spec,
             Path("/tmp/diffusion"),
+            interface="test-nic",
+            image_server_ip="192.0.2.10",
+            safety_limits={
+                "policy_arm_velocity_rad_s": FLIP_TABLE_ARM_VELOCITY_RAD_S + 0.01
+            },
+        )
+    with pytest.raises(ValueError, match="reviewed range"):
+        runner_argv(
+            get_model_spec("pick_legs_groot_v1"),
+            Path("/tmp/groot"),
             interface="test-nic",
             image_server_ip="192.0.2.10",
             safety_limits={"policy_arm_velocity_rad_s": 1.01},

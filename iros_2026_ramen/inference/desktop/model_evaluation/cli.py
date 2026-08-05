@@ -13,6 +13,17 @@ import warnings
 
 import numpy as np
 
+from inference.desktop.upper_policy.async_replanning import (
+    FAMILY_REPLANNING_PROFILES,
+    family_replanning_schedule,
+)
+from inference.desktop.upper_policy.motion_limits import (
+    FLIP_TABLE_ARM_ACCELERATION_RAD_S2,
+    FLIP_TABLE_ARM_VELOCITY_RAD_S,
+    FLIP_TABLE_HAND_ACCELERATION_FRACTION_S2,
+    FLIP_TABLE_HAND_VELOCITY_FRACTION_S,
+)
+
 from .adapters import CanonicalObservation, adapter_for
 from .artifacts import (
     download_plan,
@@ -389,16 +400,28 @@ def runner_argv(
     # tuning knob.  ACT checkpoints here declare n_action_steps=30; forwarding
     # the registry value prevents the runner from silently replanning after a
     # legacy 8-step prefix. Other families keep their own reviewed defaults.
-    if spec.family in {
-        "act_absolute_joint16_v1",
-        "groot_absolute_joint_v1",
-        "groot_relative_eef_v1",
-    }:
+    if spec.family in FAMILY_REPLANNING_PROFILES:
+        replan_after_steps, _ = family_replanning_schedule(
+            spec.family, spec.execution_steps
+        )
         argv += ["--action-execution-steps", str(spec.execution_steps)]
-    # Only these model-independent motion limits may cross the sealed common
-    # launcher boundary. The upper bounds are the highest reviewed defaults
-    # used by any registered real runner; arbitrary runner arguments and
-    # unsafe larger values remain impossible through this entry point.
+        argv += [
+            "--replan-after-steps",
+            str(replan_after_steps),
+        ]
+    # Only these motion limits may cross the sealed common launcher boundary.
+    # The dataset-compatible envelope is reviewed specifically for the
+    # chunk-relative Diffusion family. Keep every other model family on the
+    # previous conservative ceiling unless it is reviewed independently.
+    if spec.family == "diffusion_chunk_relative_v1":
+        policy_maxima = (
+            FLIP_TABLE_ARM_VELOCITY_RAD_S,
+            FLIP_TABLE_ARM_ACCELERATION_RAD_S2,
+            FLIP_TABLE_HAND_VELOCITY_FRACTION_S,
+            FLIP_TABLE_HAND_ACCELERATION_FRACTION_S2,
+        )
+    else:
+        policy_maxima = (1.0, 4.0, 1.0, 4.0)
     safety_bounds = {
         "pre_motion_arm_velocity_rad_s": (
             "--pre-motion-arm-velocity-rad-s", 0.05, 0.5
@@ -413,16 +436,24 @@ def runner_argv(
             "--pre-motion-stage-timeout-s", 1.0, 30.0
         ),
         "policy_arm_velocity_rad_s": (
-            "--policy-arm-velocity-rad-s", 0.05, 1.0
+            "--policy-arm-velocity-rad-s",
+            0.05,
+            policy_maxima[0],
         ),
         "policy_arm_acceleration_rad_s2": (
-            "--policy-arm-acceleration-rad-s2", 0.1, 4.0
+            "--policy-arm-acceleration-rad-s2",
+            0.1,
+            policy_maxima[1],
         ),
         "policy_hand_velocity_fraction_s": (
-            "--policy-hand-velocity-fraction-s", 0.05, 1.0
+            "--policy-hand-velocity-fraction-s",
+            0.05,
+            policy_maxima[2],
         ),
         "policy_hand_acceleration_fraction_s2": (
-            "--policy-hand-acceleration-fraction-s2", 0.1, 4.0
+            "--policy-hand-acceleration-fraction-s2",
+            0.1,
+            policy_maxima[3],
         ),
     }
     overrides = dict(safety_limits or {})
