@@ -1,0 +1,63 @@
+# G1 lower policy skill 姿勢定義 (Issue #81)。
+#
+# 各 skill の default pose / stage 定義をここに集約する。
+# 数値変更のたびに Python code を書き換えずに、YAML 更新 → 実機再検証 で回す。
+#
+# Joint 順 (G1_ARM_JOINT_INDICES = 15..28、14 次元):
+#    L.shoulder_pitch  L.shoulder_roll  L.shoulder_yaw
+#    L.elbow           L.wrist_roll     L.wrist_pitch    L.wrist_yaw
+#    R.shoulder_pitch  R.shoulder_roll  R.shoulder_yaw
+#    R.elbow           R.wrist_roll     R.wrist_pitch    R.wrist_yaw
+#
+# pose_rad は sparse 記法:
+#   明示的に列挙した joint 以外は 0.0 rad として扱う。
+#   これにより「使わない joint は書かない」で意図が読みやすくなる。
+#
+# YAML の読み込みは必ず yaml.safe_load() を使うこと (Python object 復元を封じる)。
+
+skills:
+  # SetupSkill: entrypoint 起動直後に腕を安全 clearance 姿勢へ持っていく (Issue #81)。
+  # orchestrator の initial skill として dispatch され、指定 dwell 経過後に
+  # move_to_table へ auto-transition する。
+  setup:
+    stages:
+      # Stage 1: 真横の高い clearance pose。腕を table 前方空間に出さず、
+      #          肩 roll ±1.2 rad で腰・天板より上の安全な高さへ退避する。
+      #          (2026-07-19 実機で lateral clearance として確認済)
+      - name: lateral_clearance
+        dwell_sec: 2.0
+        pose_rad:
+          L.shoulder_roll:  1.2
+          R.shoulder_roll: -1.2
+
+      # Stage 2: Stage 1 の肩 roll を維持したまま shoulder pitch を -0.20 rad だけ
+      #          前へ傾けた forward clearance pose。真横退避 → 前方退避の順を
+      #          厳密に分けることで下ろす動作 (衝突可能性) を挟まない。
+      #          pitch 量は初回の実機安全確認用に保守的にしている。table clearance
+      #          が十分であることを目視・joint state で確認するまで大きくしないこと。
+      - name: forward_clearance
+        dwell_sec: 2.0
+        pose_rad:
+          L.shoulder_pitch: -0.20
+          L.shoulder_roll:   1.2
+          R.shoulder_pitch: -0.20
+          R.shoulder_roll:  -1.2
+
+  # MoveToTable: 組立台の前まで歩く Type A skill (Issue #64、Issue #81 Phase 2b で YAML 化)。
+  #   - vx: 前進速度 [m/s]、default 0.185 は Issue #64 で実機確定した決め打ちルール。
+  #   - max_dwell_sec: host / firmware 両方の fail-safe (host は orchestrator 側 auto-transition、
+  #                    firmware は set_velocity の duration 引数として同値を渡す)。
+  #                    到達時は orchestrator が TRANSITIONS graph の first candidate =
+  #                    move_table_base へ auto-transition する。
+  move_to_table:
+    vx: 0.185
+    max_dwell_sec: 1.0
+
+  # SampleVLASkill: move_table_base 発火時に真横高い水平姿勢を返す Type B mock (Issue #75)。
+  #   - default_pose_rad: SetupSkill Stage 1 と同じ肩 roll ±1.2 で腕高さを維持し、
+  #                       move_to_table 到着 → move_table_base 遷移で腕が下がらないようにする。
+  # (VLA 実装が入った段階でこの skill は差し替え予定、YAML section は残らない可能性あり)
+  move_table_base:
+    default_pose_rad:
+      L.shoulder_roll:  1.2
+      R.shoulder_roll: -1.2

@@ -87,11 +87,12 @@ pixi run -e runtime python -m inference.desktop.entrypoint \
     --interface eth0 \
     --weight model/yolo_obb/runs/m_lowaug_v3/weights/best.pt \
     --topic /head/camera/color/image_raw/compressed \
-    --vx 0.15 \
     --log outputs/orch_run.jsonl
 ```
 
 - **前提** (operator 責任): G1 が walking FSM state に既に入っている、ROS2 camera driver が publish 中、ハーネス/E-stop/clearance 確保
+- 歩行速度と最大時間は `inference/desktop/lower_policy/configs/skill_config.yaml` の
+  `skills.move_to_table.vx` / `max_dwell_sec` で設定する (`entrypoint.py` に `--vx` はない)
 - Ros2FrameSource (latest-only) で subscribe、Orchestrator tick を 30Hz で回す
 - walk skill (`move_to_table`) のみ実 SDK、他 5 skill は MockSkill (log のみ) — VLA 実装は別 Epic
 - Ctrl+Cで`actuator.set_velocity(0)`。Dampには入れずwalking balancerを維持
